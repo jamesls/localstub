@@ -443,3 +443,66 @@ async def test_connection_bytes_match_per_request_bytes(server, client):
 
     # For a single request, connection bytes should equal request bytes
     assert conn_bytes == request_bytes
+
+
+@pytest.mark.asyncio
+async def test_router_matches_method_and_path(server, client):
+    """Router dispatches to method+path routes before fallback/default."""
+    from localstub.server import StubResponse
+
+    async def get_handler(request):
+        return StubResponse.text("GET-OK")
+
+    def post_handler(request):
+        return StubResponse.json({"method": "POST"})
+
+    server.add_route("GET", "/r1", get_handler)
+    server.add_route("POST", "/r1", post_handler)
+
+    r_get = await client.get(f"{server.url}r1")
+    assert r_get.status_code == 200
+    assert r_get.text == "GET-OK"
+
+    r_post = await client.post(f"{server.url}r1")
+    assert r_post.status_code == 200
+    assert r_post.json() == {"method": "POST"}
+
+
+@pytest.mark.asyncio
+async def test_router_falls_back_to_handler_when_no_route(server, client):
+    """If no route matches, server.handler handles the request."""
+    from localstub.server import StubResponse
+
+    def fallback_handler(request):
+        return StubResponse.text("fallback")
+
+    def only_handler(request):
+        return StubResponse.text("only")
+
+    server.handler = fallback_handler
+    server.add_route("GET", "/only", only_handler)
+
+    r_only = await client.get(f"{server.url}only")
+    assert r_only.status_code == 200
+    assert r_only.text == "only"
+
+    r_other = await client.get(f"{server.url}other")
+    assert r_other.status_code == 200
+    assert r_other.text == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_router_defaults_when_no_handler_and_no_route(server, client):
+    """If neither route nor handler present, default response is used."""
+    # Ensure no handler is set explicitly
+    server.handler = None
+
+    # Register a different path so '/unmatched' is not routed
+    from localstub.server import StubResponse
+
+    server.add_route("GET", "/special", lambda r: StubResponse.text("special"))
+
+    r_unmatched = await client.get(f"{server.url}unmatched")
+    assert r_unmatched.status_code == 200
+    # Default response is JSON {}
+    assert r_unmatched.json() == {}
