@@ -265,6 +265,10 @@ class AsyncHTTPTestServer:
         )
         self._router = Router()
 
+        # Response sequence tracking
+        self._response_sequence: list[HTTPResponse] = []
+        self._response_sequence_index: int = 0
+
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
         self._request_queue: asyncio.Queue[HTTPRequest] = asyncio.Queue()
@@ -311,6 +315,9 @@ class AsyncHTTPTestServer:
         self._default_response = HTTPResponse.json(
             obj, status=status, headers=headers
         )
+        # Clear any response sequence (last one wins)
+        self._response_sequence = []
+        self._response_sequence_index = 0
 
     def set_text_response(
         self,
@@ -324,6 +331,9 @@ class AsyncHTTPTestServer:
             status=status,
             headers=headers,
         )
+        # Clear any response sequence (last one wins)
+        self._response_sequence = []
+        self._response_sequence_index = 0
 
     def set_raw_response(
         self,
@@ -337,6 +347,33 @@ class AsyncHTTPTestServer:
             status=status,
             headers=headers,
         )
+        # Clear any response sequence (last one wins)
+        self._response_sequence = []
+        self._response_sequence_index = 0
+
+    def set_response_sequence(self, responses: list[HTTPResponse]) -> None:
+        """Configure a sequence of responses to return in order.
+
+        Each incoming request will consume the next response from the sequence.
+        Once exhausted, falls back to handler or default_response behavior.
+
+        This is useful for testing retry logic where you want the first N
+        requests to fail and subsequent requests to succeed.
+
+        Example:
+            server.set_response_sequence([
+                HTTPResponse(status=500),  # First request fails
+                HTTPResponse(status=500),  # Second request fails
+                HTTPResponse.json({"ok": True})  # Third request succeeds
+            ])
+
+        Args:
+            responses: List of HTTPResponse objects to return in sequence
+        """
+        self._response_sequence = responses
+        self._response_sequence_index = 0
+        # Clear default response (last one wins)
+        self._default_response = HTTPResponse.json({})
 
     def get_connection_bytes_received(
         self, client: tuple[str, int]
@@ -394,6 +431,8 @@ class AsyncHTTPTestServer:
         self._request_queue = asyncio.Queue()
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
+        # Reset response sequence index to allow reuse
+        self._response_sequence_index = 0
 
     async def start(self) -> None:
         if self._server is not None:
@@ -455,7 +494,23 @@ class AsyncHTTPTestServer:
         )
 
     async def _get_response(self, request: HTTPRequest) -> HTTPResponse:
-        """Get response via router, falling back to handler or default."""
+        """Get response via sequence, router, handler, or default.
+
+        Priority order:
+        1. Response sequence (if set and not exhausted)
+        2. Router with method/path matching
+        3. Handler (if set)
+        4. Default response
+        """
+        # Check sequence first - consumes next response if available
+        if self._response_sequence and self._response_sequence_index < len(
+            self._response_sequence
+        ):
+            response = self._response_sequence[self._response_sequence_index]
+            self._response_sequence_index += 1
+            return response
+
+        # Fall back to existing routing logic
         return await self._router.resolve(
             request, self._handler, self._default_response
         )
