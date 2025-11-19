@@ -140,11 +140,6 @@ class HTTPResponse:
         return cls(status=status, headers=base_headers, body=data)
 
 
-# Backwards-compatible alias expected by tests/handlers.
-# Minimal public surface change to keep import working.
-StubResponse = HTTPResponse
-
-
 Handler = Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]
 
 

@@ -2,7 +2,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from localstub.server import AsyncHTTPTestServer
+from localstub.server import AsyncHTTPTestServer, HTTPResponse
 
 
 @pytest_asyncio.fixture
@@ -218,9 +218,7 @@ async def test_clear_requests_preserves_handler(server, client):
     def custom_handler(request):
         nonlocal request_count
         request_count += 1
-        from localstub.server import StubResponse
-
-        return StubResponse.json({"count": request_count})
+        return HTTPResponse.json({"count": request_count})
 
     server.handler = custom_handler
 
@@ -448,13 +446,12 @@ async def test_connection_bytes_match_per_request_bytes(server, client):
 @pytest.mark.asyncio
 async def test_router_matches_method_and_path(server, client):
     """Router dispatches to method+path routes before fallback/default."""
-    from localstub.server import StubResponse
 
     async def get_handler(request):
-        return StubResponse.text("GET-OK")
+        return HTTPResponse.text("GET-OK")
 
     def post_handler(request):
-        return StubResponse.json({"method": "POST"})
+        return HTTPResponse.json({"method": "POST"})
 
     server.add_route("GET", "/r1", get_handler)
     server.add_route("POST", "/r1", post_handler)
@@ -471,13 +468,12 @@ async def test_router_matches_method_and_path(server, client):
 @pytest.mark.asyncio
 async def test_router_falls_back_to_handler_when_no_route(server, client):
     """If no route matches, server.handler handles the request."""
-    from localstub.server import StubResponse
 
     def fallback_handler(request):
-        return StubResponse.text("fallback")
+        return HTTPResponse.text("fallback")
 
     def only_handler(request):
-        return StubResponse.text("only")
+        return HTTPResponse.text("only")
 
     server.handler = fallback_handler
     server.add_route("GET", "/only", only_handler)
@@ -498,9 +494,7 @@ async def test_router_defaults_when_no_handler_and_no_route(server, client):
     server.handler = None
 
     # Register a different path so '/unmatched' is not routed
-    from localstub.server import StubResponse
-
-    server.add_route("GET", "/special", lambda r: StubResponse.text("special"))
+    server.add_route("GET", "/special", lambda r: HTTPResponse.text("special"))
 
     r_unmatched = await client.get(f"{server.url}unmatched")
     assert r_unmatched.status_code == 200
