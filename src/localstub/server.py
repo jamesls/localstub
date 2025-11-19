@@ -238,6 +238,32 @@ class AsyncHTTPTestServer:
             headers=headers,
         )
 
+    def clear_requests(self) -> None:
+        """Clear all recorded request state.
+
+        Resets last_request, requests list, and the request queue while
+        preserving server configuration (handler, default_response, etc.).
+
+        Useful for reusing a session-scoped test server across multiple
+        tests without needing to shut down and restart the server.
+
+        Example:
+            async with AsyncHTTPTestServer() as server:
+                # Test 1
+                response = await client.get(server.url)
+                assert len(server.requests) == 1
+
+                # Clear state between tests
+                server.clear_requests()
+
+                # Test 2 - fresh state
+                response = await client.get(server.url)
+                assert len(server.requests) == 1
+        """
+        self.last_request = None
+        self.requests = []
+        self._request_queue = asyncio.Queue()
+
     async def start(self) -> None:
         if self._server is not None:
             return
