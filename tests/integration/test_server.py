@@ -270,3 +270,176 @@ async def test_session_scoped_server_pattern():
             assert len(server.requests) == 2
             assert server.requests[0].path == "/a"
             assert server.requests[1].path == "/b"
+
+
+@pytest.mark.asyncio
+async def test_connection_bytes_received_single_request(server, client):
+    """Test that connection-level bytes are captured for a single request."""
+    server.set_json_response({"status": "ok"})
+
+    await client.get(f"{server.url}test")
+
+    assert server.last_request is not None
+    client_addr = server.last_request.client
+    assert client_addr is not None
+
+    # Get connection-level bytes
+    conn_bytes = server.get_connection_bytes_received(client_addr)
+    assert conn_bytes is not None
+    assert len(conn_bytes) > 0
+    # Should contain the request line
+    assert b"GET /test HTTP/1.1" in conn_bytes
+    # Header snippets we expect to see in the request.
+    assert b"Host: 127" in conn_bytes
+    assert b"User-Agent: python-httpx" in conn_bytes
+    assert b"Host:" in conn_bytes
+
+
+@pytest.mark.asyncio
+async def test_connection_bytes_sent_single_request(server, client):
+    """Test that connection-level sent bytes are captured."""
+    server.set_json_response({"status": "ok"})
+
+    await client.get(server.url)
+
+    assert server.last_request is not None
+    client_addr = server.last_request.client
+    assert client_addr is not None
+
+    # Get connection-level sent bytes
+    sent_bytes = server.get_connection_bytes_sent(client_addr)
+    assert sent_bytes is not None
+    assert len(sent_bytes) > 0
+
+    # Should contain HTTP status line
+    assert b"HTTP/1.1 200 OK" in sent_bytes
+    # Should contain the JSON response body
+    assert (
+        b'{"status": "ok"}' in sent_bytes or b'{"status":"ok"}' in sent_bytes
+    )
+
+
+@pytest.mark.asyncio
+async def test_connection_bytes_multiple_requests_same_connection(
+    server, client
+):
+    """Test that connection bytes accumulate across multiple requests."""
+    server.set_json_response({"response": "ok"})
+
+    # Make multiple requests on the same connection
+    await client.get(f"{server.url}first")
+    await client.post(f"{server.url}second", json={"data": "test"})
+    await client.put(f"{server.url}third", content=b"raw")
+
+    assert len(server.requests) == 3
+    client_addr = server.requests[0].client
+    assert client_addr is not None
+
+    # All requests should be from the same client address
+    assert all(req.client == client_addr for req in server.requests)
+
+    # Get connection-level bytes
+    conn_bytes_received = server.get_connection_bytes_received(client_addr)
+    conn_bytes_sent = server.get_connection_bytes_sent(client_addr)
+
+    assert conn_bytes_received is not None
+    assert conn_bytes_sent is not None
+
+    # Should contain all three requests
+    assert b"GET /first HTTP/1.1" in conn_bytes_received
+    assert b"POST /second HTTP/1.1" in conn_bytes_received
+    assert b"PUT /third HTTP/1.1" in conn_bytes_received
+
+    # Should contain request bodies
+    assert (
+        b'"data": "test"' in conn_bytes_received
+        or b'"data":"test"' in conn_bytes_received
+    )
+    assert b"raw" in conn_bytes_received
+
+    # Should contain multiple responses (3 status lines)
+    assert conn_bytes_sent.count(b"HTTP/1.1 200 OK") == 3
+
+
+@pytest.mark.asyncio
+async def test_connection_bytes_separate_clients():
+    """Test that connection bytes are tracked separately per client."""
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({"status": "ok"})
+
+        async with (
+            httpx.AsyncClient() as client1,
+            httpx.AsyncClient() as client2,
+        ):
+            # Each client makes requests
+            await client1.get(f"{server.url}client1")
+            await client2.get(f"{server.url}client2")
+
+        assert len(server.requests) == 2
+
+        client1_addr = server.requests[0].client
+        client2_addr = server.requests[1].client
+
+        assert client1_addr is not None
+        assert client2_addr is not None
+        assert client1_addr != client2_addr
+
+        # Get connection bytes for each client
+        client1_bytes = server.get_connection_bytes_received(client1_addr)
+        client2_bytes = server.get_connection_bytes_received(client2_addr)
+
+        assert client1_bytes is not None
+        assert client2_bytes is not None
+
+        # Each client should only have their own request
+        assert b"/client1" in client1_bytes
+        assert b"/client1" not in client2_bytes
+
+        assert b"/client2" in client2_bytes
+        assert b"/client2" not in client1_bytes
+
+
+@pytest.mark.asyncio
+async def test_connection_bytes_cleared_with_clear_requests(server, client):
+    """Test that clear_requests() also clears connection bytes."""
+    server.set_json_response({"status": "ok"})
+
+    await client.get(server.url)
+
+    assert server.last_request is not None
+    client_addr = server.last_request.client
+    assert client_addr is not None
+
+    # Verify connection bytes exist
+    conn_bytes = server.get_connection_bytes_received(client_addr)
+    assert conn_bytes is not None
+    assert len(conn_bytes) > 0
+
+    # Clear requests
+    server.clear_requests()
+
+    # Connection bytes should be cleared
+    conn_bytes_after = server.get_connection_bytes_received(client_addr)
+    assert conn_bytes_after is None
+
+
+@pytest.mark.asyncio
+async def test_connection_bytes_match_per_request_bytes(server, client):
+    """Test connection bytes include the same data as per-request bytes."""
+    server.set_json_response({"status": "ok"})
+
+    await client.post(f"{server.url}test", json={"key": "value"})
+
+    assert server.last_request is not None
+    client_addr = server.last_request.client
+    assert client_addr is not None
+
+    # Get both per-request and connection-level bytes
+    request_bytes = server.last_request.wire_raw_bytes
+    conn_bytes = server.get_connection_bytes_received(client_addr)
+
+    assert request_bytes is not None
+    assert conn_bytes is not None
+
+    # For a single request, connection bytes should equal request bytes
+    assert conn_bytes == request_bytes

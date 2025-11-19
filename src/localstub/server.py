@@ -179,6 +179,12 @@ class AsyncHTTPTestServer:
         self.requests: list[RequestRecorder] = []
         self._request_queue: asyncio.Queue[RequestRecorder] = asyncio.Queue()
 
+        # Connection-level raw bytes tracking (keyed by client address)
+        self._connection_raw_bytes_received: dict[
+            tuple[str, int], bytearray
+        ] = {}
+        self._connection_raw_bytes_sent: dict[tuple[str, int], bytearray] = {}
+
         self.host: str | None = None
         self.port: int | None = None
 
@@ -238,11 +244,40 @@ class AsyncHTTPTestServer:
             headers=headers,
         )
 
+    def get_connection_bytes_received(
+        self, client: tuple[str, int]
+    ) -> bytes | None:
+        """Get all raw bytes received from a specific client connection.
+
+        Args:
+            client: Tuple of (host, port) identifying the client connection
+
+        Returns:
+            All bytes received from this client, or None if no data recorded
+        """
+        buf = self._connection_raw_bytes_received.get(client)
+        return bytes(buf) if buf is not None else None
+
+    def get_connection_bytes_sent(
+        self, client: tuple[str, int]
+    ) -> bytes | None:
+        """Get all raw bytes sent to a specific client connection.
+
+        Args:
+            client: Tuple of (host, port) identifying the client connection
+
+        Returns:
+            All bytes sent to this client, or None if no data recorded
+        """
+        buf = self._connection_raw_bytes_sent.get(client)
+        return bytes(buf) if buf is not None else None
+
     def clear_requests(self) -> None:
         """Clear all recorded request state.
 
-        Resets last_request, requests list, and the request queue while
-        preserving server configuration (handler, default_response, etc.).
+        Resets last_request, requests list, the request queue, and
+        connection-level raw bytes while preserving server configuration
+        (handler, default_response, etc.).
 
         Useful for reusing a session-scoped test server across multiple
         tests without needing to shut down and restart the server.
@@ -263,6 +298,8 @@ class AsyncHTTPTestServer:
         self.last_request = None
         self.requests = []
         self._request_queue = asyncio.Queue()
+        self._connection_raw_bytes_received.clear()
+        self._connection_raw_bytes_sent.clear()
 
     async def start(self) -> None:
         if self._server is not None:
@@ -308,14 +345,44 @@ class AsyncHTTPTestServer:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _init_connection_tracking(
+        self, client: tuple[str, int] | None
+    ) -> tuple[bytearray | None, bytearray | None]:
+        """Initialize connection-level byte tracking for a client."""
+        if client is None:
+            return None, None
+
+        if client not in self._connection_raw_bytes_received:
+            self._connection_raw_bytes_received[client] = bytearray()
+        if client not in self._connection_raw_bytes_sent:
+            self._connection_raw_bytes_sent[client] = bytearray()
+
+        return (
+            self._connection_raw_bytes_received[client],
+            self._connection_raw_bytes_sent[client],
+        )
+
+    async def _get_response(self, request: RequestRecorder) -> StubResponse:
+        """Get response for a request, using handler or default."""
+        if self._handler is None:
+            return self._default_response
+
+        result = self._handler(request)
+        if inspect.isawaitable(result):
+            return await result  # type: ignore[return-value]
+        return result
+
     async def _handle_client(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        client = self._extract_client_info(writer)
+        conn_recv, conn_sent = self._init_connection_tracking(client)
+
         try:
             while True:
-                request = await self._read_request(reader, writer)
+                request = await self._read_request(reader, writer, conn_recv)
                 if request is None:
                     break
 
@@ -323,17 +390,9 @@ class AsyncHTTPTestServer:
                 self.requests.append(request)
                 await self._request_queue.put(request)
 
-                if self._handler is None:
-                    response = self._default_response
-                else:
-                    result = self._handler(request)
-                    if inspect.isawaitable(result):
-                        response = await result  # type: ignore[assignment]
-                    else:
-                        response = result
-
+                response = await self._get_response(request)
                 should_close = await self._write_response(
-                    writer, response, request
+                    writer, response, request, conn_sent
                 )
                 if should_close:
                     break
@@ -351,23 +410,30 @@ class AsyncHTTPTestServer:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
+        connection_wire: bytearray | None = None,
     ) -> RequestRecorder | None:
         wire = bytearray()
         header_lines: list[bytes] = []
 
         # --- Request line ---
-        req_line_parts = await self._read_request_line(reader, wire)
+        req_line_parts = await self._read_request_line(
+            reader, wire, connection_wire
+        )
         if req_line_parts is None:
             return None
         method, path, version = req_line_parts
 
         # --- Headers ---
-        headers = await self._read_headers(reader, wire, header_lines)
+        headers = await self._read_headers(
+            reader, wire, header_lines, connection_wire
+        )
         if headers is None:
             return None
 
         # --- Body ---
-        body_text = await self._read_body(reader, wire, headers)
+        body_text = await self._read_body(
+            reader, wire, headers, connection_wire
+        )
 
         # --- Client info ---
         client = self._extract_client_info(writer)
@@ -386,12 +452,15 @@ class AsyncHTTPTestServer:
         self,
         reader: asyncio.StreamReader,
         wire: bytearray,
+        connection_wire: bytearray | None = None,
     ) -> tuple[str, str, str] | None:
         """Read and parse the HTTP request line."""
         line = await reader.readline()
         if not line:
             return None
         wire.extend(line)
+        if connection_wire is not None:
+            connection_wire.extend(line)
         try:
             req_line = line.decode("ascii", errors="replace").rstrip("\r\n")
             method, path, version = req_line.split(" ", 2)
@@ -405,6 +474,7 @@ class AsyncHTTPTestServer:
         reader: asyncio.StreamReader,
         wire: bytearray,
         header_lines: list[bytes],
+        connection_wire: bytearray | None = None,
     ) -> Message | None:
         """Read HTTP headers until blank line."""
         while True:
@@ -413,6 +483,8 @@ class AsyncHTTPTestServer:
                 # EOF while reading headers
                 return None
             wire.extend(line)
+            if connection_wire is not None:
+                connection_wire.extend(line)
             if line in (b"\r\n", b"\n"):
                 break
             header_lines.append(line)
@@ -423,15 +495,18 @@ class AsyncHTTPTestServer:
         reader: asyncio.StreamReader,
         wire: bytearray,
         headers: Message,
+        connection_wire: bytearray | None = None,
     ) -> str | None:
         """Read request body based on Transfer-Encoding or Content-Length."""
         body_bytes: bytes | None = None
         transfer_encoding = headers.get("Transfer-Encoding")
         if transfer_encoding and "chunked" in transfer_encoding.lower():
-            body_bytes = await self._read_chunked_body(reader, wire)
+            body_bytes = await self._read_chunked_body(
+                reader, wire, connection_wire
+            )
         else:
             body_bytes = await self._read_content_length_body(
-                reader, wire, headers
+                reader, wire, headers, connection_wire
             )
 
         if body_bytes is None:
@@ -443,6 +518,7 @@ class AsyncHTTPTestServer:
         reader: asyncio.StreamReader,
         wire: bytearray,
         headers: Message,
+        connection_wire: bytearray | None = None,
     ) -> bytes | None:
         """Read body based on Content-Length header."""
         content_length = headers.get("Content-Length")
@@ -455,6 +531,8 @@ class AsyncHTTPTestServer:
         if length:
             chunk = await reader.readexactly(length)
             wire.extend(chunk)
+            if connection_wire is not None:
+                connection_wire.extend(chunk)
             return chunk
         return None
 
@@ -467,10 +545,46 @@ class AsyncHTTPTestServer:
             return (peer[0], peer[1])
         return None
 
+    def _extend_wire_buffers(
+        self,
+        data: bytes,
+        wire: bytearray,
+        connection_wire: bytearray | None,
+    ) -> None:
+        """Extend both per-request and connection-level wire buffers."""
+        wire.extend(data)
+        if connection_wire is not None:
+            connection_wire.extend(data)
+
+    def _parse_chunk_size(self, header: str) -> int | None:
+        """Parse chunk size from header, handling aws-chunked format."""
+        size_str = header.split(";", 1)[0] if ";" in header else header
+        try:
+            return int(size_str, 16)
+        except ValueError:
+            LOG.debug("Invalid chunk size header: %r", header)
+            return None
+
+    async def _read_chunk_trailers(
+        self,
+        reader: asyncio.StreamReader,
+        wire: bytearray,
+        connection_wire: bytearray | None,
+    ) -> None:
+        """Read trailing headers after final chunk."""
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            self._extend_wire_buffers(line, wire, connection_wire)
+            if line in (b"\r\n", b"\n", b""):
+                break
+
     async def _read_chunked_body(
         self,
         reader: asyncio.StreamReader,
         wire: bytearray,
+        connection_wire: bytearray | None = None,
     ) -> bytes:
         """Read a chunked transfer-encoded request body.
 
@@ -486,52 +600,81 @@ class AsyncHTTPTestServer:
         body = bytearray()
 
         while True:
-            # Chunk-size line
             line = await reader.readline()
             if not line:
                 break
-            wire.extend(line)
+            self._extend_wire_buffers(line, wire, connection_wire)
             header = line.decode("ascii", errors="replace").strip()
 
-            # Handle aws-chunked style: "1a;chunk-signature=..."
-            if ";" in header:
-                size_str = header.split(";", 1)[0]
-            else:
-                size_str = header
-
-            try:
-                size = int(size_str, 16)
-            except ValueError:
-                LOG.debug("Invalid chunk size header: %r", header)
+            size = self._parse_chunk_size(header)
+            if size is None:
                 break
 
             if size == 0:
-                # Trailing headers (if any), ending with blank line
-                while True:
-                    line = await reader.readline()
-                    if not line:
-                        break
-                    wire.extend(line)
-                    if line in (b"\r\n", b"\n", b""):
-                        break
+                await self._read_chunk_trailers(reader, wire, connection_wire)
                 break
 
-            # Chunk data
+            # Read chunk data
             chunk = await reader.readexactly(size)
             body.extend(chunk)
-            wire.extend(chunk)
+            self._extend_wire_buffers(chunk, wire, connection_wire)
 
-            # CRLF after each chunk
+            # Read CRLF after chunk
             crlf = await reader.readexactly(2)
-            wire.extend(crlf)
+            self._extend_wire_buffers(crlf, wire, connection_wire)
 
         return bytes(body)
+
+    def _normalize_body(self, body_obj: bytes | str | None) -> bytes:
+        """Normalize response body to bytes."""
+        if body_obj is None:
+            return b""
+        if isinstance(body_obj, bytes):
+            return body_obj
+        return str(body_obj).encode("utf-8")
+
+    def _should_close_connection(self, request: RequestRecorder) -> bool:
+        """Check if client requested connection close."""
+        if not request.headers:
+            return False
+        client_conn = request.headers.get("Connection", "").lower()
+        return "close" in client_conn
+
+    def _build_response_headers(
+        self,
+        response: StubResponse,
+        body: bytes,
+        should_close: bool,
+    ) -> dict[str, str]:
+        """Build complete response headers dict."""
+        headers = dict(response.headers) if response.headers else {}
+        header_names = {k.lower() for k in headers}
+
+        if "content-length" not in header_names:
+            headers["Content-Length"] = str(len(body))
+
+        if "connection" not in header_names and should_close:
+            headers["Connection"] = "close"
+
+        return headers
+
+    def _write_and_track(
+        self,
+        writer: asyncio.StreamWriter,
+        data: bytes,
+        connection_wire_sent: bytearray | None,
+    ) -> None:
+        """Write data to client and track in connection bytes."""
+        writer.write(data)
+        if connection_wire_sent is not None:
+            connection_wire_sent.extend(data)
 
     async def _write_response(
         self,
         writer: asyncio.StreamWriter,
         response: StubResponse,
         request: RequestRecorder,
+        connection_wire_sent: bytearray | None = None,
     ) -> bool:
         try:
             reason = HTTPStatus(response.status).phrase
@@ -539,41 +682,20 @@ class AsyncHTTPTestServer:
             reason = "UNKNOWN"
 
         status_line = f"HTTP/1.1 {response.status} {reason}\r\n"
-        writer.write(status_line.encode("ascii"))
-
-        # Normalize body to bytes
-        body_obj = response.body
-        if body_obj is None:
-            body = b""
-        elif isinstance(body_obj, bytes):
-            body = body_obj
-        else:
-            body = str(body_obj).encode("utf-8")
-
-        headers = (
-            dict(response.headers) if response.headers is not None else {}
+        self._write_and_track(
+            writer, status_line.encode("ascii"), connection_wire_sent
         )
-        header_names = {k.lower() for k in headers}
-        if "content-length" not in header_names:
-            headers["Content-Length"] = str(len(body))
 
-        # Check if client requested connection close
-        client_connection = (
-            request.headers.get("Connection", "").lower()
-            if request.headers
-            else ""
-        )
-        should_close = "close" in client_connection
-
-        # Set Connection header if not already set by user
-        if "connection" not in header_names:
-            if should_close:
-                headers["Connection"] = "close"
+        body = self._normalize_body(response.body)
+        should_close = self._should_close_connection(request)
+        headers = self._build_response_headers(response, body, should_close)
 
         for name, value in headers.items():
-            writer.write(f"{name}: {value}\r\n".encode("ascii"))
-        writer.write(b"\r\n")
-        writer.write(body)
+            header_line = f"{name}: {value}\r\n".encode("ascii")
+            self._write_and_track(writer, header_line, connection_wire_sent)
+
+        self._write_and_track(writer, b"\r\n", connection_wire_sent)
+        self._write_and_track(writer, body, connection_wire_sent)
         await writer.drain()
 
         return should_close
