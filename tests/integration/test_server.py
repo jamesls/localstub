@@ -500,3 +500,128 @@ async def test_router_defaults_when_no_handler_and_no_route(server, client):
     assert r_unmatched.status_code == 200
     # Default response is JSON {}
     assert r_unmatched.json() == {}
+
+
+@pytest.mark.asyncio
+async def test_server_receives_chunked_request_body(server, client):
+    server.set_json_response({"status": "received"})
+
+    async def chunked_body():
+        yield b"hello"
+        yield b" "
+        yield b"world"
+
+    response = await client.post(server.url, content=chunked_body())
+
+    assert response.status_code == 200
+    assert server.last_request is not None
+    assert server.last_request.body == "hello world"
+    assert server.last_request.headers is not None
+    assert (
+        "chunked"
+        in server.last_request.headers.get("Transfer-Encoding", "").lower()
+    )
+
+
+@pytest.mark.asyncio
+async def test_server_handles_multiple_chunks_varying_sizes(server, client):
+    server.set_json_response({"chunks": "received"})
+
+    async def multi_chunk_body():
+        yield b"a"  # 1 byte
+        yield b"bb"  # 2 bytes
+        yield b"ccc"  # 3 bytes
+        yield b"dddd"  # 4 bytes
+
+    response = await client.post(server.url, content=multi_chunk_body())
+
+    assert response.status_code == 200
+    assert server.last_request is not None
+    assert server.last_request.body == "abbcccdddd"
+
+    # Verify raw wire bytes contain chunk size prefixes
+    wire_bytes = server.last_request.wire_raw_bytes
+    assert wire_bytes is not None
+    # Should contain hex chunk sizes: 1, 2, 3, 4, and final 0
+    assert b"1\r\n" in wire_bytes
+    assert b"2\r\n" in wire_bytes
+    assert b"3\r\n" in wire_bytes
+    assert b"4\r\n" in wire_bytes
+    assert b"0\r\n" in wire_bytes
+
+
+@pytest.mark.asyncio
+async def test_server_receives_large_chunked_body(server, client):
+    server.set_json_response({"size": "received"})
+
+    async def large_body():
+        # Simulate streaming 100 chunks of 1024 bytes each
+        for i in range(100):
+            chunk_prefix = f"chunk{i}:".encode()
+            padding = b"x" * (1024 - len(chunk_prefix))
+            yield chunk_prefix + padding
+
+    response = await client.post(server.url, content=large_body())
+
+    assert response.status_code == 200
+    assert server.last_request is not None
+    assert len(server.last_request.body) == 100 * 1024
+    assert "chunk0:" in server.last_request.body
+    assert "chunk99:" in server.last_request.body
+
+
+@pytest.mark.asyncio
+async def test_server_receives_json_via_chunked_encoding(server, client):
+    server.set_json_response({"status": "parsed"})
+
+    json_payload = b'{"key": "value", "nested": {"data": 123}}'
+
+    async def chunked_json():
+        # Split JSON into 3 chunks
+        chunk_size = len(json_payload) // 3
+        for i in range(0, len(json_payload), chunk_size):
+            yield json_payload[i : i + chunk_size]
+
+    response = await client.post(
+        server.url,
+        content=chunked_json(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert server.last_request is not None
+    assert server.last_request.json_body == {
+        "key": "value",
+        "nested": {"data": 123},
+    }
+
+
+@pytest.mark.asyncio
+async def test_connection_bytes_with_chunked_encoding(server, client):
+    server.set_json_response({"status": "ok"})
+
+    async def chunked_body():
+        yield b"first"
+        yield b"second"
+
+    await client.post(server.url, content=chunked_body())
+
+    assert server.last_request is not None
+    client_addr = server.last_request.client
+    assert client_addr is not None
+
+    # Get connection-level bytes
+    conn_bytes = server.get_connection_bytes_received(client_addr)
+    assert conn_bytes is not None
+    assert len(conn_bytes) > 0
+
+    # Should contain chunked transfer encoding header
+    assert b"Transfer-Encoding: chunked" in conn_bytes
+    # Should contain chunk size prefixes in hex
+    assert b"5\r\n" in conn_bytes  # "first" = 5 bytes
+    assert b"6\r\n" in conn_bytes  # "second" = 6 bytes
+    # Should contain the actual chunk data
+    assert b"first" in conn_bytes
+    assert b"second" in conn_bytes
+    # Should contain final chunk marker
+    assert b"0\r\n" in conn_bytes
