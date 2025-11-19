@@ -52,7 +52,7 @@ This is a HARD REQUIREMENT.
 - Main test server class using asyncio's `start_server`
 - Records all incoming requests in `.requests` list and `.last_request`
 - Supports both static responses and dynamic handler functions
-- Handler can be sync or async: `Callable[[HTTPRequest], Awaitable[StubResponse] | StubResponse]`
+- Handler can be sync or async: `Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]`
 
 **HTTPRequest** (`src/localstub/server.py`)
 - Captures HTTP request details including method, path, headers, body
@@ -60,7 +60,7 @@ This is a HARD REQUIREMENT.
 - `json_body` property for convenient JSON access
 - `client` tuple contains (host, port) of the client
 
-**StubResponse** (`src/localstub/server.py`)
+**HTTPResponse** (`src/localstub/server.py`)
 - Dataclass for configuring HTTP responses
 - Factory methods: `.json()`, `.text()`, `.raw()` for common response types
 - Automatically sets appropriate Content-Type and Content-Length headers
