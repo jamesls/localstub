@@ -4,7 +4,10 @@
       "Skill(python-coding:testing-guidelines)",
       "Bash(poe auto-check)",
       "Skill(python-test-code-reviewer)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(poe test:*)",
+      "WebFetch(domain:www.python-httpx.org)",
+      "Skill(python-coding:coding-guidelines)"
     ],
     "deny": [],
     "ask": []
