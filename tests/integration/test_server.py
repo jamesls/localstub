@@ -141,3 +141,132 @@ async def test_server_tracks_requests_by_client(server):
     assert client2_requests[1].path == "/client2_B"
     assert client2_requests[1].method == "POST"
     assert client2_requests[1].json_body == {"id": 2}
+
+
+@pytest.mark.asyncio
+async def test_clear_requests_resets_state(server, client):
+    """Test that clear_requests() clears all recorded request state."""
+    server.set_json_response({"status": "ok"})
+
+    # Make several requests
+    await client.get(f"{server.url}first")
+    await client.post(f"{server.url}second", json={"data": "test"})
+
+    # Verify requests were recorded
+    assert len(server.requests) == 2
+    assert server.last_request is not None
+    assert server.last_request.path == "/second"
+
+    # Clear state
+    server.clear_requests()
+
+    # Verify state is cleared
+    assert len(server.requests) == 0
+    assert server.last_request is None
+
+
+@pytest.mark.asyncio
+async def test_clear_requests_allows_multiple_cycles(server, client):
+    """Test that clear_requests() can be called multiple times."""
+    server.set_json_response({"cycle": 1})
+
+    # Cycle 1
+    await client.get(f"{server.url}cycle1")
+    assert len(server.requests) == 1
+    assert server.requests[0].path == "/cycle1"
+
+    server.clear_requests()
+
+    # Cycle 2
+    await client.get(f"{server.url}cycle2")
+    assert len(server.requests) == 1
+    assert server.requests[0].path == "/cycle2"
+
+    server.clear_requests()
+
+    # Cycle 3
+    await client.get(f"{server.url}cycle3")
+    assert len(server.requests) == 1
+    assert server.requests[0].path == "/cycle3"
+
+
+@pytest.mark.asyncio
+async def test_clear_requests_preserves_default_response(server, client):
+    """Test that clear_requests() preserves the default response config."""
+    server.set_json_response({"message": "configured"}, status=201)
+
+    # Make a request and verify response
+    response1 = await client.get(server.url)
+    assert response1.status_code == 201
+    assert response1.json() == {"message": "configured"}
+
+    # Clear and make another request
+    server.clear_requests()
+
+    response2 = await client.get(server.url)
+    assert response2.status_code == 201
+    assert response2.json() == {"message": "configured"}
+    assert len(server.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_clear_requests_preserves_handler(server, client):
+    """Test that clear_requests() preserves the custom handler."""
+
+    request_count = 0
+
+    def custom_handler(request):
+        nonlocal request_count
+        request_count += 1
+        from localstub.server import StubResponse
+
+        return StubResponse.json({"count": request_count})
+
+    server.handler = custom_handler
+
+    # First request
+    response1 = await client.get(server.url)
+    assert response1.json() == {"count": 1}
+
+    # Clear and make second request
+    server.clear_requests()
+
+    response2 = await client.get(server.url)
+    # Handler should still be active
+    assert response2.json() == {"count": 2}
+    # But requests list should only have 1 request
+    assert len(server.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_scoped_server_pattern():
+    """Test session-scoped server reuse pattern across multiple tests."""
+    # Simulates a session-scoped fixture
+    async with AsyncHTTPTestServer() as server:
+        async with httpx.AsyncClient() as client:
+            # Test 1: Check initial state
+            server.set_json_response({"test": 1})
+            response = await client.get(server.url)
+            assert response.json() == {"test": 1}
+            assert len(server.requests) == 1
+
+            # Clear state between tests
+            server.clear_requests()
+
+            # Test 2: Fresh state after clear
+            server.set_json_response({"test": 2})
+            response = await client.get(server.url)
+            assert response.json() == {"test": 2}
+            assert len(server.requests) == 1
+            assert server.requests[0].path == "/"
+
+            # Clear state between tests
+            server.clear_requests()
+
+            # Test 3: Multiple requests in one test
+            server.set_json_response({"test": 3})
+            await client.get(f"{server.url}a")
+            await client.get(f"{server.url}b")
+            assert len(server.requests) == 2
+            assert server.requests[0].path == "/a"
+            assert server.requests[1].path == "/b"
