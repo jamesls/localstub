@@ -18,7 +18,7 @@ LOG = logging.getLogger(__name__)
 
 
 @dataclass
-class RequestRecorder:
+class HTTPRequest:
     """Snapshot of a single HTTP request.
 
     `body` is decoded as UTF-8 (like the original code).
@@ -140,7 +140,7 @@ class StubResponse:
         return cls(status=status, headers=base_headers, body=data)
 
 
-Handler = Callable[[RequestRecorder], Awaitable[StubResponse] | StubResponse]
+Handler = Callable[[HTTPRequest], Awaitable[StubResponse] | StubResponse]
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ class AsyncHTTPTestServer:
 
     Features:
       * exposes .url (e.g. "http://127.0.0.1:12345/")
-      * records last_request (RequestRecorder) and a list of all requests
+      * records last_request (HTTPRequest) and a list of all requests
       * `wire_raw_bytes` contains the *exact* bytes received, including
         chunked framing and trailers.
       * configurable static response, or plug in your own handler(request).
@@ -175,9 +175,9 @@ class AsyncHTTPTestServer:
             default_response or StubResponse.json({})
         )
 
-        self.last_request: RequestRecorder | None = None
-        self.requests: list[RequestRecorder] = []
-        self._request_queue: asyncio.Queue[RequestRecorder] = asyncio.Queue()
+        self.last_request: HTTPRequest | None = None
+        self.requests: list[HTTPRequest] = []
+        self._request_queue: asyncio.Queue[HTTPRequest] = asyncio.Queue()
 
         # Connection-level raw bytes tracking (keyed by client address)
         self._connection_raw_bytes_received: dict[
@@ -328,9 +328,7 @@ class AsyncHTTPTestServer:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose()
 
-    async def next_request(
-        self, timeout: float | None = None
-    ) -> RequestRecorder:
+    async def next_request(self, timeout: float | None = None) -> HTTPRequest:
         """Await and return the next request that hits this server."""
         if timeout is None:
             req = await self._request_queue.get()
@@ -362,7 +360,7 @@ class AsyncHTTPTestServer:
             self._connection_raw_bytes_sent[client],
         )
 
-    async def _get_response(self, request: RequestRecorder) -> StubResponse:
+    async def _get_response(self, request: HTTPRequest) -> StubResponse:
         """Get response for a request, using handler or default."""
         if self._handler is None:
             return self._default_response
@@ -411,7 +409,7 @@ class AsyncHTTPTestServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         connection_wire: bytearray | None = None,
-    ) -> RequestRecorder | None:
+    ) -> HTTPRequest | None:
         wire = bytearray()
         header_lines: list[bytes] = []
 
@@ -438,7 +436,7 @@ class AsyncHTTPTestServer:
         # --- Client info ---
         client = self._extract_client_info(writer)
 
-        return RequestRecorder(
+        return HTTPRequest(
             method=method,
             path=path,
             http_version=version,
@@ -633,7 +631,7 @@ class AsyncHTTPTestServer:
             return body_obj
         return str(body_obj).encode("utf-8")
 
-    def _should_close_connection(self, request: RequestRecorder) -> bool:
+    def _should_close_connection(self, request: HTTPRequest) -> bool:
         """Check if client requested connection close."""
         if not request.headers:
             return False
@@ -673,7 +671,7 @@ class AsyncHTTPTestServer:
         self,
         writer: asyncio.StreamWriter,
         response: StubResponse,
-        request: RequestRecorder,
+        request: HTTPRequest,
         connection_wire_sent: bytearray | None = None,
     ) -> bool:
         try:

@@ -40,19 +40,9 @@ uv run pytest -v tests/
 ```
 
 ### Code Quality
-```sh
-# Run all checks (linting, formatting, type checking)
-poe check
 
-# Auto-fix formatting and linting issues
-poe auto-check
-
-# Format code only
-poe format-code
-
-# Before submitting PR
-poe prcheck  # runs check + test
-```
+You MUST run `poe auto-check` if you make any code changes (including tests).
+This is a HARD REQUIREMENT.
 
 ## Code Architecture
 
@@ -62,9 +52,9 @@ poe prcheck  # runs check + test
 - Main test server class using asyncio's `start_server`
 - Records all incoming requests in `.requests` list and `.last_request`
 - Supports both static responses and dynamic handler functions
-- Handler can be sync or async: `Callable[[RequestRecorder], Awaitable[StubResponse] | StubResponse]`
+- Handler can be sync or async: `Callable[[HTTPRequest], Awaitable[StubResponse] | StubResponse]`
 
-**RequestRecorder** (`src/localstub/server.py`)
+**HTTPRequest** (`src/localstub/server.py`)
 - Captures HTTP request details including method, path, headers, body
 - `wire_raw_bytes` contains exact bytes received from the wire, including chunked framing
 - `json_body` property for convenient JSON access
@@ -101,6 +91,10 @@ tests/
 - **Quote style**: Preserve existing quotes (configured in ruff)
 - **Type hints**: Required (pyright enforces this)
 - **Imports**: `from __future__ import annotations` for modern type hints
+
+You MUST load the various `python-coding:*` skills when you are checking or
+reviewing code, e.g. `python-coding:coding-guidelines`, etc.  The content
+in those python coding skills are REQUIREMENTS and cannot be ignored.
 
 ## Coverage
 
