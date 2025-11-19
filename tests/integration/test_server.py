@@ -625,3 +625,272 @@ async def test_connection_bytes_with_chunked_encoding(server, client):
     assert b"second" in conn_bytes
     # Should contain final chunk marker
     assert b"0\r\n" in conn_bytes
+
+
+@pytest.mark.asyncio
+async def test_response_sequence_returns_responses_in_order(server, client):
+    """Test that response sequence returns configured responses in order."""
+    server.set_response_sequence([
+        HTTPResponse(status=500),
+        HTTPResponse(status=502),
+        HTTPResponse.json({"success": True}),
+    ])
+
+    # First request gets 500
+    response1 = await client.get(server.url)
+    assert response1.status_code == 500
+
+    # Second request gets 502
+    response2 = await client.get(server.url)
+    assert response2.status_code == 502
+
+    # Third request gets 200 with JSON
+    response3 = await client.get(server.url)
+    assert response3.status_code == 200
+    assert response3.json() == {"success": True}
+
+    # All requests should be recorded
+    assert len(server.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_response_sequence_exhaustion_falls_back_to_default(
+    server, client
+):
+    """Test sequence falls back to handler/default after exhaustion."""
+    # Set a handler as fallback
+    server.handler = lambda req: HTTPResponse.json({"fallback": True})
+
+    # Set a sequence of 2 responses
+    server.set_response_sequence([
+        HTTPResponse(status=500),
+        HTTPResponse(status=500),
+    ])
+
+    # First two requests consume the sequence
+    response1 = await client.get(server.url)
+    assert response1.status_code == 500
+
+    response2 = await client.get(server.url)
+    assert response2.status_code == 500
+
+    # Third request should fall back to handler
+    response3 = await client.get(server.url)
+    assert response3.status_code == 200
+    assert response3.json() == {"fallback": True}
+
+
+@pytest.mark.asyncio
+async def test_response_sequence_clears_default_response(server, client):
+    """Test that set_response_sequence clears previous default response."""
+    # First set a default response
+    server.set_json_response({"default": "value"})
+
+    # Verify it works
+    response1 = await client.get(server.url)
+    assert response1.json() == {"default": "value"}
+
+    server.clear_requests()
+
+    # Now set a response sequence - should clear the default
+    server.set_response_sequence([HTTPResponse(status=503)])
+
+    # Should get 503, not the old default
+    response2 = await client.get(server.url)
+    assert response2.status_code == 503
+
+    # After sequence exhaustion, should get empty default
+    response3 = await client.get(server.url)
+    assert response3.status_code == 200
+    assert response3.json() == {}
+
+
+@pytest.mark.asyncio
+async def test_set_json_response_clears_sequence(server, client):
+    """Test that set_json_response clears any response sequence."""
+    # First set a sequence
+    server.set_response_sequence([
+        HTTPResponse(status=500),
+        HTTPResponse(status=500),
+    ])
+
+    # Now set a JSON response - should clear the sequence
+    server.set_json_response({"message": "override"})
+
+    # Should get the JSON response, not sequence
+    response = await client.get(server.url)
+    assert response.status_code == 200
+    assert response.json() == {"message": "override"}
+
+    # Multiple requests should all get the same response
+    response2 = await client.get(server.url)
+    assert response2.json() == {"message": "override"}
+
+
+@pytest.mark.asyncio
+async def test_set_text_response_clears_sequence(server, client):
+    """Test that set_text_response clears any response sequence."""
+    server.set_response_sequence([HTTPResponse(status=404)])
+    server.set_text_response("text override")
+
+    response = await client.get(server.url)
+    assert response.status_code == 200
+    assert response.text == "text override"
+
+
+@pytest.mark.asyncio
+async def test_set_raw_response_clears_sequence(server, client):
+    """Test that set_raw_response clears any response sequence."""
+    server.set_response_sequence([HTTPResponse(status=500)])
+    server.set_raw_response(b"raw bytes")
+
+    response = await client.get(server.url)
+    assert response.status_code == 200
+    assert response.content == b"raw bytes"
+
+
+@pytest.mark.asyncio
+async def test_clear_requests_resets_sequence_index(server, client):
+    """Test that clear_requests allows sequence reuse."""
+    server.set_response_sequence([
+        HTTPResponse(status=500),
+        HTTPResponse.json({"attempt": 2}),
+    ])
+
+    # First cycle
+    response1 = await client.get(server.url)
+    assert response1.status_code == 500
+
+    response2 = await client.get(server.url)
+    assert response2.json() == {"attempt": 2}
+
+    # Clear requests - should reset sequence index
+    server.clear_requests()
+
+    # Second cycle - sequence should restart
+    response3 = await client.get(server.url)
+    assert response3.status_code == 500
+
+    response4 = await client.get(server.url)
+    assert response4.json() == {"attempt": 2}
+
+
+@pytest.mark.asyncio
+async def test_response_sequence_for_retry_testing():
+    """Test the motivating use case: testing client retry behavior."""
+    async with AsyncHTTPTestServer() as server:
+        # Configure server to fail twice, then succeed
+        server.set_response_sequence([
+            HTTPResponse(status=500),  # First attempt fails
+            HTTPResponse(status=500),  # First retry fails
+            HTTPResponse.json({"success": True}),  # Second retry succeeds
+        ])
+
+        # Simulate a client with retry logic
+        async with httpx.AsyncClient() as client:
+            attempts = 0
+            max_attempts = 3
+
+            for attempt in range(max_attempts):
+                attempts += 1
+                response = await client.get(server.url)
+
+                if response.status_code == 200:
+                    # Success!
+                    assert response.json() == {"success": True}
+                    break
+
+                # Retry on 500
+                assert response.status_code == 500
+
+            # Should have made exactly 3 attempts
+            assert attempts == 3
+            assert len(server.requests) == 3
+
+            # Verify the sequence worked correctly
+            assert server.requests[0].method == "GET"
+            assert server.requests[1].method == "GET"
+            assert server.requests[2].method == "GET"
+
+
+@pytest.mark.asyncio
+async def test_response_sequence_respects_router_priority(server, client):
+    """Test that response sequence has higher priority than routes."""
+    # Set up a route
+    server.add_route(
+        "GET", "/special", lambda req: HTTPResponse.text("route-handler")
+    )
+
+    # Set a response sequence
+    server.set_response_sequence([HTTPResponse.json({"sequence": True})])
+
+    # Sequence should take precedence
+    response = await client.get(f"{server.url}special")
+    assert response.status_code == 200
+    assert response.json() == {"sequence": True}
+
+
+@pytest.mark.asyncio
+async def test_response_sequence_works_across_multiple_clients():
+    """Test that response sequence is global across different clients."""
+    async with AsyncHTTPTestServer() as server:
+        server.set_response_sequence([
+            HTTPResponse.json({"client": 1}),
+            HTTPResponse.json({"client": 2}),
+            HTTPResponse.json({"client": 3}),
+        ])
+
+        # Three different clients each make one request
+        async with httpx.AsyncClient() as client1:
+            response1 = await client1.get(server.url)
+            assert response1.json() == {"client": 1}
+
+        async with httpx.AsyncClient() as client2:
+            response2 = await client2.get(server.url)
+            assert response2.json() == {"client": 2}
+
+        async with httpx.AsyncClient() as client3:
+            response3 = await client3.get(server.url)
+            assert response3.json() == {"client": 3}
+
+        # All three requests recorded
+        assert len(server.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_response_sequence_with_different_request_methods(
+    server, client
+):
+    """Test that sequence works regardless of HTTP method."""
+    server.set_response_sequence([
+        HTTPResponse.json({"method": "first"}),
+        HTTPResponse.json({"method": "second"}),
+        HTTPResponse.json({"method": "third"}),
+    ])
+
+    # Different methods all consume the sequence
+    response1 = await client.get(server.url)
+    assert response1.json() == {"method": "first"}
+
+    response2 = await client.post(server.url, json={"test": "data"})
+    assert response2.json() == {"method": "second"}
+
+    response3 = await client.put(server.url, content=b"test")
+    assert response3.json() == {"method": "third"}
+
+    # Verify all requests recorded with correct methods
+    assert server.requests[0].method == "GET"
+    assert server.requests[1].method == "POST"
+    assert server.requests[2].method == "PUT"
+
+
+@pytest.mark.asyncio
+async def test_empty_response_sequence_uses_fallback(server, client):
+    """Test that an empty sequence immediately falls back."""
+    server.set_json_response({"default": True})
+    server.set_response_sequence([])  # Empty sequence
+
+    response = await client.get(server.url)
+    # Should use the default (which was cleared by set_response_sequence)
+    assert response.status_code == 200
+    assert response.json() == {}
