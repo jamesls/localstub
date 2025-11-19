@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 import pytest_asyncio
@@ -894,3 +896,390 @@ async def test_empty_response_sequence_uses_fallback(server, client):
     # Should use the default (which was cleared by set_response_sequence)
     assert response.status_code == 200
     assert response.json() == {}
+
+
+async def send_raw_request(host, port, data):
+    """Send raw bytes to server and read response."""
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(data)
+        await writer.drain()
+        # Give server time to process
+        await asyncio.sleep(0.1)
+        response = await asyncio.wait_for(reader.read(4096), timeout=1.0)
+        return response
+    except asyncio.TimeoutError:
+        return b""
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_server_handles_empty_request_line(server):
+    """Test server handles empty request line gracefully."""
+    # Send just EOF without any request line
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    writer.close()
+    await writer.wait_closed()
+
+    # Server should not crash, no request should be recorded
+    await asyncio.sleep(0.1)
+    assert len(server.requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_server_handles_malformed_request_line(server):
+    """Test server handles request line without 3 parts."""
+    # Send malformed request line (only 2 parts)
+    await send_raw_request(
+        server.host,
+        server.port,
+        b"GET /path\r\n\r\n",
+    )
+
+    # Server should handle gracefully
+    await asyncio.sleep(0.1)
+    assert len(server.requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_server_handles_eof_while_reading_headers(server):
+    """Test server handles EOF while reading headers."""
+    # Send request line but close before sending complete headers
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    writer.write(b"GET / HTTP/1.1\r\n")
+    writer.write(b"Host: localhost\r\n")
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+    await asyncio.sleep(0.1)
+    # Request should not be recorded since headers weren't complete
+    assert len(server.requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_server_handles_invalid_content_length(server):
+    """Test server handles non-numeric Content-Length."""
+    response = await send_raw_request(
+        server.host,
+        server.port,
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Length: not-a-number\r\n"
+        b"\r\n",
+    )
+
+    # Server should handle this gracefully and return a response
+    assert b"HTTP/1.1" in response
+
+
+@pytest.mark.asyncio
+async def test_server_handles_invalid_chunk_size(server):
+    """Test server handles invalid chunk size in chunked encoding."""
+    await send_raw_request(
+        server.host,
+        server.port,
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"INVALID\r\n"
+        b"test\r\n",
+    )
+
+    # Server should handle this gracefully
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_server_handles_eof_in_chunked_body(server):
+    """Test server handles EOF while reading chunked body."""
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    writer.write(
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5\r\n"
+    )
+    await writer.drain()
+    # Close before sending the chunk data
+    writer.close()
+    await writer.wait_closed()
+
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_server_handles_eof_in_chunk_trailers(server):
+    """Test server handles EOF while reading chunk trailers."""
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    writer.write(
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5\r\nhello\r\n"
+        b"0\r\n"
+    )
+    await writer.drain()
+    # Close before sending final CRLF
+    writer.close()
+    await writer.wait_closed()
+
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_server_handles_invalid_status_code():
+    """Test server handles invalid status codes gracefully."""
+    async with AsyncHTTPTestServer() as server:
+        # Set response with invalid status code
+        server.set_json_response({"test": "value"}, status=999)
+
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+
+        response = await reader.read(4096)
+        writer.close()
+        await writer.wait_closed()
+
+        # Server should return the response with "UNKNOWN" reason
+        assert b"HTTP/1.1 999 UNKNOWN" in response
+
+
+# ---------------------------------------------------------------------------
+# next_request() timeout tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_next_request_without_timeout(server):
+    """Test next_request() waits indefinitely without timeout."""
+
+    async def make_request():
+        await asyncio.sleep(0.1)
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+        await reader.read(4096)
+        writer.close()
+        await writer.wait_closed()
+
+    # Start request in background
+    request_task = asyncio.create_task(make_request())
+
+    # Wait for request without timeout
+    request = await server.next_request(timeout=None)
+    assert request.method == "GET"
+    assert request.path == "/"
+
+    await request_task
+
+
+@pytest.mark.asyncio
+async def test_next_request_with_timeout_success(server):
+    """Test next_request() with timeout that completes in time."""
+
+    async def make_request():
+        await asyncio.sleep(0.05)
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        writer.write(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+        await reader.read(4096)
+        writer.close()
+        await writer.wait_closed()
+
+    request_task = asyncio.create_task(make_request())
+
+    # Wait with sufficient timeout
+    request = await server.next_request(timeout=5.0)
+    assert request.method == "GET"
+    assert request.path == "/test"
+
+    await request_task
+
+
+@pytest.mark.asyncio
+async def test_next_request_with_timeout_expires():
+    """Test next_request() raises TimeoutError when timeout expires."""
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({"test": "ok"})
+
+        # Wait for request that never arrives
+        with pytest.raises(asyncio.TimeoutError):
+            await server.next_request(timeout=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Exception handling tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_server_handles_exception_during_request_processing():
+    """Test server handles exceptions during request processing."""
+    async with AsyncHTTPTestServer() as server:
+
+        def failing_handler(request):
+            raise ValueError("Handler error")
+
+        server.handler = failing_handler
+
+        # Make request that will trigger handler exception
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+
+        # Server should handle exception and close connection
+        await asyncio.sleep(0.2)
+
+        writer.close()
+        await writer.wait_closed()
+
+        # Request should still be recorded before handler error
+        assert len(server.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_server_handles_writer_close_exception():
+    """Test server handles exceptions when closing writer."""
+
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({"test": "ok"})
+
+        # Make a normal request
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+
+        # Read response
+        await reader.read(4096)
+
+        # Forcefully close from client side
+        writer.close()
+        await writer.wait_closed()
+
+        # Give server time to handle cleanup
+        await asyncio.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
+# Raw socket tests for EOF in various stages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_server_handles_immediate_eof_in_request_line(server):
+    """Test server handles immediate EOF (no data at all)."""
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    # Close immediately without sending anything
+    writer.close()
+    await writer.wait_closed()
+
+    await asyncio.sleep(0.1)
+    assert len(server.requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_server_handles_eof_after_chunk_size(server):
+    """Test server handles EOF right after reading chunk size line."""
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    writer.write(
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    )
+    await writer.drain()
+    # Close before sending any chunk size
+    writer.close()
+    await writer.wait_closed()
+
+    await asyncio.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
+# Connection: close handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_server_closes_connection_on_connection_close_header(server):
+    """Test server closes connection when Connection: close is sent."""
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+
+    # Send request with Connection: close
+    writer.write(
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    await writer.drain()
+
+    # Read response
+    response = await reader.read(4096)
+    assert b"HTTP/1.1 200 OK" in response
+    assert b"Connection: close" in response
+
+    # Try to send another request on the same connection
+    writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    await writer.drain()
+
+    # Server should have closed the connection after first request
+    # Second request should get no response
+    await asyncio.sleep(0.1)
+
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except ConnectionResetError:
+        # Expected - server already closed the connection
+        pass
+
+    # Only first request should be recorded
+    assert len(server.requests) == 1
+
+
+# ---------------------------------------------------------------------------
+# Additional edge case tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_server_handles_chunked_with_trailer_headers(server):
+    """Test server handles chunked encoding with trailing headers."""
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    writer.write(
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5\r\n"
+        b"hello\r\n"
+        b"0\r\n"
+        b"X-Trailer: value\r\n"
+        b"\r\n"
+    )
+    await writer.drain()
+
+    response = await reader.read(4096)
+    assert b"HTTP/1.1 200 OK" in response
+
+    writer.close()
+    await writer.wait_closed()
+
+    await asyncio.sleep(0.1)
+    assert len(server.requests) == 1
+    assert server.last_request.body == "hello"
