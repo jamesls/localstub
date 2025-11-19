@@ -140,7 +140,101 @@ class HTTPResponse:
         return cls(status=status, headers=base_headers, body=data)
 
 
+# Backwards-compatible alias expected by tests/handlers.
+# Minimal public surface change to keep import working.
+StubResponse = HTTPResponse
+
+
 Handler = Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]
+
+
+# ---------------------------------------------------------------------------
+# Internal layering (MVP adapters inspired by better.py)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ConnectionContext:
+    """Per-connection tracking container.
+
+    Minimal adapter that holds references to the connection-level wire buffers
+    maintained by the server. Tests do not access this class; it is internal
+    and used only to clarify responsibilities.
+    """
+
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    client: tuple[str, int] | None
+    raw_received_total: bytearray | None
+    raw_sent_total: bytearray | None
+    history: list[tuple[HTTPRequest, HTTPResponse]] = field(
+        default_factory=list
+    )
+
+
+class HTTPProtocol:
+    """Thin protocol facade that delegates to existing helpers.
+
+    This allows us to separate parsing/formatting concerns from the server
+    loop without changing the tested public API or behavior.
+    """
+
+    def __init__(self, server: "AsyncHTTPTestServer") -> None:  # noqa: F821
+        self._server = server
+
+    async def parse_request(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        conn_recv: bytearray | None,
+    ) -> HTTPRequest | None:
+        return await self._server._read_request(reader, writer, conn_recv)
+
+    async def send_response(
+        self,
+        writer: asyncio.StreamWriter,
+        response: HTTPResponse,
+        request: HTTPRequest,
+        conn_sent: bytearray | None,
+    ) -> bool:
+        return await self._server._write_response(
+            writer, response, request, conn_sent
+        )
+
+
+class Router:
+    """Small router wrapper with optional method/path routes.
+
+    MVP behavior: if no explicit route matches, falls back to the server's
+    `handler` callable. If that is also absent, returns the configured
+    default response.
+    """
+
+    def __init__(self) -> None:
+        self._routes: dict[tuple[str, str], Handler] = {}
+
+    def add_route(self, method: str, path: str, handler: Handler) -> None:
+        self._routes[(method.upper(), path)] = handler
+
+    async def resolve(
+        self,
+        request: HTTPRequest,
+        fallback_handler: Handler | None,
+        default_response: HTTPResponse,
+    ) -> HTTPResponse:
+        key = (
+            request.method.upper() if request.method else "",
+            request.path or "/",
+        )
+        handler = self._routes.get(key, fallback_handler)
+
+        if handler is None:
+            return default_response
+
+        result = handler(request)
+        if inspect.isawaitable(result):
+            return await result  # type: ignore[return-value]
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +268,7 @@ class AsyncHTTPTestServer:
         self._default_response: HTTPResponse = (
             default_response or HTTPResponse.json({})
         )
+        self._router = Router()
 
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
@@ -205,6 +300,10 @@ class AsyncHTTPTestServer:
     @handler.setter
     def handler(self, value: Handler | None) -> None:
         self._handler = value
+
+    # Optional convenience for method/path handlers; tests don't use this.
+    def add_route(self, method: str, path: str, handler: Handler) -> None:
+        self._router.add_route(method, path, handler)
 
     def set_json_response(
         self,
@@ -361,14 +460,10 @@ class AsyncHTTPTestServer:
         )
 
     async def _get_response(self, request: HTTPRequest) -> HTTPResponse:
-        """Get response for a request, using handler or default."""
-        if self._handler is None:
-            return self._default_response
-
-        result = self._handler(request)
-        if inspect.isawaitable(result):
-            return await result  # type: ignore[return-value]
-        return result
+        """Get response via router, falling back to handler or default."""
+        return await self._router.resolve(
+            request, self._handler, self._default_response
+        )
 
     async def _handle_client(
         self,
@@ -377,10 +472,20 @@ class AsyncHTTPTestServer:
     ) -> None:
         client = self._extract_client_info(writer)
         conn_recv, conn_sent = self._init_connection_tracking(client)
+        protocol = HTTPProtocol(self)
+        ctx = ConnectionContext(
+            reader=reader,
+            writer=writer,
+            client=client,
+            raw_received_total=conn_recv,
+            raw_sent_total=conn_sent,
+        )
 
         try:
             while True:
-                request = await self._read_request(reader, writer, conn_recv)
+                request = await protocol.parse_request(
+                    reader, writer, conn_recv
+                )
                 if request is None:
                     break
 
@@ -389,9 +494,13 @@ class AsyncHTTPTestServer:
                 await self._request_queue.put(request)
 
                 response = await self._get_response(request)
-                should_close = await self._write_response(
+                should_close = await protocol.send_response(
                     writer, response, request, conn_sent
                 )
+
+                # Keep a lightweight per-connection history for debugging
+                ctx.history.append((request, response))
+
                 if should_close:
                     break
 
