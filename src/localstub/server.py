@@ -86,7 +86,7 @@ def _parse_headers(header_lines: list[bytes]) -> Message:
 
 
 @dataclass
-class StubResponse:
+class HTTPResponse:
     status: int = 200
     headers: dict[str, str] = field(default_factory=dict)
     body: bytes | str | None = b""
@@ -98,7 +98,7 @@ class StubResponse:
         *,
         status: int = 200,
         headers: Optional[dict[str, str]] = None,
-    ) -> StubResponse:
+    ) -> HTTPResponse:
         text = json.dumps(obj)
         body = text.encode("utf-8")
         base_headers = {
@@ -116,7 +116,7 @@ class StubResponse:
         *,
         status: int = 200,
         headers: Optional[dict[str, str]] = None,
-    ) -> StubResponse:
+    ) -> HTTPResponse:
         body = text.encode("utf-8")
         base_headers = {
             "Content-Type": "text/plain; charset=utf-8",
@@ -133,14 +133,14 @@ class StubResponse:
         *,
         status: int = 200,
         headers: Optional[dict[str, str]] = None,
-    ) -> StubResponse:
+    ) -> HTTPResponse:
         base_headers = {"Content-Length": str(len(data))}
         if headers:
             base_headers.update(headers)
         return cls(status=status, headers=base_headers, body=data)
 
 
-Handler = Callable[[HTTPRequest], Awaitable[StubResponse] | StubResponse]
+Handler = Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]
 
 
 # ---------------------------------------------------------------------------
@@ -164,15 +164,15 @@ class AsyncHTTPTestServer:
         host: str = "127.0.0.1",
         port: int = 0,
         handler: Handler | None = None,
-        default_response: StubResponse | None = None,
+        default_response: HTTPResponse | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._server: asyncio.base_events.Server | None = None
 
         self._handler: Handler | None = handler
-        self._default_response: StubResponse = (
-            default_response or StubResponse.json({})
+        self._default_response: HTTPResponse = (
+            default_response or HTTPResponse.json({})
         )
 
         self.last_request: HTTPRequest | None = None
@@ -214,7 +214,7 @@ class AsyncHTTPTestServer:
         headers: Optional[dict[str, str]] = None,
     ) -> None:
         """Configure a static JSON response returned for every request."""
-        self._default_response = StubResponse.json(
+        self._default_response = HTTPResponse.json(
             obj, status=status, headers=headers
         )
 
@@ -225,7 +225,7 @@ class AsyncHTTPTestServer:
         status: int = 200,
         headers: Optional[dict[str, str]] = None,
     ) -> None:
-        self._default_response = StubResponse.text(
+        self._default_response = HTTPResponse.text(
             text,
             status=status,
             headers=headers,
@@ -238,7 +238,7 @@ class AsyncHTTPTestServer:
         status: int = 200,
         headers: Optional[dict[str, str]] = None,
     ) -> None:
-        self._default_response = StubResponse.raw(
+        self._default_response = HTTPResponse.raw(
             data,
             status=status,
             headers=headers,
@@ -360,7 +360,7 @@ class AsyncHTTPTestServer:
             self._connection_raw_bytes_sent[client],
         )
 
-    async def _get_response(self, request: HTTPRequest) -> StubResponse:
+    async def _get_response(self, request: HTTPRequest) -> HTTPResponse:
         """Get response for a request, using handler or default."""
         if self._handler is None:
             return self._default_response
@@ -640,7 +640,7 @@ class AsyncHTTPTestServer:
 
     def _build_response_headers(
         self,
-        response: StubResponse,
+        response: HTTPResponse,
         body: bytes,
         should_close: bool,
     ) -> dict[str, str]:
@@ -670,7 +670,7 @@ class AsyncHTTPTestServer:
     async def _write_response(
         self,
         writer: asyncio.StreamWriter,
-        response: StubResponse,
+        response: HTTPResponse,
         request: HTTPRequest,
         connection_wire_sent: bytearray | None = None,
     ) -> bool:
