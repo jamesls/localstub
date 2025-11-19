@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(python-coding:testing-guidelines)",
+      "Bash(poe auto-check)",
+      "Skill(python-test-code-reviewer)",
+      "WebSearch"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

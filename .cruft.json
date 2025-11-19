@@ -1,0 +1,21 @@
+{
+  "template": "/Users/jsaryer/Source/misc/../jmes-cookiecutter-python-package",
+  "commit": "3d5e158f6fa18e451b36d42e11c9dbca622e95be",
+  "checkout": null,
+  "context": {
+    "cookiecutter": {
+      "project_name": "localstub",
+      "project_slug": "localstub",
+      "package_name": "localstub",
+      "project_short_description": "Local HTTP Stub for Testing",
+      "year": "2025",
+      "version": "0.0.1",
+      "github_username": "jamesls",
+      "full_name": "James Saryerwinnie",
+      "email": "js@jamesls.com",
+      "pypi_username": "jamesls",
+      "_template": "/Users/jsaryer/Source/misc/../jmes-cookiecutter-python-package"
+    }
+  },
+  "directory": null
+}

@@ -1,0 +1,110 @@
+[project]
+name = "localstub"
+version = "0.0.1"
+description = "Local HTTP Stub for Testing"
+authors = [
+  { name="James Saryerwinnie", email="js@jamesls.com"},
+]
+license = "Apache-2.0"
+readme = "README.md"
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+requires-python = ">=3.12.0,<3.13.0"
+dependencies = [
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.2",
+  "httpx",
+  "pytest-asyncio",
+  "pytest-cov>=7.0.0",
+  "mkdocstrings>=0.30.0",
+  "mkdocs-material>=9.6.20",
+  "pymdown-extensions>=10.16.1",
+  "pytest-github-actions-annotate-failures>=0.3.0",
+  "jmeslog>=0.2.0",
+  "poethepoet>=0.37.0",
+  "ruff>=0.13.0",
+  "pyright[nodejs]>=1.1.405",
+  "pygments>=2.19.2",
+]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/localstub"]
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+extend-select = ["C901", "PLR0915", "E501"]
+
+[tool.ruff.format]
+quote-style = "preserve"
+preview = true
+
+[tool.pytest.ini_options]
+addopts = """\
+    --cov localstub \
+    --cov-report term-missing \
+    --no-cov-on-fail \
+"""
+
+[tool.coverage.run]
+branch = true
+source = ["src/"]
+
+
+[tool.coverage.report]
+exclude_lines = [
+    'if TYPE_CHECKING:',
+    'pragma: no cover',
+    'raise NotImplementedError',
+]
+
+[tool.pyright]
+include = ["src"]
+exclude = ["**/__pycache__"]
+
+reportMissingImports = true
+reportMissingTypeStubs = false
+
+pythonVersion = "3.12"
+pythonPlatform = "All"
+
+[tool.poe.tasks]
+check = [
+  { cmd = ".venv/bin/ruff check ." },
+  { cmd = ".venv/bin/ruff format --diff ." },
+  { cmd = ".venv/bin/pyright" },
+]
+test = ".venv/bin/pytest tests/"
+stage-release = "python3 ./scripts/stage-release --output staged-release.zip"
+format-code = [
+  { cmd = ".venv/bin/ruff format ." },
+]
+# Similar to check, but also auto fixes issues.
+auto-check = [
+  { cmd = ".venv/bin/ruff format ." },
+  { cmd = ".venv/bin/ruff check --fix ." },
+  { cmd = ".venv/bin/pyright" },
+]
+prcheck = ["check", "test"]
+
+# Uncomment if you want to add a CLI script.
+# [project.scripts]
+# my-cli-command = "module.path.foo:app"
