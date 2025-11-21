@@ -1,10 +1,15 @@
 import asyncio
+import time
 
 import httpx
 import pytest
 import pytest_asyncio
 
-from localstub.server import AsyncHTTPTestServer, HTTPResponse
+from localstub.server import (
+    AsyncHTTPTestServer,
+    HTTPResponse,
+    ThrottledTransmission,
+)
 
 
 @pytest_asyncio.fixture
@@ -1283,3 +1288,154 @@ async def test_server_handles_chunked_with_trailer_headers(server):
     await asyncio.sleep(0.1)
     assert len(server.requests) == 1
     assert server.last_request.body == "hello"
+
+
+# ---------------------------------------------------------------------------
+# Transmission strategy tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_throttled_transmission_slows_response(server, client):
+    """Test ThrottledTransmission delays response body transmission."""
+    response_data = b"x" * 10000  # 10KB of data
+
+    server.set_raw_response(response_data)
+    server.set_transmission_strategy(
+        ThrottledTransmission(chunk_size=1000, delay=0.05)
+    )
+
+    start = time.time()
+    response = await client.get(server.url)
+    elapsed = time.time() - start
+
+    # Verify response is correct
+    assert response.status_code == 200
+    assert response.content == response_data
+
+    # Should have taken roughly: 10 chunks with 9 delays = 9 * 0.05 = ~0.45s
+    # Allow some margin for network/processing overhead
+    assert elapsed >= 0.40
+
+    # Request should be recorded normally
+    assert len(server.requests) == 1
+    assert server.last_request.method == "GET"
+
+
+@pytest.mark.asyncio
+async def test_throttled_transmission_large_chunks():
+    """Test throttled transmission with larger chunk size."""
+    async with AsyncHTTPTestServer() as server:
+        response_data = b"y" * 50000  # 50KB
+
+        server.set_raw_response(response_data)
+        server.set_transmission_strategy(
+            ThrottledTransmission(chunk_size=10000, delay=0.02)
+        )
+
+        async with httpx.AsyncClient() as client:
+            start = time.time()
+            response = await client.get(server.url)
+            elapsed = time.time() - start
+
+            # 50KB / 10KB = 5 chunks, 4 delays = 4 * 0.02 = 0.08s
+            assert elapsed >= 0.07
+            assert response.content == response_data
+
+
+@pytest.mark.asyncio
+async def test_throttled_transmission_small_body(server, client):
+    """Test throttled transmission with body smaller than chunk size."""
+    small_data = b"small response"
+
+    server.set_raw_response(small_data)
+    server.set_transmission_strategy(
+        ThrottledTransmission(chunk_size=1000, delay=0.1)
+    )
+
+    start = time.time()
+    response = await client.get(server.url)
+    elapsed = time.time() - start
+
+    # Single chunk, no delay
+    assert elapsed < 0.05
+    assert response.content == small_data
+
+
+@pytest.mark.asyncio
+async def test_throttled_transmission_json_response(server, client):
+    """Test throttled transmission works with JSON responses."""
+    json_data = {"data": "x" * 5000}  # Large JSON
+
+    server.set_json_response(json_data)
+    server.set_transmission_strategy(
+        ThrottledTransmission(chunk_size=500, delay=0.01)
+    )
+
+    start = time.time()
+    response = await client.get(server.url)
+    elapsed = time.time() - start
+
+    # Should have throttled the transmission
+    assert elapsed > 0.01
+    assert response.json() == json_data
+
+
+@pytest.mark.asyncio
+async def test_throttled_transmission_with_handler(server, client):
+    """Test throttled transmission works with custom handlers."""
+
+    def handler(request):
+        return HTTPResponse.raw(b"handler response" * 1000)
+
+    server.handler = handler
+    server.set_transmission_strategy(
+        ThrottledTransmission(chunk_size=1000, delay=0.02)
+    )
+
+    start = time.time()
+    response = await client.get(server.url)
+    elapsed = time.time() - start
+
+    expected = b"handler response" * 1000
+    assert response.content == expected
+    # ~16KB with 1KB chunks = 16 chunks, 15 delays = 0.3s
+    assert elapsed >= 0.25
+
+
+@pytest.mark.asyncio
+async def test_throttled_transmission_with_multiple_requests(server, client):
+    """Test throttled transmission applies to all requests."""
+    server.set_raw_response(b"x" * 5000)
+    server.set_transmission_strategy(
+        ThrottledTransmission(chunk_size=1000, delay=0.02)
+    )
+
+    # Make multiple requests - all should be throttled
+    for i in range(3):
+        start = time.time()
+        response = await client.get(server.url)
+        elapsed = time.time() - start
+
+        assert response.status_code == 200
+        # 5 chunks, 4 delays = 0.08s
+        assert elapsed >= 0.07
+
+    assert len(server.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_default_transmission_is_immediate(server, client):
+    """Test that default transmission (without throttling) is fast."""
+    response_data = b"z" * 10000
+
+    server.set_raw_response(response_data)
+    # Don't set any transmission strategy - should use default immediate
+
+    start = time.time()
+    response = await client.get(server.url)
+    elapsed = time.time() - start
+
+    # Should be very fast (no artificial delays)
+    assert elapsed < 0.1
+    assert response.content == response_data

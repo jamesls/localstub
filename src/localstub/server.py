@@ -144,6 +144,89 @@ Handler = Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]
 
 
 # ---------------------------------------------------------------------------
+# Transmission strategies
+# ---------------------------------------------------------------------------
+
+
+class TransmissionStrategy:
+    """Protocol for controlling how response body bytes are transmitted.
+
+    This allows tests to simulate network conditions like slow transfers,
+    throttled bandwidth, etc. without changing the actual response content.
+    """
+
+    async def write_body(
+        self,
+        writer: asyncio.StreamWriter,
+        body: bytes,
+        connection_wire_sent: bytearray | None,
+    ) -> None:
+        """Write the response body to the client.
+
+        Args:
+            writer: The asyncio stream writer to write to
+            body: The complete response body bytes to transmit
+            connection_wire_sent: Optional buffer for tracking sent bytes
+        """
+        raise NotImplementedError
+
+
+class ImmediateTransmission(TransmissionStrategy):
+    """Default transmission strategy - send entire body immediately."""
+
+    async def write_body(
+        self,
+        writer: asyncio.StreamWriter,
+        body: bytes,
+        connection_wire_sent: bytearray | None,
+    ) -> None:
+        writer.write(body)
+        if connection_wire_sent is not None:
+            connection_wire_sent.extend(body)
+        await writer.drain()
+
+
+class ThrottledTransmission(TransmissionStrategy):
+    """Throttled transmission strategy - send body in chunks with delays.
+
+    Useful for testing client behavior with slow network connections or
+    bandwidth-limited scenarios (e.g., S3 GetObject with slow transfer).
+    """
+
+    def __init__(self, chunk_size: int, delay: float) -> None:
+        """Initialize throttled transmission.
+
+        Args:
+            chunk_size: Number of bytes to send in each chunk
+            delay: Seconds to wait between chunks
+        """
+        if chunk_size <= 0:
+            raise ValueError(
+                f"chunk_size must be positive (> 0), got {chunk_size}"
+            )
+        self.chunk_size = chunk_size
+        self.delay = delay
+
+    async def write_body(
+        self,
+        writer: asyncio.StreamWriter,
+        body: bytes,
+        connection_wire_sent: bytearray | None,
+    ) -> None:
+        offset = 0
+        while offset < len(body):
+            chunk = body[offset : offset + self.chunk_size]
+            writer.write(chunk)
+            if connection_wire_sent is not None:
+                connection_wire_sent.extend(chunk)
+            await writer.drain()
+
+            offset += self.chunk_size
+            if offset < len(body):  # Don't delay after last chunk
+                await asyncio.sleep(self.delay)
+
+
+# ---------------------------------------------------------------------------
 # Internal layering (MVP adapters inspired by better.py)
 # ---------------------------------------------------------------------------
 
@@ -269,6 +352,11 @@ class AsyncHTTPTestServer:
         self._response_sequence: list[HTTPResponse] = []
         self._response_sequence_index: int = 0
 
+        # Transmission strategy for controlling how body bytes are sent
+        self._transmission_strategy: TransmissionStrategy = (
+            ImmediateTransmission()
+        )
+
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
         self._request_queue: asyncio.Queue[HTTPRequest] = asyncio.Queue()
@@ -374,6 +462,27 @@ class AsyncHTTPTestServer:
         self._response_sequence_index = 0
         # Clear default response (last one wins)
         self._default_response = HTTPResponse.json({})
+
+    def set_transmission_strategy(
+        self, strategy: TransmissionStrategy
+    ) -> None:
+        """Configure how response body bytes are transmitted.
+
+        This controls the network transmission behavior (e.g., throttling,
+        chunking) without changing the actual response content. Useful for
+        testing client behavior under various network conditions.
+
+        Example:
+            # Simulate slow S3 GetObject response
+            server.set_raw_response(large_file_bytes)
+            server.set_transmission_strategy(
+                ThrottledTransmission(chunk_size=8192, delay=0.1)
+            )
+
+        Args:
+            strategy: TransmissionStrategy instance controlling transmission
+        """
+        self._transmission_strategy = strategy
 
     def get_connection_bytes_received(
         self, client: tuple[str, int]
@@ -852,7 +961,8 @@ class AsyncHTTPTestServer:
             self._write_and_track(writer, header_line, connection_wire_sent)
 
         self._write_and_track(writer, b"\r\n", connection_wire_sent)
-        self._write_and_track(writer, body, connection_wire_sent)
-        await writer.drain()
+        await self._transmission_strategy.write_body(
+            writer, body, connection_wire_sent
+        )
 
         return should_close
