@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from email.message import Message
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 LOG = logging.getLogger(__name__)
 
@@ -201,9 +201,7 @@ class ThrottledTransmission(TransmissionStrategy):
             delay: Seconds to wait between chunks
         """
         if chunk_size <= 0:
-            raise ValueError(
-                f"chunk_size must be positive (> 0), got {chunk_size}"
-            )
+            raise ValueError("chunk_size must be a positive integer")
         self.chunk_size = chunk_size
         self.delay = delay
 
@@ -224,6 +222,127 @@ class ThrottledTransmission(TransmissionStrategy):
             offset += self.chunk_size
             if offset < len(body):  # Don't delay after last chunk
                 await asyncio.sleep(self.delay)
+
+
+@dataclass
+class ApplyResult:
+    """Result of applying a fault step."""
+
+    body: bytes
+    delay_before: float = 0.0
+    drop_after: int | None = None
+
+
+class FaultStep(Protocol):
+    """Protocol for fault steps that mutate transmission behavior."""
+
+    def apply(self, body: bytes) -> ApplyResult: ...
+
+
+class Delay(FaultStep):
+    """Delay sending the body."""
+
+    def __init__(self, seconds: float) -> None:
+        if seconds < 0:
+            raise ValueError("seconds must be non-negative")
+        self.seconds = seconds
+
+    def apply(self, body: bytes) -> ApplyResult:
+        return ApplyResult(body=body, delay_before=self.seconds)
+
+
+class DropConnection(FaultStep):
+    """Close the connection after sending part of the body."""
+
+    def __init__(self, after_bytes: int) -> None:
+        if after_bytes < 0:
+            raise ValueError("after_bytes must be non-negative")
+        self.after_bytes = after_bytes
+
+    def apply(self, body: bytes) -> ApplyResult:
+        return ApplyResult(body=body, drop_after=self.after_bytes)
+
+
+class TruncateBody(FaultStep):
+    """Send only the first N bytes of the body."""
+
+    def __init__(self, keep_bytes: int) -> None:
+        if keep_bytes < 0:
+            raise ValueError("keep_bytes must be non-negative")
+        self.keep_bytes = keep_bytes
+
+    def apply(self, body: bytes) -> ApplyResult:
+        return ApplyResult(body=body[: self.keep_bytes])
+
+
+class ByteFlip(FaultStep):
+    """Flip a single byte in the body using XOR."""
+
+    def __init__(self, offset: int, mask: int = 0xFF) -> None:
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        if mask < 0 or mask > 0xFF:
+            raise ValueError("mask must be between 0 and 255")
+        self.offset = offset
+        self.mask = mask
+
+    def apply(self, body: bytes) -> ApplyResult:
+        if self.offset >= len(body):
+            return ApplyResult(body=body)
+        mutated = bytearray(body)
+        mutated[self.offset] ^= self.mask
+        return ApplyResult(body=bytes(mutated))
+
+
+class FaultyTransmission(TransmissionStrategy):
+    """Always-on fault injection applied during body transmission."""
+
+    def __init__(
+        self,
+        faults: list[FaultStep],
+        base: TransmissionStrategy | None = None,
+    ) -> None:
+        self._faults = faults
+        self._base = base or ImmediateTransmission()
+
+    async def write_body(
+        self,
+        writer: asyncio.StreamWriter,
+        body: bytes,
+        connection_wire_sent: bytearray | None,
+    ) -> None:
+        body_to_send = body
+        total_delay = 0.0
+        drop_after: int | None = None
+
+        for fault in self._faults:
+            result = fault.apply(body_to_send)
+            body_to_send = result.body
+            total_delay += result.delay_before
+            if drop_after is None and result.drop_after is not None:
+                drop_after = result.drop_after
+
+        if total_delay > 0:
+            await asyncio.sleep(total_delay)
+
+        if drop_after is None:
+            await self._base.write_body(
+                writer, body_to_send, connection_wire_sent
+            )
+            return
+
+        to_send = body_to_send[:drop_after]
+        if to_send:
+            writer.write(to_send)
+            if connection_wire_sent is not None:
+                connection_wire_sent.extend(to_send)
+            await writer.drain()
+
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
