@@ -15,6 +15,7 @@ from localstub.server import (
     ImmediateTransmission,
     ThrottledTransmission,
     TruncateBody,
+    RecordingStreamWriter,
 )
 
 
@@ -89,15 +90,15 @@ async def test_immediate_transmission_sends_all_at_once():
     body = b"x" * 10000
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
-    conn_sent = bytearray()
+    recorder = RecordingStreamWriter(writer)
 
-    await strategy.write_body(writer, body, conn_sent)
+    await strategy.write_body(recorder, body)
 
     # Should have exactly one write call with the full body
     assert writer.write.call_count == 1
     assert writer.write.call_args[0][0] == body
     assert writer.drain.call_count == 1
-    assert bytes(conn_sent) == body
+    assert recorder.bytes_sent == body
 
 
 @pytest.mark.asyncio
@@ -108,7 +109,7 @@ async def test_immediate_transmission_without_tracking():
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
 
-    await strategy.write_body(writer, body, None)
+    await strategy.write_body(writer, body)
 
     assert writer.write.call_count == 1
     assert writer.write.call_args[0][0] == body
@@ -122,10 +123,10 @@ async def test_throttled_transmission_chunks_body():
     body = b"x" * 250  # Should create 3 chunks: 100, 100, 50
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
-    conn_sent = bytearray()
+    recorder = RecordingStreamWriter(writer)
 
     start = time.time()
-    await strategy.write_body(writer, body, conn_sent)
+    await strategy.write_body(recorder, body)
     elapsed = time.time() - start
 
     # Should have 3 write calls
@@ -138,8 +139,8 @@ async def test_throttled_transmission_chunks_body():
     assert len(chunks[1]) == 100
     assert len(chunks[2]) == 50
 
-    # Verify connection tracking accumulated all chunks
-    assert bytes(conn_sent) == body
+    # Verify recording accumulated all chunks
+    assert recorder.bytes_sent == body
 
     # Should have delayed twice (not after last chunk)
     # 2 delays * 0.01s = ~0.02s (allow some margin)
@@ -153,16 +154,16 @@ async def test_throttled_transmission_single_chunk():
     body = b"small"
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
-    conn_sent = bytearray()
+    recorder = RecordingStreamWriter(writer)
 
     start = time.time()
-    await strategy.write_body(writer, body, conn_sent)
+    await strategy.write_body(recorder, body)
     elapsed = time.time() - start
 
     # Should have exactly one write, no delays
     assert writer.write.call_count == 1
     assert writer.drain.call_count == 1
-    assert bytes(conn_sent) == body
+    assert recorder.bytes_sent == body
 
     # Should NOT have delayed (single chunk)
     assert elapsed < 0.005
@@ -175,10 +176,10 @@ async def test_throttled_transmission_exact_multiple():
     body = b"x" * 200  # Exactly 2 chunks
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
-    conn_sent = bytearray()
+    recorder = RecordingStreamWriter(writer)
 
     start = time.time()
-    await strategy.write_body(writer, body, conn_sent)
+    await strategy.write_body(recorder, body)
     elapsed = time.time() - start
 
     # Should have 2 write calls
@@ -189,7 +190,7 @@ async def test_throttled_transmission_exact_multiple():
     chunks = [call[0][0] for call in writer.write.call_args_list]
     assert len(chunks[0]) == 100
     assert len(chunks[1]) == 100
-    assert bytes(conn_sent) == body
+    assert recorder.bytes_sent == body
 
     # Should have delayed once (between chunks, not after last)
     assert elapsed >= 0.008
@@ -222,14 +223,14 @@ async def test_faulty_transmission_delay():
     body = b"abc"
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
-    conn_sent = bytearray()
+    recorder = RecordingStreamWriter(writer)
 
     start = time.time()
-    await strategy.write_body(writer, body, conn_sent)
+    await strategy.write_body(recorder, body)
     elapsed = time.time() - start
 
     assert elapsed >= 0.045
-    assert bytes(conn_sent) == body
+    assert recorder.bytes_sent == body
 
 
 @pytest.mark.asyncio
@@ -238,12 +239,12 @@ async def test_faulty_transmission_truncate():
     body = b"hello"
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
-    conn_sent = bytearray()
+    recorder = RecordingStreamWriter(writer)
 
-    await strategy.write_body(writer, body, conn_sent)
+    await strategy.write_body(recorder, body)
 
     assert writer.write.call_args[0][0] == b"hel"
-    assert bytes(conn_sent) == b"hel"
+    assert recorder.bytes_sent == b"hel"
 
 
 @pytest.mark.asyncio
@@ -252,13 +253,13 @@ async def test_faulty_transmission_byte_flip():
     body = b"\x00\x01\x02"
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
-    conn_sent = bytearray()
+    recorder = RecordingStreamWriter(writer)
 
-    await strategy.write_body(writer, body, conn_sent)
+    await strategy.write_body(recorder, body)
 
     expected = b"\x00\x0e\x02"
     assert writer.write.call_args[0][0] == expected
-    assert bytes(conn_sent) == expected
+    assert recorder.bytes_sent == expected
 
 
 @pytest.mark.asyncio
@@ -267,11 +268,11 @@ async def test_faulty_transmission_drop_connection():
     body = b"abcdef"
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
-    conn_sent = bytearray()
+    recorder = RecordingStreamWriter(writer)
 
-    await strategy.write_body(writer, body, conn_sent)
+    await strategy.write_body(recorder, body)
 
     assert writer.write.call_args[0][0] == b"ab"
     assert writer.close.call_count == 1
     assert writer.wait_closed.call_count == 1
-    assert bytes(conn_sent) == b"ab"
+    assert recorder.bytes_sent == b"ab"
