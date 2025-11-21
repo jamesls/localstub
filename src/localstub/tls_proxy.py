@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import ssl
 import tempfile
@@ -53,12 +54,16 @@ class AsyncTLSInterceptProxy:
         server: Optional[AsyncHTTPTestServer] = None,
         ca: Optional[_TrustMeCA] = None,
         max_read: int = 8192,
+        default_mode: str = "intercept",
+        verify_upstream: bool = True,
     ) -> None:
         self._listen_host = listen_host
         self._listen_port = listen_port
         self._server = server
         self._ca = ca or _TrustMeCA()
         self._max_read = max_read
+        self._default_mode = default_mode
+        self._verify_upstream = verify_upstream
 
         self._listener: asyncio.base_events.Server | None = None
         self._host: str | None = None
@@ -119,16 +124,21 @@ class AsyncTLSInterceptProxy:
                 await self._send_and_close(writer, b"HTTP/1.1 400 Bad Request")
                 return
 
-            if connect_port != 443:
-                await self._send_and_close(writer, b"HTTP/1.1 400 Bad Request")
-                return
-
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
 
             tls_reader, tls_writer = await self._upgrade_to_tls(
                 writer, connect_host
             )
+
+            if self._default_mode == "forward":
+                await self._forward(
+                    connect_host,
+                    connect_port,
+                    tls_reader,
+                    tls_writer,
+                )
+                return
 
             if self._server is None:
                 await self._send_and_close(
@@ -208,6 +218,66 @@ class AsyncTLSInterceptProxy:
             loop,
         )
         return tls_reader, tls_writer
+
+    async def _forward(
+        self,
+        host: str,
+        port: int,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        upstream_ssl: ssl.SSLContext | bool | None
+        if self._verify_upstream:
+            upstream_ssl = ssl.create_default_context()
+        else:
+            upstream_ssl = None
+
+        upstream_reader, upstream_writer = await asyncio.open_connection(
+            host,
+            port,
+            ssl=upstream_ssl,
+            server_hostname=host if upstream_ssl else None,
+        )
+
+        async def relay(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            try:
+                while True:
+                    data = await reader.read(8192)
+                    if not data:
+                        break
+                    writer.write(data)
+                    await writer.drain()
+            except Exception:
+                return
+            finally:
+                try:
+                    writer.write_eof()
+                except Exception:
+                    writer.close()
+
+        relay_to_upstream = asyncio.create_task(
+            relay(client_reader, upstream_writer)
+        )
+        relay_to_client = asyncio.create_task(
+            relay(upstream_reader, client_writer)
+        )
+
+        try:
+            await asyncio.wait(
+                {relay_to_upstream, relay_to_client},
+                return_when=asyncio.ALL_COMPLETED,
+            )
+        finally:
+            relay_to_upstream.cancel()
+            relay_to_client.cancel()
+            with contextlib.suppress(Exception):
+                upstream_writer.close()
+                await upstream_writer.wait_closed()
+            with contextlib.suppress(Exception):
+                client_writer.close()
+                await client_writer.wait_closed()
 
     async def _send_and_close(
         self,
