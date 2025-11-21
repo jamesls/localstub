@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from email.message import Message
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
 
 LOG = logging.getLogger(__name__)
 
@@ -199,8 +199,9 @@ class RecordingStreamWriter:
         return await self._writer.drain()
 
     def write_eof(self) -> None:
-        if hasattr(self._writer, "write_eof"):
-            self._writer.write_eof()  # type: ignore[call-arg]
+        write_eof_fn = getattr(self._writer, "write_eof", None)
+        if callable(write_eof_fn):
+            write_eof_fn()
 
     def is_closing(self) -> bool:
         return self._writer.is_closing()
@@ -209,8 +210,11 @@ class RecordingStreamWriter:
         self._writer.close()
 
     async def wait_closed(self) -> None:
-        if hasattr(self._writer, "wait_closed"):
-            await self._writer.wait_closed()  # type: ignore[call-arg]
+        wait_closed_fn = getattr(self._writer, "wait_closed", None)
+        if callable(wait_closed_fn):
+            result = wait_closed_fn()
+            if inspect.isawaitable(result):
+                await result
 
     def get_extra_info(self, name: str, default: Any | None = None) -> Any:
         return self._writer.get_extra_info(name, default)
@@ -481,9 +485,11 @@ class Router:
             return default_response
 
         result = handler(request)
+        if isinstance(result, HTTPResponse):
+            return result
         if inspect.isawaitable(result):
-            return await result  # type: ignore[return-value]
-        return result
+            return await cast(Awaitable[HTTPResponse], result)
+        raise TypeError("Handler returned unsupported type")
 
 
 # ---------------------------------------------------------------------------
