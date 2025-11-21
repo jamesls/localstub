@@ -39,10 +39,19 @@ uv run pytest tests/integration/test_server.py::test_server_receives_request_and
 uv run pytest -v tests/
 ```
 
+**Hard requirement**: If you add or modify tests (or any code that relies on them),
+you MUST run `poe test` before handoff.
+
 ### Code Quality
 
-You MUST run `poe auto-check` if you make any code changes (including tests).
+You MUST run `poe auto-check` if you make ANY code changes (including tests).
 This is a HARD REQUIREMENT.
+
+### Test Discipline
+
+For ANY change that touches runtime code or tests (anything beyond docs/comment
+edits), you MUST run the full test suite via `poe test` before handoff. No
+exceptions. The expectation is: code change → `poe auto-check` → `poe test`.
 
 ## Code Architecture
 

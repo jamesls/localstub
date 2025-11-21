@@ -8,8 +8,13 @@ from localstub.server import (
     AsyncHTTPTestServer,
     HTTPRequest,
     HTTPResponse,
+    ByteFlip,
+    Delay,
+    DropConnection,
+    FaultyTransmission,
     ImmediateTransmission,
     ThrottledTransmission,
+    TruncateBody,
 )
 
 
@@ -204,3 +209,69 @@ def test_throttled_transmission_rejects_negative_chunk_size():
         ValueError, match="chunk_size must be a positive integer"
     ):
         ThrottledTransmission(chunk_size=-5, delay=0.01)
+
+
+# ---------------------------------------------------------------------------
+# FaultyTransmission
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_faulty_transmission_delay():
+    strategy = FaultyTransmission(faults=[Delay(0.05)])
+    body = b"abc"
+
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    conn_sent = bytearray()
+
+    start = time.time()
+    await strategy.write_body(writer, body, conn_sent)
+    elapsed = time.time() - start
+
+    assert elapsed >= 0.045
+    assert bytes(conn_sent) == body
+
+
+@pytest.mark.asyncio
+async def test_faulty_transmission_truncate():
+    strategy = FaultyTransmission(faults=[TruncateBody(3)])
+    body = b"hello"
+
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    conn_sent = bytearray()
+
+    await strategy.write_body(writer, body, conn_sent)
+
+    assert writer.write.call_args[0][0] == b"hel"
+    assert bytes(conn_sent) == b"hel"
+
+
+@pytest.mark.asyncio
+async def test_faulty_transmission_byte_flip():
+    strategy = FaultyTransmission(faults=[ByteFlip(offset=1, mask=0x0F)])
+    body = b"\x00\x01\x02"
+
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    conn_sent = bytearray()
+
+    await strategy.write_body(writer, body, conn_sent)
+
+    expected = b"\x00\x0e\x02"
+    assert writer.write.call_args[0][0] == expected
+    assert bytes(conn_sent) == expected
+
+
+@pytest.mark.asyncio
+async def test_faulty_transmission_drop_connection():
+    strategy = FaultyTransmission(faults=[DropConnection(after_bytes=2)])
+    body = b"abcdef"
+
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    conn_sent = bytearray()
+
+    await strategy.write_body(writer, body, conn_sent)
+
+    assert writer.write.call_args[0][0] == b"ab"
+    assert writer.close.call_count == 1
+    assert writer.wait_closed.call_count == 1
+    assert bytes(conn_sent) == b"ab"
