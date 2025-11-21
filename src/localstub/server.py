@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from email.message import Message
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol
 
 LOG = logging.getLogger(__name__)
 
@@ -148,6 +148,74 @@ Handler = Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]
 # ---------------------------------------------------------------------------
 
 
+class Writer(Protocol):
+    """Minimal StreamWriter interface used by transmission strategies."""
+
+    def write(self, data: bytes) -> None: ...
+
+    def writelines(self, data: Iterable[bytes]) -> None: ...
+
+    async def drain(self) -> Any: ...
+
+    def write_eof(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    async def wait_closed(self) -> None: ...
+
+    def is_closing(self) -> bool: ...
+
+    def get_extra_info(self, name: str, default: Any | None = None) -> Any: ...
+
+
+class RecordingStreamWriter:
+    """Wrapper that records all bytes written to the underlying writer."""
+
+    def __init__(
+        self,
+        writer: asyncio.StreamWriter,
+        sent_buffer: bytearray | None = None,
+    ) -> None:
+        self._writer = writer
+        self._sent_buffer = sent_buffer
+        self._recorded = bytearray()
+
+    @property
+    def bytes_sent(self) -> bytes:
+        """Return all bytes written through this recorder."""
+        return bytes(self._recorded)
+
+    def write(self, data: bytes) -> None:
+        self._recorded.extend(data)
+        if self._sent_buffer is not None:
+            self._sent_buffer.extend(data)
+        self._writer.write(data)
+
+    def writelines(self, data: Iterable[bytes]) -> None:
+        for chunk in data:
+            self.write(chunk)
+
+    async def drain(self) -> Any:
+        return await self._writer.drain()
+
+    def write_eof(self) -> None:
+        if hasattr(self._writer, "write_eof"):
+            self._writer.write_eof()  # type: ignore[call-arg]
+
+    def is_closing(self) -> bool:
+        return self._writer.is_closing()
+
+    def close(self) -> None:
+        self._writer.close()
+
+    async def wait_closed(self) -> None:
+        if hasattr(self._writer, "wait_closed"):
+            await self._writer.wait_closed()  # type: ignore[call-arg]
+
+    def get_extra_info(self, name: str, default: Any | None = None) -> Any:
+        return self._writer.get_extra_info(name, default)
+
+
 class TransmissionStrategy:
     """Protocol for controlling how response body bytes are transmitted.
 
@@ -157,16 +225,14 @@ class TransmissionStrategy:
 
     async def write_body(
         self,
-        writer: asyncio.StreamWriter,
+        writer: Writer,
         body: bytes,
-        connection_wire_sent: bytearray | None,
     ) -> None:
         """Write the response body to the client.
 
         Args:
             writer: The asyncio stream writer to write to
             body: The complete response body bytes to transmit
-            connection_wire_sent: Optional buffer for tracking sent bytes
         """
         raise NotImplementedError
 
@@ -176,13 +242,10 @@ class ImmediateTransmission(TransmissionStrategy):
 
     async def write_body(
         self,
-        writer: asyncio.StreamWriter,
+        writer: Writer,
         body: bytes,
-        connection_wire_sent: bytearray | None,
     ) -> None:
         writer.write(body)
-        if connection_wire_sent is not None:
-            connection_wire_sent.extend(body)
         await writer.drain()
 
 
@@ -207,16 +270,13 @@ class ThrottledTransmission(TransmissionStrategy):
 
     async def write_body(
         self,
-        writer: asyncio.StreamWriter,
+        writer: Writer,
         body: bytes,
-        connection_wire_sent: bytearray | None,
     ) -> None:
         offset = 0
         while offset < len(body):
             chunk = body[offset : offset + self.chunk_size]
             writer.write(chunk)
-            if connection_wire_sent is not None:
-                connection_wire_sent.extend(chunk)
             await writer.drain()
 
             offset += self.chunk_size
@@ -307,9 +367,8 @@ class FaultyTransmission(TransmissionStrategy):
 
     async def write_body(
         self,
-        writer: asyncio.StreamWriter,
+        writer: Writer,
         body: bytes,
-        connection_wire_sent: bytearray | None,
     ) -> None:
         body_to_send = body
         total_delay = 0.0
@@ -326,16 +385,12 @@ class FaultyTransmission(TransmissionStrategy):
             await asyncio.sleep(total_delay)
 
         if drop_after is None:
-            await self._base.write_body(
-                writer, body_to_send, connection_wire_sent
-            )
+            await self._base.write_body(writer, body_to_send)
             return
 
         to_send = body_to_send[:drop_after]
         if to_send:
             writer.write(to_send)
-            if connection_wire_sent is not None:
-                connection_wire_sent.extend(to_send)
             await writer.drain()
 
         try:
@@ -360,7 +415,7 @@ class ConnectionContext:
     """
 
     reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
+    writer: Writer
     client: tuple[str, int] | None
     raw_received_total: bytearray | None
     raw_sent_total: bytearray | None
@@ -382,21 +437,18 @@ class HTTPProtocol:
     async def parse_request(
         self,
         reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        writer: Writer,
         conn_recv: bytearray | None,
     ) -> HTTPRequest | None:
         return await self._server._read_request(reader, writer, conn_recv)
 
     async def send_response(
         self,
-        writer: asyncio.StreamWriter,
+        writer: Writer,
         response: HTTPResponse,
         request: HTTPRequest,
-        conn_sent: bytearray | None,
     ) -> bool:
-        return await self._server._write_response(
-            writer, response, request, conn_sent
-        )
+        return await self._server._write_response(writer, response, request)
 
 
 class Router:
@@ -750,10 +802,11 @@ class AsyncHTTPTestServer:
     ) -> None:
         client = self._extract_client_info(writer)
         conn_recv, conn_sent = self._init_connection_tracking(client)
+        recording_writer = RecordingStreamWriter(writer, conn_sent)
         protocol = HTTPProtocol(self)
         ctx = ConnectionContext(
             reader=reader,
-            writer=writer,
+            writer=recording_writer,
             client=client,
             raw_received_total=conn_recv,
             raw_sent_total=conn_sent,
@@ -762,7 +815,7 @@ class AsyncHTTPTestServer:
         try:
             while True:
                 request = await protocol.parse_request(
-                    reader, writer, conn_recv
+                    reader, recording_writer, conn_recv
                 )
                 if request is None:
                     break
@@ -773,7 +826,7 @@ class AsyncHTTPTestServer:
 
                 response = await self._get_response(request)
                 should_close = await protocol.send_response(
-                    writer, response, request, conn_sent
+                    recording_writer, response, request
                 )
 
                 # Keep a lightweight per-connection history for debugging
@@ -786,15 +839,15 @@ class AsyncHTTPTestServer:
             LOG.exception("Error in AsyncHTTPTestServer handler")
         finally:
             try:
-                writer.close()
-                await writer.wait_closed()
+                recording_writer.close()
+                await recording_writer.wait_closed()
             except Exception:
                 pass
 
     async def _read_request(
         self,
         reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
+        writer: Writer,
         connection_wire: bytearray | None = None,
     ) -> HTTPRequest | None:
         wire = bytearray()
@@ -921,9 +974,7 @@ class AsyncHTTPTestServer:
             return chunk
         return None
 
-    def _extract_client_info(
-        self, writer: asyncio.StreamWriter
-    ) -> tuple[str, int] | None:
+    def _extract_client_info(self, writer: Writer) -> tuple[str, int] | None:
         """Extract client (host, port) from the writer's peername."""
         peer = writer.get_extra_info("peername")
         if isinstance(peer, tuple) and len(peer) >= 2:
@@ -1043,23 +1094,11 @@ class AsyncHTTPTestServer:
 
         return headers
 
-    def _write_and_track(
-        self,
-        writer: asyncio.StreamWriter,
-        data: bytes,
-        connection_wire_sent: bytearray | None,
-    ) -> None:
-        """Write data to client and track in connection bytes."""
-        writer.write(data)
-        if connection_wire_sent is not None:
-            connection_wire_sent.extend(data)
-
     async def _write_response(
         self,
-        writer: asyncio.StreamWriter,
+        writer: Writer,
         response: HTTPResponse,
         request: HTTPRequest,
-        connection_wire_sent: bytearray | None = None,
     ) -> bool:
         try:
             reason = HTTPStatus(response.status).phrase
@@ -1067,9 +1106,7 @@ class AsyncHTTPTestServer:
             reason = "UNKNOWN"
 
         status_line = f"HTTP/1.1 {response.status} {reason}\r\n"
-        self._write_and_track(
-            writer, status_line.encode("ascii"), connection_wire_sent
-        )
+        writer.write(status_line.encode("ascii"))
 
         body = self._normalize_body(response.body)
         should_close = self._should_close_connection(request)
@@ -1077,11 +1114,9 @@ class AsyncHTTPTestServer:
 
         for name, value in headers.items():
             header_line = f"{name}: {value}\r\n".encode("ascii")
-            self._write_and_track(writer, header_line, connection_wire_sent)
+            writer.write(header_line)
 
-        self._write_and_track(writer, b"\r\n", connection_wire_sent)
-        await self._transmission_strategy.write_body(
-            writer, body, connection_wire_sent
-        )
+        writer.write(b"\r\n")
+        await self._transmission_strategy.write_body(writer, body)
 
         return should_close
