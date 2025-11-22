@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import ssl
 import tempfile
 from asyncio import transports as asyncio_transports
+import gzip
+from dataclasses import dataclass
+from email.message import Message
 from pathlib import Path
 from typing import Optional, cast
 
@@ -17,7 +19,7 @@ except ImportError as exc:  # pragma: no cover - handled in tests
         "install the 'tls' extra or add trustme to your dependencies."
     ) from exc
 
-from .server import AsyncHTTPTestServer
+from .server import AsyncHTTPTestServer, HTTPRequest, _parse_headers
 
 LOG = logging.getLogger(__name__)
 
@@ -56,6 +58,7 @@ class AsyncTLSInterceptProxy:
         max_read: int = 8192,
         default_mode: str = "intercept",
         verify_upstream: bool = True,
+        upstream_tls: bool = True,
     ) -> None:
         self._listen_host = listen_host
         self._listen_port = listen_port
@@ -64,10 +67,17 @@ class AsyncTLSInterceptProxy:
         self._max_read = max_read
         self._default_mode = default_mode
         self._verify_upstream = verify_upstream
+        self._upstream_tls = upstream_tls
 
         self._listener: asyncio.base_events.Server | None = None
         self._host: str | None = None
         self._port: int | None = None
+
+        # Recording queues for forwarded traffic
+        self._recorded_requests: asyncio.Queue[HTTPRequest] = asyncio.Queue()
+        self._recorded_responses: asyncio.Queue["RecordedResponse"] = (
+            asyncio.Queue()
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -82,6 +92,22 @@ class AsyncTLSInterceptProxy:
     @property
     def ca(self) -> _TrustMeCA:
         return self._ca
+
+    async def next_request(self, timeout: float | None = None) -> HTTPRequest:
+        if timeout is None:
+            return await self._recorded_requests.get()
+        return await asyncio.wait_for(
+            self._recorded_requests.get(), timeout=timeout
+        )
+
+    async def next_response(
+        self, timeout: float | None = None
+    ) -> "RecordedResponse":
+        if timeout is None:
+            return await self._recorded_responses.get()
+        return await asyncio.wait_for(
+            self._recorded_responses.get(), timeout=timeout
+        )
 
     async def start(self) -> None:
         if self._listener is not None:
@@ -219,6 +245,120 @@ class AsyncTLSInterceptProxy:
         )
         return tls_reader, tls_writer
 
+    async def _read_upstream_response(
+        self, reader: asyncio.StreamReader
+    ) -> RecordedResponse | None:
+        wire = bytearray()
+
+        # Status line
+        status_line = await reader.readline()
+        if not status_line:
+            return None
+        wire.extend(status_line)
+        try:
+            status_parts = (
+                status_line.decode("ascii", errors="replace")
+                .strip()
+                .split(" ", 2)
+            )
+            _version, status_code_str, reason = (status_parts + ["", ""])[:3]
+            status_code = int(status_code_str)
+        except Exception:
+            return None
+
+        # Headers
+        header_lines: list[bytes] = []
+        while True:
+            line = await reader.readline()
+            if not line:
+                return None
+            wire.extend(line)
+            if line in (b"\r\n", b"\n"):
+                break
+            header_lines.append(line)
+        headers = _parse_headers(header_lines)
+
+        body_bytes = await self._read_response_body(reader, headers, wire)
+        body_bytes = self._maybe_decompress(headers, body_bytes)
+
+        body_text = body_bytes.decode("utf-8", errors="replace")
+        return RecordedResponse(
+            status=status_code,
+            reason=reason,
+            headers=headers,
+            body=body_text,
+            wire_raw_bytes=bytes(wire),
+        )
+
+    async def _read_response_body(
+        self, reader: asyncio.StreamReader, headers: Message, wire: bytearray
+    ) -> bytes:
+        content_length = headers.get("Content-Length")
+        transfer_encoding = headers.get("Transfer-Encoding", "")
+
+        if content_length and "chunked" not in transfer_encoding.lower():
+            try:
+                length = int(content_length)
+            except ValueError:
+                return b""
+            if length <= 0:
+                return b""
+            body = await reader.readexactly(length)
+            wire.extend(body)
+            return body
+
+        if "chunked" in transfer_encoding.lower():
+            return await self._read_chunked_body(reader, wire)
+
+        body = await reader.read()
+        wire.extend(body)
+        return body
+
+    def _maybe_decompress(self, headers: Message, body: bytes) -> bytes:
+        content_encoding = headers.get("Content-Encoding", "").lower()
+        if "gzip" in content_encoding:
+            try:
+                return gzip.decompress(body)
+            except Exception:
+                return body
+        return body
+
+    async def _read_chunked_body(
+        self, reader: asyncio.StreamReader, wire: bytearray
+    ) -> bytes:
+        body = bytearray()
+
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            wire.extend(line)
+            header = line.decode("ascii", errors="replace").strip()
+            try:
+                size = int(header.split(";", 1)[0], 16)
+            except ValueError:
+                break
+
+            if size == 0:
+                # Trailers
+                while True:
+                    trailer_line = await reader.readline()
+                    if not trailer_line:
+                        break
+                    wire.extend(trailer_line)
+                    if trailer_line in (b"\r\n", b"\n", b""):
+                        break
+                break
+
+            chunk = await reader.readexactly(size)
+            body.extend(chunk)
+            wire.extend(chunk)
+
+            crlf = await reader.readexactly(2)
+            wire.extend(crlf)
+
+        return bytes(body)
+
     async def _forward(
         self,
         host: str,
@@ -226,58 +366,63 @@ class AsyncTLSInterceptProxy:
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
-        upstream_ssl: ssl.SSLContext | bool | None
-        if self._verify_upstream:
-            upstream_ssl = ssl.create_default_context()
-        else:
-            upstream_ssl = None
+        use_tls = self._upstream_tls
+        ssl_param: ssl.SSLContext | None = None
+        server_hostname: str | None = None
+        if use_tls:
+            upstream_ctx = ssl.create_default_context()
+            if not self._verify_upstream:
+                upstream_ctx.check_hostname = False
+                upstream_ctx.verify_mode = ssl.CERT_NONE
+            ssl_param = upstream_ctx
+            server_hostname = host
 
         upstream_reader, upstream_writer = await asyncio.open_connection(
             host,
             port,
-            ssl=upstream_ssl,
-            server_hostname=host if upstream_ssl else None,
+            ssl=ssl_param,
+            server_hostname=server_hostname,
         )
 
-        async def relay(
-            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-        ) -> None:
-            try:
-                while True:
-                    data = await reader.read(8192)
-                    if not data:
-                        break
-                    writer.write(data)
-                    await writer.drain()
-            except Exception:
-                return
-            finally:
-                try:
-                    writer.write_eof()
-                except Exception:
-                    writer.close()
-
-        relay_to_upstream = asyncio.create_task(
-            relay(client_reader, upstream_writer)
+        # Read and record request from client
+        parser = AsyncHTTPTestServer()
+        request = await parser._read_request(
+            client_reader, client_writer, None
         )
-        relay_to_client = asyncio.create_task(
-            relay(upstream_reader, client_writer)
-        )
-
-        try:
-            await asyncio.wait(
-                {relay_to_upstream, relay_to_client},
-                return_when=asyncio.ALL_COMPLETED,
+        if request is None or request.wire_raw_bytes is None:
+            await self._send_and_close(
+                client_writer, b"HTTP/1.1 400 Bad Request"
             )
-        finally:
-            relay_to_upstream.cancel()
-            relay_to_client.cancel()
-            with contextlib.suppress(Exception):
-                upstream_writer.close()
-                await upstream_writer.wait_closed()
-            with contextlib.suppress(Exception):
-                client_writer.close()
-                await client_writer.wait_closed()
+            upstream_writer.close()
+            await upstream_writer.wait_closed()
+            return
+
+        await self._recorded_requests.put(request)
+
+        # Forward the raw request to upstream
+        upstream_writer.write(request.wire_raw_bytes)
+        await upstream_writer.drain()
+
+        # Read response from upstream
+        recorded_response = await self._read_upstream_response(upstream_reader)
+        if recorded_response is None:
+            await self._send_and_close(
+                client_writer, b"HTTP/1.1 502 Bad Gateway"
+            )
+            upstream_writer.close()
+            await upstream_writer.wait_closed()
+            return
+
+        await self._recorded_responses.put(recorded_response)
+
+        # Relay response to client
+        upstream_writer.close()
+        await upstream_writer.wait_closed()
+
+        client_writer.write(recorded_response.wire_raw_bytes)
+        await client_writer.drain()
+        client_writer.close()
+        await client_writer.wait_closed()
 
     async def _send_and_close(
         self,
@@ -294,3 +439,12 @@ class AsyncTLSInterceptProxy:
                     await writer.wait_closed()
                 except Exception:
                     pass
+
+
+@dataclass
+class RecordedResponse:
+    status: int
+    reason: str | None
+    headers: Message | None
+    body: str | None
+    wire_raw_bytes: bytes
