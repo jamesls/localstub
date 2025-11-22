@@ -37,6 +37,35 @@ async def test_tls_proxy_intercepts_https_request_to_localstub():
         assert request.headers["host"] == "example.com"
 
 
+@pytest.mark.asyncio
+async def test_tls_proxy_parses_ipv6_connect_target():
+    async with AsyncHTTPTestServer() as server:
+        server.set_text_response("ipv6")
+
+        async with AsyncTLSInterceptProxy(server=server) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    "https://[2001:db8::1]/ipv6",
+                )
+
+        assert response.status_code == 200
+        assert response.text == "ipv6"
+
+        request = await server.next_request(timeout=1.0)
+        assert request.path == "/ipv6"
+        assert request.headers is not None
+        assert "2001:db8::1" in request.headers["host"]
+
+
 def test_proxy_address_raises_before_start():
     proxy = AsyncTLSInterceptProxy()
     with pytest.raises(RuntimeError):
