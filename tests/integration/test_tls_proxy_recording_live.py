@@ -29,11 +29,11 @@ async def test_proxy_records_request_and_response_when_forwarding_to_real():
     assert response.status_code == 200
     assert "Example Domain" in response.text
 
-    recorded_request = await proxy.next_request(timeout=2.0)  # type: ignore[attr-defined]
+    recorded_request = await proxy.next_request(timeout=2.0)
     assert recorded_request.path == "/"
     assert recorded_request.headers is not None
     assert recorded_request.headers["host"] == "example.com"
 
-    recorded_response = await proxy.next_response(timeout=2.0)  # type: ignore[attr-defined]
+    recorded_response = await proxy.next_response(timeout=2.0)
     assert recorded_response.status == 200
     assert "Example Domain" in recorded_response.body
