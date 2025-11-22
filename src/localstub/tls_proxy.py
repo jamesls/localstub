@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import ssl
 import tempfile
@@ -30,6 +31,7 @@ class _TrustMeCA:
     def __init__(self) -> None:
         self._ca = trustme.CA()
         fd, path = tempfile.mkstemp(prefix="localstub-ca-", suffix=".pem")
+        os.close(fd)
         Path(path).write_bytes(self._ca.cert_pem.bytes())
         self._ca_pem_path = Path(path)
 
@@ -195,10 +197,7 @@ class AsyncTLSInterceptProxy:
             method, target, _version = parts[0], parts[1], parts[2]
             if method.upper() != "CONNECT":
                 return None, None
-            if ":" in target:
-                host, port_str = target.split(":", 1)
-            else:
-                host, port_str = target, "443"
+            host, port_str = self._split_connect_target(target)
             port = int(port_str)
         except Exception:
             return None, None
@@ -211,6 +210,27 @@ class AsyncTLSInterceptProxy:
             if header_line in (b"\r\n", b"\n"):
                 break
         return host, port
+
+    def _split_connect_target(self, target: str) -> tuple[str, str]:
+        if target.startswith("["):
+            closing = target.rfind("]")
+            if closing == -1:
+                raise ValueError("Invalid IPv6 target")
+            host = target[1:closing]
+            remainder = target[closing + 1 :]
+            if remainder.startswith(":"):
+                port_str = remainder[1:] or "443"
+            elif remainder == "":
+                port_str = "443"
+            else:
+                raise ValueError("Invalid IPv6 target")
+            return host, port_str
+
+        if ":" in target:
+            host, port_str = target.rsplit(":", 1)
+        else:
+            host, port_str = target, "443"
+        return host, port_str
 
     async def _upgrade_to_tls(
         self,
