@@ -441,19 +441,19 @@ async def test_forward_handles_zero_and_invalid_content_length():
                 zero_response = await client.get(
                     f"https://{upstream_host}:{upstream_port}/zero"
                 )
-                with pytest.raises(httpx.RemoteProtocolError):
-                    await client.get(
-                        f"https://{upstream_host}:{upstream_port}/invalid"
-                    )
+                invalid_response = await client.get(
+                    f"https://{upstream_host}:{upstream_port}/invalid"
+                )
 
         assert zero_response.status_code == 200
         assert zero_response.text == ""
+        assert invalid_response.status_code == 502
 
         first_recorded = await proxy.next_response(timeout=1.0)
         assert first_recorded.body == ""
 
-        second_recorded = await proxy.next_response(timeout=1.0)
-        assert second_recorded.body == ""
+        with pytest.raises(asyncio.TimeoutError):
+            await proxy.next_response(timeout=0.1)
     finally:
         server.close()
         await server.wait_closed()
