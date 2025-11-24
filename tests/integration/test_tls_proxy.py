@@ -640,4 +640,5 @@ async def test_proxy_records_request_and_response_when_forwarding_to_real():
 
     recorded_response = await proxy.next_response(timeout=2.0)
     assert recorded_response.status == 200
+    assert recorded_response.body is not None
     assert "Example Domain" in recorded_response.body
