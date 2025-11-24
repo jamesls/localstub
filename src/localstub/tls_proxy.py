@@ -20,6 +20,10 @@ from localstub.server import AsyncHTTPTestServer, HTTPRequest, parse_headers
 LOG = logging.getLogger(__name__)
 
 
+class _InvalidContentLength(Exception):
+    """Raised when an upstream response sends an invalid Content-Length."""
+
+
 class _TrustMeCA:
     """Ephemeral CA backed by trustme; issues per-host server contexts."""
 
@@ -319,7 +323,14 @@ class AsyncTLSInterceptProxy:
             header_lines.append(line)
         headers = parse_headers(header_lines)
 
-        body_bytes = await self._read_response_body(reader, headers, wire)
+        try:
+            body_bytes = await self._read_response_body(reader, headers, wire)
+        except _InvalidContentLength:
+            LOG.warning(
+                "Upstream response contained an invalid Content-Length; "
+                "treating as framing error"
+            )
+            return None
         body_bytes = self._maybe_decompress(headers, body_bytes)
 
         body_text = body_bytes.decode("utf-8", errors="replace")
@@ -341,9 +352,9 @@ class AsyncTLSInterceptProxy:
             try:
                 length = int(content_length)
             except ValueError:
-                return b""
-            if length <= 0:
-                return b""
+                raise _InvalidContentLength("Content-Length not an integer")
+            if length < 0:
+                raise _InvalidContentLength("Content-Length is negative")
             body = await reader.readexactly(length)
             wire.extend(body)
             return body
