@@ -44,7 +44,7 @@ class HTTPRequest:
         return json.loads(self.body)
 
 
-def _parse_headers(header_lines: list[bytes]) -> Message:
+def parse_headers(header_lines: list[bytes]) -> Message:
     """Parse raw header lines into an email.message.Message (HTTP-style)."""
     msg = Message()
     current_name: str | None = None
@@ -932,7 +932,7 @@ class AsyncHTTPTestServer:
             if line in (b"\r\n", b"\n"):
                 break
             header_lines.append(line)
-        return _parse_headers(header_lines)
+        return parse_headers(header_lines)
 
     async def _read_body(
         self,

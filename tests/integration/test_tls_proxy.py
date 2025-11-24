@@ -178,6 +178,50 @@ async def test_forward_returns_502_when_upstream_closes_early():
         await server.wait_closed()
 
 
+@pytest.mark.asyncio
+async def test_forward_returns_502_when_upstream_connection_fails():
+    # Acquire an unused local port, then close the server so that connecting
+    # to the port will be refused.
+    tmp = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    unused_port = tmp.sockets[0].getsockname()[1]
+    tmp.close()
+    await tmp.wait_closed()
+
+    async with AsyncTLSInterceptProxy(
+        server=None,
+        default_mode="forward",
+        verify_upstream=False,
+        upstream_tls=False,
+    ) as proxy:
+        proxy_host, proxy_port = proxy.address
+        verify_ctx = ssl.create_default_context(
+            cafile=str(proxy.ca.ca_pem_path())
+        )
+
+        async with httpx.AsyncClient(
+            proxy=f"http://{proxy_host}:{proxy_port}",
+            verify=verify_ctx,
+            http2=False,
+        ) as client:
+            response = await client.get(
+                f"https://127.0.0.1:{unused_port}/unreachable",
+                follow_redirects=False,
+            )
+
+    assert response.status_code == 502
+
+    # The client request should still be recorded even though no upstream
+    # connection could be established.
+    recorded_request = await proxy.next_request(timeout=1.0)
+    assert recorded_request.path == "/unreachable"
+    assert recorded_request.headers is not None
+    assert "127.0.0.1" in recorded_request.headers["host"]
+
+    # No upstream response should be recorded.
+    with pytest.raises(asyncio.TimeoutError):
+        await proxy.next_response(timeout=0.1)
+
+
 async def _chunked_handler(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
