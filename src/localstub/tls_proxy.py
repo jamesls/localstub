@@ -1,26 +1,21 @@
 from __future__ import annotations
 
-import asyncio
 import os
-import logging
 import ssl
+import asyncio
+import logging
 import tempfile
-from asyncio import transports as asyncio_transports
+from asyncio import transports
 import gzip
 from dataclasses import dataclass
 from email.message import Message
 from pathlib import Path
 from typing import Optional, cast
 
-try:
-    import trustme
-except ImportError as exc:  # pragma: no cover - handled in tests
-    raise RuntimeError(
-        "trustme is required for AsyncTLSInterceptProxy; "
-        "install the 'tls' extra or add trustme to your dependencies."
-    ) from exc
+import trustme
 
-from .server import AsyncHTTPTestServer, HTTPRequest, _parse_headers
+from localstub.server import AsyncHTTPTestServer, HTTPRequest, parse_headers
+
 
 LOG = logging.getLogger(__name__)
 
@@ -74,6 +69,7 @@ class AsyncTLSInterceptProxy:
         self._listener: asyncio.base_events.Server | None = None
         self._host: str | None = None
         self._port: int | None = None
+        self._client_tasks: set[asyncio.Task[None]] = set()
 
         # Recording queues for forwarded traffic
         self._recorded_requests: asyncio.Queue[HTTPRequest] = asyncio.Queue()
@@ -115,7 +111,7 @@ class AsyncTLSInterceptProxy:
         if self._listener is not None:
             return
         self._listener = await asyncio.start_server(
-            self._handle_client,
+            self._client_connected,
             self._listen_host,
             self._listen_port,
         )
@@ -128,6 +124,15 @@ class AsyncTLSInterceptProxy:
             return
         self._listener.close()
         await self._listener.wait_closed()
+        # Wait for in-flight client handlers to finish; cancel any that linger.
+        pending = [t for t in self._client_tasks if not t.done()]
+        if pending:
+            done, pending = await asyncio.wait(pending, timeout=1.0)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        self._client_tasks.clear()
         self._listener = None
 
     async def __aenter__(self) -> "AsyncTLSInterceptProxy":
@@ -175,6 +180,13 @@ class AsyncTLSInterceptProxy:
                 return
 
             await self._server._handle_client(tls_reader, tls_writer)
+        except asyncio.CancelledError:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            raise
         except Exception:
             LOG.exception("TLS proxy error")
             try:
@@ -182,6 +194,15 @@ class AsyncTLSInterceptProxy:
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    async def _client_connected(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        task = asyncio.create_task(self._handle_client(reader, writer))
+        self._client_tasks.add(task)
+        task.add_done_callback(self._client_tasks.discard)
 
     async def _parse_connect(
         self, reader: asyncio.StreamReader
@@ -258,7 +279,7 @@ class AsyncTLSInterceptProxy:
         )
 
         tls_writer = asyncio.StreamWriter(
-            cast(asyncio_transports.WriteTransport, tls_transport),
+            cast(transports.WriteTransport, tls_transport),
             tls_protocol,
             tls_reader,
             loop,
@@ -296,7 +317,7 @@ class AsyncTLSInterceptProxy:
             if line in (b"\r\n", b"\n"):
                 break
             header_lines.append(line)
-        headers = _parse_headers(header_lines)
+        headers = parse_headers(header_lines)
 
         body_bytes = await self._read_response_body(reader, headers, wire)
         body_bytes = self._maybe_decompress(headers, body_bytes)
@@ -386,6 +407,21 @@ class AsyncTLSInterceptProxy:
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
+        # Read and record the client's decrypted HTTP request first so we
+        # preserve it even if the upstream cannot be reached.
+        parser = AsyncHTTPTestServer()
+        request = await parser._read_request(
+            client_reader, client_writer, None
+        )
+        if request is None or request.wire_raw_bytes is None:
+            await self._send_and_close(
+                client_writer, b"HTTP/1.1 400 Bad Request"
+            )
+            return
+
+        await self._recorded_requests.put(request)
+
+        # Prepare upstream connection parameters after reading the request.
         use_tls = self._upstream_tls
         ssl_param: ssl.SSLContext | None = None
         server_hostname: str | None = None
@@ -397,27 +433,20 @@ class AsyncTLSInterceptProxy:
             ssl_param = upstream_ctx
             server_hostname = host
 
-        upstream_reader, upstream_writer = await asyncio.open_connection(
-            host,
-            port,
-            ssl=ssl_param,
-            server_hostname=server_hostname,
-        )
-
-        # Read and record request from client
-        parser = AsyncHTTPTestServer()
-        request = await parser._read_request(
-            client_reader, client_writer, None
-        )
-        if request is None or request.wire_raw_bytes is None:
-            await self._send_and_close(
-                client_writer, b"HTTP/1.1 400 Bad Request"
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_connection(
+                host,
+                port,
+                ssl=ssl_param,
+                server_hostname=server_hostname,
             )
-            upstream_writer.close()
-            await upstream_writer.wait_closed()
+        except Exception:
+            # Could not connect upstream; send a 502 but keep the recorded
+            # request available to callers for inspection.
+            await self._send_and_close(
+                client_writer, b"HTTP/1.1 502 Bad Gateway"
+            )
             return
-
-        await self._recorded_requests.put(request)
 
         # Forward the raw request to upstream
         upstream_writer.write(request.wire_raw_bytes)
