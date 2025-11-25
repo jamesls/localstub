@@ -838,7 +838,11 @@ class AsyncHTTPTestServer:
 
         return HTTPRequest(
             method=parsed.method,
-            path=parsed.url.decode("ascii") if parsed.url else None,
+            path=(
+                parsed.url.decode("ascii", errors="replace")
+                if parsed.url
+                else None
+            ),
             http_version=parsed.http_version,
             headers=headers,
             body=body_text,

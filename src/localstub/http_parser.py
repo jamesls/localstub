@@ -101,7 +101,9 @@ class RequestProtocol:
     def on_headers_complete(self) -> None:
         """Called when all headers have been parsed."""
         if not self.result.is_complete and self._parser is not None:
-            self.result.method = self._parser.get_method().decode("ascii")
+            self.result.method = self._parser.get_method().decode(
+                "ascii", errors="replace"
+            )
             self.result.http_version = self._parser.get_http_version()
 
     def on_body(self, body: bytes) -> None:
