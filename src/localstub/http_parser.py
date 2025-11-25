@@ -82,9 +82,16 @@ class RequestProtocol:
             self.result = ParsedRequest()
 
     def on_url(self, url: bytes) -> None:
-        """Called when the URL is parsed."""
+        """Called when the URL is parsed.
+
+        Note: May be called multiple times with URL chunks when data
+        arrives incrementally. We accumulate all chunks.
+        """
         if not self.result.is_complete:
-            self.result.url = url
+            if self.result.url is None:
+                self.result.url = url
+            else:
+                self.result.url += url
 
     def on_header(self, name: bytes, value: bytes) -> None:
         """Called for each header."""
@@ -142,9 +149,16 @@ class ResponseProtocol:
             self.result = ParsedResponse()
 
     def on_status(self, status: bytes) -> None:
-        """Called when the status text is parsed."""
+        """Called when the status text is parsed.
+
+        Note: May be called multiple times with status chunks when data
+        arrives incrementally. We accumulate all chunks.
+        """
         if not self.result.is_complete:
-            self.result.status_text = status
+            if self.result.status_text is None:
+                self.result.status_text = status
+            else:
+                self.result.status_text += status
 
     def on_header(self, name: bytes, value: bytes) -> None:
         """Called for each header."""
@@ -195,7 +209,9 @@ class AsyncRequestParser:
     """Async wrapper for httptools.HttpRequestParser with wire tracking.
 
     This class combines asyncio stream reading with httptools parsing while
-    preserving the exact bytes received on the wire.
+    preserving the exact bytes received on the wire. It correctly handles
+    pipelined requests by feeding data byte-by-byte to detect message
+    boundaries and pushing leftover bytes back to the reader.
     """
 
     def __init__(self, max_read: int = 8192) -> None:
@@ -220,27 +236,45 @@ class AsyncRequestParser:
         Returns:
             Tuple of (parsed_request, wire_bytes).
             Returns (None, wire_bytes) on parse error or EOF before complete.
+
+        Note:
+            This method feeds data byte-by-byte to detect message boundaries
+            precisely. Any bytes belonging to a subsequent pipelined request
+            are pushed back into the reader for the next parse() call.
         """
+        buffer = bytearray()
+
         while not self._protocol.result.is_complete:
-            try:
-                data = await reader.read(self._max_read)
-            except Exception:
-                break
+            # If buffer is empty, read more data from the stream
+            if not buffer:
+                try:
+                    data = await reader.read(self._max_read)
+                except Exception:
+                    break
 
-            if not data:
-                # EOF before complete message
-                break
+                if not data:
+                    # EOF before complete message
+                    break
 
-            # Track wire bytes BEFORE parsing to preserve exact format
-            self._wire.extend(data)
+                buffer.extend(data)
+
+            # Feed one byte at a time to detect message boundary precisely
+            byte = bytes([buffer.pop(0)])
+            self._wire.extend(byte)
             if connection_wire is not None:
-                connection_wire.extend(data)
+                connection_wire.extend(byte)
 
             try:
-                self._parser.feed_data(data)
+                self._parser.feed_data(byte)
             except httptools.HttpParserError:
-                # Malformed request
+                # Malformed request - push remaining buffer back for recovery
+                if buffer:
+                    reader.feed_data(bytes(buffer))
                 return None, bytes(self._wire)
+
+        # Push any leftover bytes back to the reader for the next request
+        if buffer:
+            reader.feed_data(bytes(buffer))
 
         if not self._protocol.result.is_complete:
             return None, bytes(self._wire)

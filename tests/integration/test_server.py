@@ -1451,3 +1451,85 @@ async def test_default_transmission_is_immediate(server, client):
     # Should be very fast (no artificial delays)
     assert elapsed < 0.1
     assert response.content == response_data
+
+
+# ---------------------------------------------------------------------------
+# Pipelined requests tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_server_handles_pipelined_requests(server):
+    """Test server handles pipelined HTTP requests on same connection.
+
+    When a client sends multiple HTTP requests back-to-back without waiting
+    for responses (HTTP pipelining), the server should record all of them.
+    """
+    # Send two pipelined requests in one write
+    pipelined_requests = (
+        b"GET /first HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"\r\n"
+        b"GET /second HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"\r\n"
+    )
+
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    try:
+        writer.write(pipelined_requests)
+        await writer.drain()
+
+        # Read both responses
+        await asyncio.sleep(0.2)
+        response = await asyncio.wait_for(reader.read(8192), timeout=1.0)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+    # Both requests should be recorded
+    assert len(server.requests) == 2
+    assert server.requests[0].path == "/first"
+    assert server.requests[1].path == "/second"
+
+    # Should have received two HTTP responses
+    assert response.count(b"HTTP/1.1") == 2
+
+
+@pytest.mark.asyncio
+async def test_server_handles_pipelined_requests_with_body(server):
+    """Test server handles pipelined POST requests with bodies."""
+    # Two POST requests with bodies, pipelined
+    pipelined_requests = (
+        b"POST /first HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Length: 6\r\n"
+        b"\r\n"
+        b"first!"
+        b"POST /second HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Length: 7\r\n"
+        b"\r\n"
+        b"second!"
+    )
+
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    try:
+        writer.write(pipelined_requests)
+        await writer.drain()
+
+        await asyncio.sleep(0.2)
+        response = await asyncio.wait_for(reader.read(8192), timeout=1.0)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+    # Both requests should be recorded with correct bodies
+    assert len(server.requests) == 2
+    assert server.requests[0].path == "/first"
+    assert server.requests[0].body == "first!"
+    assert server.requests[1].path == "/second"
+    assert server.requests[1].body == "second!"
+
+    # Should have received two HTTP responses
+    assert response.count(b"HTTP/1.1") == 2

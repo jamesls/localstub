@@ -399,34 +399,49 @@ class TestAsyncRequestParser:
     async def test_parse_pipelined_requests_preserves_first(self):
         """Test that pipelined requests preserve the first request.
 
-        When two HTTP requests arrive in the same TCP frame, httptools
-        parses them both synchronously. The parser must preserve the first
-        completed request rather than overwriting it with the second.
+        When two HTTP requests arrive in the same TCP frame, the parser
+        must preserve the first completed request and push leftover bytes
+        back to the reader for the next request.
         """
-        # Two complete requests in one buffer
-        pipelined_data = (
-            b"GET /first HTTP/1.1\r\n"
-            b"Host: first.com\r\n"
-            b"\r\n"
-            b"GET /second HTTP/1.1\r\n"
-            b"Host: second.com\r\n"
-            b"\r\n"
-        )
-        reader = _create_mock_reader([pipelined_data])
+        first_request = b"GET /first HTTP/1.1\r\nHost: first.com\r\n\r\n"
+        second_request = b"GET /second HTTP/1.1\r\nHost: second.com\r\n\r\n"
+        pipelined_data = first_request + second_request
 
-        parser = AsyncRequestParser()
-        parsed, wire_bytes = await parser.parse(reader)
+        # Use a real StreamReader to test feed_data behavior
+        # Don't call feed_eof() yet - we need to push leftover bytes back
+        reader = asyncio.StreamReader()
+        reader.feed_data(pipelined_data)
 
-        # First request should be returned, not the second
-        assert parsed is not None
-        assert parsed.method == "GET"
-        assert parsed.url == b"/first"
-        assert parsed.is_complete is True
-        # Headers should be from first request only
-        header_names = [h[0] for h in parsed.headers]
-        assert b"Host" in header_names
-        host_value = next(h[1] for h in parsed.headers if h[0] == b"Host")
+        # Parse first request
+        parser1 = AsyncRequestParser()
+        parsed1, wire_bytes1 = await parser1.parse(reader)
+
+        # First request should be returned correctly
+        assert parsed1 is not None
+        assert parsed1.method == "GET"
+        assert parsed1.url == b"/first"
+        assert parsed1.is_complete is True
+        host_value = next(h[1] for h in parsed1.headers if h[0] == b"Host")
         assert host_value == b"first.com"
+        # Wire bytes should only contain the first request
+        assert wire_bytes1 == first_request
+
+        # Now signal EOF for the second request
+        reader.feed_eof()
+
+        # Parse second request from the same reader
+        # The leftover bytes should have been pushed back
+        parser2 = AsyncRequestParser()
+        parsed2, wire_bytes2 = await parser2.parse(reader)
+
+        # Second request should also be parsed correctly
+        assert parsed2 is not None
+        assert parsed2.method == "GET"
+        assert parsed2.url == b"/second"
+        assert parsed2.is_complete is True
+        host_value2 = next(h[1] for h in parsed2.headers if h[0] == b"Host")
+        assert host_value2 == b"second.com"
+        assert wire_bytes2 == second_request
 
 
 class TestAsyncResponseParser:
