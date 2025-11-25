@@ -387,12 +387,18 @@ class AsyncTLSInterceptProxy:
 
         # Relay response to client
         upstream_writer.close()
-        await upstream_writer.wait_closed()
+        try:
+            await upstream_writer.wait_closed()
+        except Exception:
+            pass
 
         client_writer.write(recorded_response.wire_raw_bytes)
         await client_writer.drain()
         client_writer.close()
-        await client_writer.wait_closed()
+        try:
+            await client_writer.wait_closed()
+        except Exception:
+            pass
 
     async def _send_and_close(
         self,
