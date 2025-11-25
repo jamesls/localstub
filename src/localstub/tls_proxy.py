@@ -293,10 +293,12 @@ class AsyncTLSInterceptProxy:
         return tls_reader, tls_writer
 
     async def _read_upstream_response(
-        self, reader: asyncio.StreamReader
+        self,
+        reader: asyncio.StreamReader,
+        request_method: str | None = None,
     ) -> RecordedResponse | None:
         parser = AsyncResponseParser(max_read=self._max_read)
-        parsed, wire_bytes = await parser.parse(reader)
+        parsed, wire_bytes = await parser.parse(reader, request_method)
 
         if parsed is None:
             return None
@@ -379,7 +381,9 @@ class AsyncTLSInterceptProxy:
         await upstream_writer.drain()
 
         # Read response from upstream
-        recorded_response = await self._read_upstream_response(upstream_reader)
+        recorded_response = await self._read_upstream_response(
+            upstream_reader, request.method
+        )
         if recorded_response is None:
             await self._send_and_close(
                 client_writer, b"HTTP/1.1 502 Bad Gateway"

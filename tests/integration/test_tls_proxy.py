@@ -645,6 +645,79 @@ async def test_proxy_records_request_and_response_when_forwarding_to_real():
 
 
 @pytest.mark.asyncio
+async def test_forward_handles_head_request_with_content_length():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        request_line = await reader.readline()
+        await reader.readuntil(b"\r\n\r\n")
+
+        method = request_line.decode("ascii", errors="replace").split(" ")[0]
+        # For HEAD, respond with Content-Length but no body
+        if method.upper() == "HEAD":
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 12345\r\n"
+                b"Content-Type: text/html\r\n"
+                b"\r\n"
+            )
+        else:
+            body = b"Hello World!"
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 12\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"\r\n" + body
+            )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+                timeout=httpx.Timeout(5.0),
+            ) as client:
+                # HEAD request should complete quickly, not timeout
+                response = await client.head(
+                    f"https://{server_host}:{server_port}/authors.html"
+                )
+
+        assert response.status_code == 200
+        assert response.headers.get("content-length") == "12345"
+        # HEAD responses have no body
+        assert response.content == b""
+
+        recorded_request = await proxy.next_request(timeout=1.0)
+        assert recorded_request.method == "HEAD"
+        assert recorded_request.path == "/authors.html"
+
+        recorded_response = await proxy.next_response(timeout=1.0)
+        assert recorded_response.status == 200
+        # The recorded response body should be empty for HEAD
+        assert recorded_response.body == ""
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_forward_handles_client_closing_connection_early():
     """
     Proxy should gracefully handle client closing connection
