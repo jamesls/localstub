@@ -133,6 +133,40 @@ class TestRequestProtocol:
         protocol.on_chunk_header()
         protocol.on_chunk_complete()
 
+    def test_callbacks_are_noop_after_message_complete(self):
+        """Test that callbacks are no-ops after message is complete.
+
+        This protects against pipelined requests overwriting the first
+        completed request when httptools processes multiple requests
+        in a single buffer.
+        """
+        protocol = RequestProtocol()
+
+        # Simulate first request
+        protocol.on_message_begin()
+        protocol.on_url(b"/first")
+        protocol.on_header(b"Host", b"first.com")
+        protocol.on_body(b"first body")
+        protocol.on_message_complete()
+
+        # Verify first request is complete
+        assert protocol.result.is_complete is True
+        assert protocol.result.url == b"/first"
+        assert protocol.result.headers == [(b"Host", b"first.com")]
+        assert protocol.result.body_parts == [b"first body"]
+
+        # Simulate second pipelined request callbacks - should be ignored
+        protocol.on_message_begin()
+        protocol.on_url(b"/second")
+        protocol.on_header(b"Host", b"second.com")
+        protocol.on_body(b"second body")
+        protocol.on_message_complete()
+
+        # First request should be preserved
+        assert protocol.result.url == b"/first"
+        assert protocol.result.headers == [(b"Host", b"first.com")]
+        assert protocol.result.body_parts == [b"first body"]
+
 
 class TestResponseProtocol:
     """Tests for ResponseProtocol callback handler."""
@@ -186,6 +220,40 @@ class TestResponseProtocol:
         # These should not raise
         protocol.on_chunk_header()
         protocol.on_chunk_complete()
+
+    def test_callbacks_are_noop_after_message_complete(self):
+        """Test that callbacks are no-ops after message is complete.
+
+        This protects against pipelined responses overwriting the first
+        completed response when httptools processes multiple responses
+        in a single buffer.
+        """
+        protocol = ResponseProtocol()
+
+        # Simulate first response
+        protocol.on_message_begin()
+        protocol.on_status(b"OK")
+        protocol.on_header(b"Content-Type", b"text/html")
+        protocol.on_body(b"first body")
+        protocol.on_message_complete()
+
+        # Verify first response is complete
+        assert protocol.result.is_complete is True
+        assert protocol.result.status_text == b"OK"
+        assert protocol.result.headers == [(b"Content-Type", b"text/html")]
+        assert protocol.result.body_parts == [b"first body"]
+
+        # Simulate second pipelined response callbacks - should be ignored
+        protocol.on_message_begin()
+        protocol.on_status(b"Not Found")
+        protocol.on_header(b"Content-Type", b"text/plain")
+        protocol.on_body(b"second body")
+        protocol.on_message_complete()
+
+        # First response should be preserved
+        assert protocol.result.status_text == b"OK"
+        assert protocol.result.headers == [(b"Content-Type", b"text/html")]
+        assert protocol.result.body_parts == [b"first body"]
 
 
 class TestHeadersToMessage:
@@ -326,6 +394,39 @@ class TestAsyncRequestParser:
         await parser.parse(reader)
 
         assert parser.wire_bytes == request_data
+
+    @pytest.mark.asyncio
+    async def test_parse_pipelined_requests_preserves_first(self):
+        """Test that pipelined requests preserve the first request.
+
+        When two HTTP requests arrive in the same TCP frame, httptools
+        parses them both synchronously. The parser must preserve the first
+        completed request rather than overwriting it with the second.
+        """
+        # Two complete requests in one buffer
+        pipelined_data = (
+            b"GET /first HTTP/1.1\r\n"
+            b"Host: first.com\r\n"
+            b"\r\n"
+            b"GET /second HTTP/1.1\r\n"
+            b"Host: second.com\r\n"
+            b"\r\n"
+        )
+        reader = _create_mock_reader([pipelined_data])
+
+        parser = AsyncRequestParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        # First request should be returned, not the second
+        assert parsed is not None
+        assert parsed.method == "GET"
+        assert parsed.url == b"/first"
+        assert parsed.is_complete is True
+        # Headers should be from first request only
+        header_names = [h[0] for h in parsed.headers]
+        assert b"Host" in header_names
+        host_value = next(h[1] for h in parsed.headers if h[0] == b"Host")
+        assert host_value == b"first.com"
 
 
 class TestAsyncResponseParser:

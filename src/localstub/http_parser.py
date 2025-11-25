@@ -57,7 +57,12 @@ class ParsedResponse:
 
 
 class RequestProtocol:
-    """Callback protocol for httptools.HttpRequestParser."""
+    """Callback protocol for httptools.HttpRequestParser.
+
+    All callbacks are guarded to be no-ops after a message is complete.
+    This prevents pipelined requests from overwriting the first completed
+    request when httptools processes multiple requests in a single buffer.
+    """
 
     def __init__(self) -> None:
         self.result = ParsedRequest()
@@ -68,30 +73,39 @@ class RequestProtocol:
         self._parser = parser
 
     def on_message_begin(self) -> None:
-        """Called when a new message begins."""
-        self.result = ParsedRequest()
+        """Called when a new message begins.
+
+        Only resets if no message has been completed yet. This preserves
+        the first request when pipelined requests arrive in the same buffer.
+        """
+        if not self.result.is_complete:
+            self.result = ParsedRequest()
 
     def on_url(self, url: bytes) -> None:
         """Called when the URL is parsed."""
-        self.result.url = url
+        if not self.result.is_complete:
+            self.result.url = url
 
     def on_header(self, name: bytes, value: bytes) -> None:
         """Called for each header."""
-        self.result.headers.append((name, value))
+        if not self.result.is_complete:
+            self.result.headers.append((name, value))
 
     def on_headers_complete(self) -> None:
         """Called when all headers have been parsed."""
-        if self._parser is not None:
+        if not self.result.is_complete and self._parser is not None:
             self.result.method = self._parser.get_method().decode("ascii")
             self.result.http_version = self._parser.get_http_version()
 
     def on_body(self, body: bytes) -> None:
         """Called for each chunk of body data."""
-        self.result.body_parts.append(body)
+        if not self.result.is_complete:
+            self.result.body_parts.append(body)
 
     def on_message_complete(self) -> None:
         """Called when the message is fully parsed."""
-        self.result.is_complete = True
+        if not self.result.is_complete:
+            self.result.is_complete = True
 
     def on_chunk_header(self) -> None:
         """Called at the start of a chunk (for chunked encoding)."""
@@ -103,7 +117,12 @@ class RequestProtocol:
 
 
 class ResponseProtocol:
-    """Callback protocol for httptools.HttpResponseParser."""
+    """Callback protocol for httptools.HttpResponseParser.
+
+    All callbacks are guarded to be no-ops after a message is complete.
+    This prevents pipelined responses from overwriting the first completed
+    response when httptools processes multiple responses in a single buffer.
+    """
 
     def __init__(self) -> None:
         self.result = ParsedResponse()
@@ -114,30 +133,39 @@ class ResponseProtocol:
         self._parser = parser
 
     def on_message_begin(self) -> None:
-        """Called when a new message begins."""
-        self.result = ParsedResponse()
+        """Called when a new message begins.
+
+        Only resets if no message has been completed yet. This preserves
+        the first response when pipelined responses arrive in the same buffer.
+        """
+        if not self.result.is_complete:
+            self.result = ParsedResponse()
 
     def on_status(self, status: bytes) -> None:
         """Called when the status text is parsed."""
-        self.result.status_text = status
+        if not self.result.is_complete:
+            self.result.status_text = status
 
     def on_header(self, name: bytes, value: bytes) -> None:
         """Called for each header."""
-        self.result.headers.append((name, value))
+        if not self.result.is_complete:
+            self.result.headers.append((name, value))
 
     def on_headers_complete(self) -> None:
         """Called when all headers have been parsed."""
-        if self._parser is not None:
+        if not self.result.is_complete and self._parser is not None:
             self.result.status_code = self._parser.get_status_code()
             self.result.http_version = self._parser.get_http_version()
 
     def on_body(self, body: bytes) -> None:
         """Called for each chunk of body data."""
-        self.result.body_parts.append(body)
+        if not self.result.is_complete:
+            self.result.body_parts.append(body)
 
     def on_message_complete(self) -> None:
         """Called when the message is fully parsed."""
-        self.result.is_complete = True
+        if not self.result.is_complete:
+            self.result.is_complete = True
 
     def on_chunk_header(self) -> None:
         """Called at the start of a chunk (for chunked encoding)."""
