@@ -14,8 +14,13 @@ from typing import Optional, cast
 
 import trustme
 
-from localstub.http_parser import AsyncResponseParser, headers_to_message
-from localstub.server import AsyncHTTPTestServer, HTTPRequest
+from localstub.http_parser import (
+    AsyncResponseParser,
+    HTTPRequest,
+    HTTPRequestReader,
+    headers_to_message,
+)
+from localstub.server import AsyncHTTPTestServer
 
 
 LOG = logging.getLogger(__name__)
@@ -180,7 +185,7 @@ class AsyncTLSInterceptProxy:
                 )
                 return
 
-            await self._server._handle_client(tls_reader, tls_writer)
+            await self._server.handle_http_connection(tls_reader, tls_writer)
         except asyncio.CancelledError:
             try:
                 writer.close()
@@ -330,9 +335,9 @@ class AsyncTLSInterceptProxy:
     ) -> None:
         # Read and record the client's decrypted HTTP request first so we
         # preserve it even if the upstream cannot be reached.
-        parser = AsyncHTTPTestServer()
-        request = await parser._read_request(
-            client_reader, client_writer, None
+        request_reader = HTTPRequestReader()
+        request = await request_reader.read_request(
+            client_reader, client_writer
         )
         if request is None or request.wire_raw_bytes is None:
             await self._send_and_close(

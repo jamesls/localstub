@@ -5,45 +5,16 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass, field
-from email.message import Message
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
 
-from localstub.http_parser import AsyncRequestParser, headers_to_message
+from localstub.http_parser import (
+    AsyncRequestParser,
+    HTTPRequest,
+    headers_to_message,
+)
 
 LOG = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Recorded request
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class HTTPRequest:
-    """Snapshot of a single HTTP request.
-
-    `body` is decoded as UTF-8 (like the original code).
-    `wire_raw_bytes` is *exactly* what came off the wire, including:
-      - request line
-      - headers
-      - the blank line
-      - body bytes (including chunk framing for chunked requests)
-    """
-
-    method: str | None = None
-    path: str | None = None
-    http_version: str | None = None
-    headers: Message | None = None
-    body: str | None = None
-    wire_raw_bytes: bytes | None = None
-    client: tuple[str, int] | None = None
-
-    @property
-    def json_body(self) -> Any:
-        if self.body is None or self.body == "":
-            return None
-        return json.loads(self.body)
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +694,34 @@ class AsyncHTTPTestServer:
             )
         self.last_request = req
         return req
+
+    async def handle_http_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle an HTTP conversation on externally-established streams.
+
+        This method handles the full HTTP request/response cycle on streams
+        that may have been established externally (e.g., by a TLS proxy
+        that terminates TLS and hands off the decrypted streams).
+
+        The server will:
+        1. Parse incoming HTTP requests
+        2. Record requests in .requests and .last_request
+        3. Generate responses using the configured handler/routes
+        4. Write responses to the client
+        5. Handle connection persistence (keep-alive vs close)
+
+        Args:
+            reader: StreamReader for the client connection
+            writer: StreamWriter for the client connection
+
+        Note:
+            This method is intended for external callers like TLS proxies.
+            The server manages cleanup of the writer on exit.
+        """
+        await self._handle_client(reader, writer)
 
     # ------------------------------------------------------------------
     # Internal helpers

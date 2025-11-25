@@ -12,14 +12,53 @@ The architecture is:
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from email.message import Message
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httptools
 
 if TYPE_CHECKING:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Recorded request
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HTTPRequest:
+    """Snapshot of a single HTTP request.
+
+    `body` is decoded as UTF-8 (like the original code).
+    `wire_raw_bytes` is *exactly* what came off the wire, including:
+      - request line
+      - headers
+      - the blank line
+      - body bytes (including chunk framing for chunked requests)
+    """
+
+    method: str | None = None
+    path: str | None = None
+    http_version: str | None = None
+    headers: Message | None = None
+    body: str | None = None
+    wire_raw_bytes: bytes | None = None
+    client: tuple[str, int] | None = None
+
+    @property
+    def json_body(self) -> Any:
+        if self.body is None or self.body == "":
+            return None
+        return json.loads(self.body)
+
+
+class Writer(Protocol):
+    """Minimal StreamWriter interface for extracting client info."""
+
+    def get_extra_info(self, name: str, default: Any | None = None) -> Any: ...
 
 
 @dataclass
@@ -355,3 +394,65 @@ class AsyncResponseParser:
     def wire_bytes(self) -> bytes:
         """Return the accumulated wire bytes."""
         return bytes(self._wire)
+
+
+class HTTPRequestReader:
+    """Public interface for reading HTTP requests from streams.
+
+    This provides a clean way to parse HTTP requests without needing
+    an AsyncHTTPTestServer instance.
+    """
+
+    def __init__(self, max_read: int = 8192) -> None:
+        self._max_read = max_read
+
+    async def read_request(
+        self,
+        reader: asyncio.StreamReader,
+        writer: Writer | None = None,
+        connection_wire: bytearray | None = None,
+    ) -> HTTPRequest | None:
+        """Parse a complete HTTP request from the stream.
+
+        Args:
+            reader: The asyncio stream to read from
+            writer: Optional writer to extract client info from
+            connection_wire: Optional buffer for connection-level tracking
+
+        Returns:
+            HTTPRequest or None on EOF/parse error
+        """
+        parser = AsyncRequestParser(max_read=self._max_read)
+        parsed, wire_bytes = await parser.parse(reader, connection_wire)
+
+        if parsed is None:
+            return None
+
+        headers = headers_to_message(parsed.headers)
+        body_text = (
+            parsed.body.decode("utf-8", errors="replace")
+            if parsed.body
+            else None
+        )
+        client = self._extract_client_info(writer) if writer else None
+
+        return HTTPRequest(
+            method=parsed.method,
+            path=(
+                parsed.url.decode("ascii", errors="replace")
+                if parsed.url
+                else None
+            ),
+            http_version=parsed.http_version,
+            headers=headers,
+            body=body_text,
+            wire_raw_bytes=wire_bytes,
+            client=client,
+        )
+
+    def _extract_client_info(self, writer: Writer) -> tuple[str, int] | None:
+        """Extract client (host, port) from the writer's peername."""
+        peer = writer.get_extra_info("peername")
+        if isinstance(peer, tuple) and len(peer) >= 2:
+            return (peer[0], peer[1])
+        return None
