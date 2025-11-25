@@ -108,5 +108,5 @@ auto-check = [
 prcheck = ["check", "test"]
 
 # Uncomment if you want to add a CLI script.
-# [project.scripts]
-# my-cli-command = "module.path.foo:app"
+[project.scripts]
+lstub = "localstub.cli:main"

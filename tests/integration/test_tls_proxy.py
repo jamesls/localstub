@@ -642,3 +642,77 @@ async def test_proxy_records_request_and_response_when_forwarding_to_real():
     assert recorded_response.status == 200
     assert recorded_response.body is not None
     assert "Example Domain" in recorded_response.body
+
+
+@pytest.mark.asyncio
+async def test_forward_handles_client_closing_connection_early():
+    """
+    Proxy should gracefully handle client closing connection
+    after reading the response.
+
+    This simulates behavior seen with the AWS CLI where the client
+    reads the response and closes the connection, which can cause
+    ConnectionResetError in wait_closed().
+    """
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        # Send a chunked response similar to what S3 returns
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Content-Type: application/xml\r\n"
+            b"\r\n"
+            b"5\r\nhello\r\n"
+            b"0\r\n\r\n"
+        )
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            # Use httpx with no keepalive to ensure connection is closed
+            # immediately after response is received
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+                limits=httpx.Limits(max_keepalive_connections=0),
+            ) as client:
+                response = await client.get(
+                    f"https://{server_host}:{server_port}/test"
+                )
+
+        # Verify the proxy completed without error
+        assert response.status_code == 200
+        assert response.text == "hello"
+
+        # The proxy should have recorded the request and response
+        recorded_request = await proxy.next_request(timeout=1.0)
+        assert recorded_request.path == "/test"
+
+        recorded_response = await proxy.next_response(timeout=1.0)
+        assert recorded_response.status == 200
+        assert recorded_response.body == "hello"
+    finally:
+        server.close()
+        await server.wait_closed()
