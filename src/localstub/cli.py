@@ -74,8 +74,12 @@ async def run_proxy(args: argparse.Namespace) -> None:
 
         shutdown_event = asyncio.Event()
         loop = asyncio.get_running_loop()
-        loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
-        loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
+        try:
+            loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
+            loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
+        except (NotImplementedError, RuntimeError):
+            # Signal handlers may be unsupported (e.g. on Windows)
+            pass
 
         output_file: TextIO | None = None
         if args.output:
@@ -105,10 +109,14 @@ async def process_traffic(
         sys.stdout.buffer.flush()
 
         response: RecordedResponse | None = None
-        try:
-            response = await proxy.next_response(timeout=5.0)
-        except asyncio.TimeoutError:
-            pass
+        while not shutdown_event.is_set() and response is None:
+            try:
+                response = await proxy.next_response(timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+
+        if shutdown_event.is_set() and response is None:
+            break
 
         if response:
             sys.stdout.buffer.write(b"\n--- RESPONSE ---\n")
