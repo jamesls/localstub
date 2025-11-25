@@ -346,17 +346,25 @@ class AsyncResponseParser:
     async def parse(
         self,
         reader: asyncio.StreamReader,
+        request_method: str | None = None,
     ) -> tuple[ParsedResponse | None, bytes]:
         """Parse a complete HTTP response from the stream.
 
         Args:
             reader: The asyncio stream to read from.
+            request_method: The HTTP method of the request that generated
+                this response. Required for HEAD requests, which have no
+                body despite Content-Length headers.
 
         Returns:
             Tuple of (parsed_response, wire_bytes).
             Returns (None, wire_bytes) on parse error.
             For close-delimited bodies, EOF signals completion.
         """
+        is_head = (
+            request_method is not None and request_method.upper() == "HEAD"
+        )
+
         while not self._protocol.result.is_complete:
             try:
                 data = await reader.read(self._max_read)
@@ -378,6 +386,11 @@ class AsyncResponseParser:
                 self._parser.feed_data(data)
             except httptools.HttpParserError:
                 return None, bytes(self._wire)
+
+            # HEAD responses have no body - complete once headers are done
+            if is_head and self._protocol.result.http_version is not None:
+                self._protocol.result.is_complete = True
+                break
 
         # For close-delimited bodies, the message may be complete after EOF
         # even if on_message_complete wasn't called
