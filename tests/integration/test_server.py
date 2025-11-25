@@ -934,18 +934,22 @@ async def test_server_handles_empty_request_line(server):
 
 
 @pytest.mark.asyncio
-async def test_server_handles_malformed_request_line(server):
-    """Test server handles request line without 3 parts."""
-    # Send malformed request line (only 2 parts)
+async def test_server_handles_http09_simple_request(server):
+    """Test server handles HTTP/0.9 simple request format (no version)."""
+    # HTTP/0.9 simple request format: "GET /path\r\n"
+    # httptools correctly parses this as HTTP/0.9
     await send_raw_request(
         server.host,
         server.port,
         b"GET /path\r\n\r\n",
     )
 
-    # Server should handle gracefully
+    # Server should handle HTTP/0.9 requests correctly
     await asyncio.sleep(0.1)
-    assert len(server.requests) == 0
+    assert len(server.requests) == 1
+    assert server.requests[0].method == "GET"
+    assert server.requests[0].path == "/path"
+    assert server.requests[0].http_version == "0.9"
 
 
 @pytest.mark.asyncio
@@ -966,7 +970,12 @@ async def test_server_handles_eof_while_reading_headers(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_invalid_content_length(server):
-    """Test server handles non-numeric Content-Length."""
+    """Test server handles non-numeric Content-Length.
+
+    httptools strictly validates HTTP headers per spec, so invalid
+    Content-Length values cause a parse failure. The connection is
+    closed without recording the request.
+    """
     response = await send_raw_request(
         server.host,
         server.port,
@@ -976,8 +985,11 @@ async def test_server_handles_invalid_content_length(server):
         b"\r\n",
     )
 
-    # Server should handle this gracefully and return a response
-    assert b"HTTP/1.1" in response
+    # httptools rejects invalid Content-Length (strict HTTP compliance)
+    # Connection is closed without sending a response
+    await asyncio.sleep(0.1)
+    assert len(server.requests) == 0
+    assert response == b""
 
 
 @pytest.mark.asyncio

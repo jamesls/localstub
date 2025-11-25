@@ -14,14 +14,11 @@ from typing import Optional, cast
 
 import trustme
 
-from localstub.server import AsyncHTTPTestServer, HTTPRequest, parse_headers
+from localstub.http_parser import AsyncResponseParser, headers_to_message
+from localstub.server import AsyncHTTPTestServer, HTTPRequest
 
 
 LOG = logging.getLogger(__name__)
-
-
-class _InvalidContentLength(Exception):
-    """Raised when an upstream response sends an invalid Content-Length."""
 
 
 class _TrustMeCA:
@@ -293,78 +290,27 @@ class AsyncTLSInterceptProxy:
     async def _read_upstream_response(
         self, reader: asyncio.StreamReader
     ) -> RecordedResponse | None:
-        wire = bytearray()
+        parser = AsyncResponseParser(max_read=self._max_read)
+        parsed, wire_bytes = await parser.parse(reader)
 
-        # Status line
-        status_line = await reader.readline()
-        if not status_line:
-            return None
-        wire.extend(status_line)
-        try:
-            status_parts = (
-                status_line.decode("ascii", errors="replace")
-                .strip()
-                .split(" ", 2)
-            )
-            _version, status_code_str, reason = (status_parts + ["", ""])[:3]
-            status_code = int(status_code_str)
-        except Exception:
+        if parsed is None:
             return None
 
-        # Headers
-        header_lines: list[bytes] = []
-        while True:
-            line = await reader.readline()
-            if not line:
-                return None
-            wire.extend(line)
-            if line in (b"\r\n", b"\n"):
-                break
-            header_lines.append(line)
-        headers = parse_headers(header_lines)
-
-        try:
-            body_bytes = await self._read_response_body(reader, headers, wire)
-        except _InvalidContentLength:
-            LOG.warning(
-                "Upstream response contained an invalid Content-Length; "
-                "treating as framing error"
-            )
-            return None
-        body_bytes = self._maybe_decompress(headers, body_bytes)
-
+        headers = headers_to_message(parsed.headers)
+        body_bytes = self._maybe_decompress(headers, parsed.body)
         body_text = body_bytes.decode("utf-8", errors="replace")
+
         return RecordedResponse(
-            status=status_code,
-            reason=reason,
+            status=parsed.status_code or 0,
+            reason=(
+                parsed.status_text.decode("ascii", errors="replace")
+                if parsed.status_text
+                else None
+            ),
             headers=headers,
             body=body_text,
-            wire_raw_bytes=bytes(wire),
+            wire_raw_bytes=wire_bytes,
         )
-
-    async def _read_response_body(
-        self, reader: asyncio.StreamReader, headers: Message, wire: bytearray
-    ) -> bytes:
-        content_length = headers.get("Content-Length")
-        transfer_encoding = headers.get("Transfer-Encoding", "")
-
-        if content_length and "chunked" not in transfer_encoding.lower():
-            try:
-                length = int(content_length)
-            except ValueError:
-                raise _InvalidContentLength("Content-Length not an integer")
-            if length < 0:
-                raise _InvalidContentLength("Content-Length is negative")
-            body = await reader.readexactly(length)
-            wire.extend(body)
-            return body
-
-        if "chunked" in transfer_encoding.lower():
-            return await self._read_chunked_body(reader, wire)
-
-        body = await reader.read()
-        wire.extend(body)
-        return body
 
     def _maybe_decompress(self, headers: Message, body: bytes) -> bytes:
         content_encoding = headers.get("Content-Encoding", "").lower()
@@ -374,42 +320,6 @@ class AsyncTLSInterceptProxy:
             except Exception:
                 return body
         return body
-
-    async def _read_chunked_body(
-        self, reader: asyncio.StreamReader, wire: bytearray
-    ) -> bytes:
-        body = bytearray()
-
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            wire.extend(line)
-            header = line.decode("ascii", errors="replace").strip()
-            try:
-                size = int(header.split(";", 1)[0], 16)
-            except ValueError:
-                break
-
-            if size == 0:
-                # Trailers
-                while True:
-                    trailer_line = await reader.readline()
-                    if not trailer_line:
-                        break
-                    wire.extend(trailer_line)
-                    if trailer_line in (b"\r\n", b"\n", b""):
-                        break
-                break
-
-            chunk = await reader.readexactly(size)
-            body.extend(chunk)
-            wire.extend(chunk)
-
-            crlf = await reader.readexactly(2)
-            wire.extend(crlf)
-
-        return bytes(body)
 
     async def _forward(
         self,
