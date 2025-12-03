@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import io
+import pytest
 from email.message import Message
 from pathlib import Path
 
@@ -7,6 +10,7 @@ from localstub.cli import (
     DEFAULT_PORT,
     build_record,
     parse_args,
+    process_traffic,
 )
 from localstub.server import HTTPRequest
 from localstub.tls_proxy import RecordedResponse
@@ -154,3 +158,70 @@ class TestBuildRecord:
 
         assert record["response"]["status"] == 204
         assert "headers" not in record["response"]
+
+
+class TestProcessTrafficNoResponse:
+    @pytest.mark.asyncio
+    async def test_logs_request_when_no_recorded_response(self) -> None:
+        # Prepare a single recorded request that will have no corresponding
+        # recorded response from the proxy.
+        req_headers = Message()
+        req_headers["Host"] = "example.com"
+        request = HTTPRequest(
+            method="GET",
+            path="/no-upstream",
+            headers=req_headers,
+            body="",
+            wire_raw_bytes=b"GET /no-upstream HTTP/1.1\r\n\r\n",
+            client=("127.0.0.1", 55555),
+        )
+
+        class _NoResponseProxy:
+            def __init__(self) -> None:
+                self._given = False
+
+            async def next_request(
+                self, timeout: float | None = None
+            ) -> HTTPRequest:  # type: ignore[override]
+                if not self._given:
+                    self._given = True
+                    return request
+                # After first request, behave like a timeout poll loop
+                await asyncio.sleep(0)
+                raise asyncio.TimeoutError()
+
+            async def next_response(  # type: ignore[override]
+                self, timeout: float | None = None
+            ) -> RecordedResponse:
+                # Never produce a response; always time out quickly
+                await asyncio.sleep(0)
+                raise asyncio.TimeoutError()
+
+        proxy = _NoResponseProxy()
+        out = io.StringIO()
+        shutdown = asyncio.Event()
+
+        # Run the traffic processor in the background with aggressive
+        # timeouts so the test completes quickly.
+        task = asyncio.create_task(
+            process_traffic(
+                proxy,  # type: ignore[arg-type]
+                out,
+                shutdown,
+                response_timeout=0.01,
+                response_max_timeouts=2,
+            )
+        )
+
+        # Give the loop a moment to process, then stop it.
+        await asyncio.sleep(0.05)
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        # Exactly one JSONL record should be written with response set to null
+        lines = [line for line in out.getvalue().splitlines() if line.strip()]
+        assert len(lines) == 1
+
+        record = __import__("json").loads(lines[0])
+        assert record["request"]["path"] == "/no-upstream"
+        assert record["response"] is None
