@@ -96,8 +96,17 @@ async def process_traffic(
     proxy: AsyncTLSInterceptProxy,
     output_file: TextIO | None,
     shutdown_event: asyncio.Event,
+    *,
+    response_timeout: float = 5.0,
+    response_max_timeouts: int = 3,
 ) -> None:
-    """Poll for recorded requests/responses and output them."""
+    """Poll for recorded requests/responses and output them.
+
+    If the TLS proxy cannot obtain an upstream response it will not enqueue
+    a ``RecordedResponse``. In that case we treat repeated timeouts while
+    awaiting ``next_response()`` as "no response" and log the request with
+    ``response=None`` so traffic recording continues.
+    """
     while not shutdown_event.is_set():
         try:
             request = await proxy.next_request(timeout=0.1)
@@ -109,10 +118,19 @@ async def process_traffic(
         sys.stdout.buffer.flush()
 
         response: RecordedResponse | None = None
+        timeouts = 0
         while not shutdown_event.is_set() and response is None:
             try:
-                response = await proxy.next_response(timeout=5.0)
+                response = await proxy.next_response(timeout=response_timeout)
             except asyncio.TimeoutError:
+                timeouts += 1
+                if timeouts >= response_max_timeouts:
+                    sys.stderr.write(
+                        "No upstream response recorded; "
+                        "logging without response\n"
+                    )
+                    sys.stderr.flush()
+                    break
                 continue
 
         if shutdown_event.is_set() and response is None:
