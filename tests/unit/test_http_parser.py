@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from localstub.http_parser import (
     AsyncRequestParser,
     AsyncResponseParser,
+    HTTPRequest,
+    HTTPRequestReader,
     ParsedRequest,
     ParsedResponse,
     RequestProtocol,
@@ -167,6 +169,26 @@ class TestRequestProtocol:
         assert protocol.result.headers == [(b"Host", b"first.com")]
         assert protocol.result.body_parts == [b"first body"]
 
+    def test_on_headers_complete_without_parser_is_noop(self):
+        protocol = RequestProtocol()
+        protocol.result.method = "GET"
+        protocol.result.url = b"/test"
+
+        protocol.on_headers_complete()
+
+        assert protocol.result.method == "GET"
+        assert protocol.result.url == b"/test"
+        assert protocol.result.http_version is None
+
+    def test_on_url_accumulates_chunks(self):
+        protocol = RequestProtocol()
+
+        protocol.on_url(b"/api")
+        protocol.on_url(b"/users")
+        protocol.on_url(b"/123")
+
+        assert protocol.result.url == b"/api/users/123"
+
 
 class TestResponseProtocol:
     """Tests for ResponseProtocol callback handler."""
@@ -254,6 +276,25 @@ class TestResponseProtocol:
         assert protocol.result.status_text == b"OK"
         assert protocol.result.headers == [(b"Content-Type", b"text/html")]
         assert protocol.result.body_parts == [b"first body"]
+
+    def test_on_status_accumulates_chunks(self):
+        protocol = ResponseProtocol()
+
+        protocol.on_status(b"Not")
+        protocol.on_status(b" ")
+        protocol.on_status(b"Found")
+
+        assert protocol.result.status_text == b"Not Found"
+
+    def test_on_headers_complete_without_parser_is_noop(self):
+        protocol = ResponseProtocol()
+        protocol.result.status_text = b"OK"
+
+        protocol.on_headers_complete()
+
+        assert protocol.result.status_text == b"OK"
+        assert protocol.result.status_code is None
+        assert protocol.result.http_version is None
 
 
 class TestHeadersToMessage:
@@ -443,6 +484,37 @@ class TestAsyncRequestParser:
         assert host_value2 == b"second.com"
         assert wire_bytes2 == second_request
 
+    @pytest.mark.asyncio
+    async def test_parse_with_read_exception_returns_none(self):
+        reader = AsyncMock(spec=asyncio.StreamReader)
+        reader.read = AsyncMock(
+            side_effect=ConnectionResetError("Connection reset")
+        )
+
+        parser = AsyncRequestParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        assert parsed is None
+        assert wire_bytes == b""
+
+    @pytest.mark.asyncio
+    async def test_parse_malformed_with_remaining_buffer_pushes_back(self):
+        reader = asyncio.StreamReader()
+        # Feed malformed HTTP followed by what looks like more data
+        # The parser will fail on the malformed part and should push back
+        # remaining buffer bytes. Don't call feed_eof() so push back works.
+        malformed_with_extra = b"INVALID HTTP\x00\x01\x02extra data here"
+        reader.feed_data(malformed_with_extra)
+
+        parser = AsyncRequestParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        assert parsed is None
+        assert len(wire_bytes) > 0
+        # Verify remaining bytes were pushed back to the reader
+        remaining = await reader.read(100)
+        assert len(remaining) > 0
+
 
 class TestAsyncResponseParser:
     """Tests for AsyncResponseParser."""
@@ -541,10 +613,208 @@ class TestAsyncResponseParser:
 
         assert parser.wire_bytes == response_data
 
+    @pytest.mark.asyncio
+    async def test_parse_with_read_exception_returns_none(self):
+        reader = AsyncMock(spec=asyncio.StreamReader)
+        reader.read = AsyncMock(side_effect=OSError("Connection lost"))
+
+        parser = AsyncResponseParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        assert parsed is None
+        assert wire_bytes == b""
+
+    @pytest.mark.asyncio
+    async def test_parse_head_response_completes_after_headers(self):
+        response_data = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n"
+        reader = _create_mock_reader([response_data])
+
+        parser = AsyncResponseParser()
+        parsed, wire_bytes = await parser.parse(reader, request_method="HEAD")
+
+        assert parsed is not None
+        assert parsed.status_code == 200
+        assert parsed.is_complete
+        assert parsed.body == b""
+
+    @pytest.mark.asyncio
+    async def test_parse_malformed_response_returns_none(self):
+        reader = _create_mock_reader([b"NOT A VALID HTTP RESPONSE\r\n"])
+
+        parser = AsyncResponseParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        assert parsed is None
+
+
+class TestHTTPRequestReader:
+    @pytest.mark.asyncio
+    async def test_read_request_simple_get(self):
+        request_data = b"GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(reader)
+
+        assert request is not None
+        assert request.method == "GET"
+        assert request.path == "/api/test"
+        assert request.http_version == "1.1"
+        assert request.wire_raw_bytes == request_data
+
+    @pytest.mark.asyncio
+    async def test_read_request_with_body(self):
+        request_data = (
+            b"POST /api/data HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 13\r\n"
+            b"\r\n"
+            b"Hello, World!"
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(reader)
+
+        assert request is not None
+        assert request.method == "POST"
+        assert request.body == "Hello, World!"
+
+    @pytest.mark.asyncio
+    async def test_read_request_returns_none_on_parse_failure(self):
+        reader = asyncio.StreamReader()
+        # Don't call feed_eof() - the malformed request triggers parse error
+        # and the code tries to push back remaining bytes
+        reader.feed_data(b"NOT VALID HTTP")
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(reader)
+
+        assert request is None
+
+    @pytest.mark.asyncio
+    async def test_read_request_returns_none_on_eof(self):
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(reader)
+
+        assert request is None
+
+    @pytest.mark.asyncio
+    async def test_read_request_with_connection_wire(self):
+        request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+        connection_wire = bytearray()
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(
+            reader, connection_wire=connection_wire
+        )
+
+        assert request is not None
+        assert bytes(connection_wire) == request_data
+
+    @pytest.mark.asyncio
+    async def test_read_request_extracts_client_info_from_writer(self):
+        request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        writer = Mock()
+        writer.get_extra_info = Mock(return_value=("127.0.0.1", 54321))
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(reader, writer=writer)
+
+        assert request is not None
+        assert request.client == ("127.0.0.1", 54321)
+        writer.get_extra_info.assert_called_once_with("peername")
+
+    @pytest.mark.asyncio
+    async def test_read_request_with_invalid_peer_returns_none_client(self):
+        request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        writer = Mock()
+        writer.get_extra_info = Mock(return_value=None)
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(reader, writer=writer)
+
+        assert request is not None
+        assert request.client is None
+
+    @pytest.mark.asyncio
+    async def test_read_request_with_short_peer_tuple_returns_none_client(
+        self,
+    ):
+        request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        writer = Mock()
+        writer.get_extra_info = Mock(return_value=("127.0.0.1",))
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(reader, writer=writer)
+
+        assert request is not None
+        assert request.client is None
+
+    @pytest.mark.asyncio
+    async def test_read_request_without_writer_has_none_client(self):
+        request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        http_reader = HTTPRequestReader()
+        request = await http_reader.read_request(reader, writer=None)
+
+        assert request is not None
+        assert request.client is None
+
+    @pytest.mark.asyncio
+    async def test_read_request_with_custom_max_read(self):
+        request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        http_reader = HTTPRequestReader(max_read=1024)
+        request = await http_reader.read_request(reader)
+
+        assert request is not None
+        assert request.method == "GET"
+
+
+class TestHTTPRequest:
+    def test_json_body_returns_none_for_empty_body(self):
+        request = HTTPRequest(body=None)
+        assert request.json_body is None
+
+    def test_json_body_returns_none_for_empty_string(self):
+        request = HTTPRequest(body="")
+        assert request.json_body is None
+
+    def test_json_body_parses_json(self):
+        request = HTTPRequest(body='{"key": "value"}')
+        assert request.json_body == {"key": "value"}
+
 
 def _create_mock_reader(data_chunks: list[bytes]) -> asyncio.StreamReader:
-    """Create a mock StreamReader that returns data chunks then EOF."""
     reader = AsyncMock(spec=asyncio.StreamReader)
-    # Return each chunk, then empty bytes for EOF
     reader.read = AsyncMock(side_effect=data_chunks + [b""])
     return reader
