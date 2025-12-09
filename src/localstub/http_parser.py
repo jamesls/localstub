@@ -395,13 +395,40 @@ class AsyncResponseParser:
         # For close-delimited bodies, the message may be complete after EOF
         # even if on_message_complete wasn't called
         if not self._protocol.result.is_complete:
-            # If we have headers and got EOF, treat as close-delimited
+            # Only treat as close-delimited if we have headers AND there's
+            # no Content-Length or Transfer-Encoding header. If those headers
+            # exist, the response is truncated and should be treated as a
+            # parse failure.
             if self._protocol.result.http_version is not None:
-                self._protocol.result.is_complete = True
+                if self._is_close_delimited():
+                    self._protocol.result.is_complete = True
+                else:
+                    # Truncated response - Content-Length or chunked encoding
+                    # indicated more data was expected
+                    return None, bytes(self._wire)
             else:
                 return None, bytes(self._wire)
 
         return self._protocol.result, bytes(self._wire)
+
+    def _is_close_delimited(self) -> bool:
+        """Check if the response is genuinely close-delimited.
+
+        A response is close-delimited if it has no Content-Length header
+        and no Transfer-Encoding header. In this case, EOF signals the
+        end of the response body.
+
+        Returns:
+            True if the response is close-delimited, False otherwise.
+        """
+        headers = self._protocol.result.headers
+        for name, _ in headers:
+            name_lower = name.lower()
+            if name_lower == b"content-length":
+                return False
+            if name_lower == b"transfer-encoding":
+                return False
+        return True
 
     @property
     def wire_bytes(self) -> bytes:
