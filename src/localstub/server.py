@@ -5,79 +5,16 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass, field
-from email.message import Message
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
+
+from localstub.http_parser import (
+    AsyncRequestParser,
+    HTTPRequest,
+    headers_to_message,
+)
 
 LOG = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Recorded request
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class HTTPRequest:
-    """Snapshot of a single HTTP request.
-
-    `body` is decoded as UTF-8 (like the original code).
-    `wire_raw_bytes` is *exactly* what came off the wire, including:
-      - request line
-      - headers
-      - the blank line
-      - body bytes (including chunk framing for chunked requests)
-    """
-
-    method: str | None = None
-    path: str | None = None
-    http_version: str | None = None
-    headers: Message | None = None
-    body: str | None = None
-    wire_raw_bytes: bytes | None = None
-    client: tuple[str, int] | None = None
-
-    @property
-    def json_body(self) -> Any:
-        if self.body is None or self.body == "":
-            return None
-        return json.loads(self.body)
-
-
-def _parse_headers(header_lines: list[bytes]) -> Message:
-    """Parse raw header lines into an email.message.Message (HTTP-style)."""
-    msg = Message()
-    current_name: str | None = None
-    current_value_parts: list[str] = []
-
-    for raw in header_lines:
-        line = raw.decode("iso-8859-1").rstrip("\r\n")
-        if not line and current_name is None:
-            continue
-
-        # Continuation line
-        if line.startswith((" ", "\t")) and current_name is not None:
-            current_value_parts.append(line.strip())
-            continue
-
-        # Finish previous header
-        if current_name is not None:
-            msg[current_name] = " ".join(current_value_parts)
-            current_name = None
-            current_value_parts = []
-
-        if ":" not in line:
-            # Malformed line, ignore
-            continue
-
-        name, value = line.split(":", 1)
-        current_name = name.strip()
-        current_value_parts = [value.strip()]
-
-    if current_name is not None:
-        msg[current_name] = " ".join(current_value_parts)
-
-    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +136,9 @@ class RecordingStreamWriter:
         return await self._writer.drain()
 
     def write_eof(self) -> None:
-        if hasattr(self._writer, "write_eof"):
-            self._writer.write_eof()  # type: ignore[call-arg]
+        write_eof_fn = getattr(self._writer, "write_eof", None)
+        if callable(write_eof_fn):
+            write_eof_fn()
 
     def is_closing(self) -> bool:
         return self._writer.is_closing()
@@ -209,8 +147,11 @@ class RecordingStreamWriter:
         self._writer.close()
 
     async def wait_closed(self) -> None:
-        if hasattr(self._writer, "wait_closed"):
-            await self._writer.wait_closed()  # type: ignore[call-arg]
+        wait_closed_fn = getattr(self._writer, "wait_closed", None)
+        if callable(wait_closed_fn):
+            result = wait_closed_fn()
+            if inspect.isawaitable(result):
+                await result
 
     def get_extra_info(self, name: str, default: Any | None = None) -> Any:
         return self._writer.get_extra_info(name, default)
@@ -481,9 +422,11 @@ class Router:
             return default_response
 
         result = handler(request)
+        if isinstance(result, HTTPResponse):
+            return result
         if inspect.isawaitable(result):
-            return await result  # type: ignore[return-value]
-        return result
+            return await cast(Awaitable[HTTPResponse], result)
+        raise TypeError("Handler returned unsupported type")
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +695,34 @@ class AsyncHTTPTestServer:
         self.last_request = req
         return req
 
+    async def handle_http_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle an HTTP conversation on externally-established streams.
+
+        This method handles the full HTTP request/response cycle on streams
+        that may have been established externally (e.g., by a TLS proxy
+        that terminates TLS and hands off the decrypted streams).
+
+        The server will:
+        1. Parse incoming HTTP requests
+        2. Record requests in .requests and .last_request
+        3. Generate responses using the configured handler/routes
+        4. Write responses to the client
+        5. Handle connection persistence (keep-alive vs close)
+
+        Args:
+            reader: StreamReader for the client connection
+            writer: StreamWriter for the client connection
+
+        Note:
+            This method is intended for external callers like TLS proxies.
+            The server manages cleanup of the writer on exit.
+        """
+        await self._handle_client(reader, writer)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -850,129 +821,33 @@ class AsyncHTTPTestServer:
         writer: Writer,
         connection_wire: bytearray | None = None,
     ) -> HTTPRequest | None:
-        wire = bytearray()
-        header_lines: list[bytes] = []
+        parser = AsyncRequestParser()
+        parsed, wire_bytes = await parser.parse(reader, connection_wire)
 
-        # --- Request line ---
-        req_line_parts = await self._read_request_line(
-            reader, wire, connection_wire
-        )
-        if req_line_parts is None:
-            return None
-        method, path, version = req_line_parts
-
-        # --- Headers ---
-        headers = await self._read_headers(
-            reader, wire, header_lines, connection_wire
-        )
-        if headers is None:
+        if parsed is None:
             return None
 
-        # --- Body ---
-        body_text = await self._read_body(
-            reader, wire, headers, connection_wire
+        headers = headers_to_message(parsed.headers)
+        body_text = (
+            parsed.body.decode("utf-8", errors="replace")
+            if parsed.body
+            else None
         )
-
-        # --- Client info ---
         client = self._extract_client_info(writer)
 
         return HTTPRequest(
-            method=method,
-            path=path,
-            http_version=version,
+            method=parsed.method,
+            path=(
+                parsed.url.decode("ascii", errors="replace")
+                if parsed.url
+                else None
+            ),
+            http_version=parsed.http_version,
             headers=headers,
             body=body_text,
-            wire_raw_bytes=bytes(wire),
+            wire_raw_bytes=wire_bytes,
             client=client,
         )
-
-    async def _read_request_line(
-        self,
-        reader: asyncio.StreamReader,
-        wire: bytearray,
-        connection_wire: bytearray | None = None,
-    ) -> tuple[str, str, str] | None:
-        """Read and parse the HTTP request line."""
-        line = await reader.readline()
-        if not line:
-            return None
-        wire.extend(line)
-        if connection_wire is not None:
-            connection_wire.extend(line)
-        try:
-            req_line = line.decode("ascii", errors="replace").rstrip("\r\n")
-            method, path, version = req_line.split(" ", 2)
-            return (method, path, version)
-        except ValueError:
-            LOG.debug("Malformed request line: %r", line)
-            return None
-
-    async def _read_headers(
-        self,
-        reader: asyncio.StreamReader,
-        wire: bytearray,
-        header_lines: list[bytes],
-        connection_wire: bytearray | None = None,
-    ) -> Message | None:
-        """Read HTTP headers until blank line."""
-        while True:
-            line = await reader.readline()
-            if not line:
-                # EOF while reading headers
-                return None
-            wire.extend(line)
-            if connection_wire is not None:
-                connection_wire.extend(line)
-            if line in (b"\r\n", b"\n"):
-                break
-            header_lines.append(line)
-        return _parse_headers(header_lines)
-
-    async def _read_body(
-        self,
-        reader: asyncio.StreamReader,
-        wire: bytearray,
-        headers: Message,
-        connection_wire: bytearray | None = None,
-    ) -> str | None:
-        """Read request body based on Transfer-Encoding or Content-Length."""
-        body_bytes: bytes | None = None
-        transfer_encoding = headers.get("Transfer-Encoding")
-        if transfer_encoding and "chunked" in transfer_encoding.lower():
-            body_bytes = await self._read_chunked_body(
-                reader, wire, connection_wire
-            )
-        else:
-            body_bytes = await self._read_content_length_body(
-                reader, wire, headers, connection_wire
-            )
-
-        if body_bytes is None:
-            return None
-        return body_bytes.decode("utf-8", errors="replace")
-
-    async def _read_content_length_body(
-        self,
-        reader: asyncio.StreamReader,
-        wire: bytearray,
-        headers: Message,
-        connection_wire: bytearray | None = None,
-    ) -> bytes | None:
-        """Read body based on Content-Length header."""
-        content_length = headers.get("Content-Length")
-        if content_length is None:
-            return None
-        try:
-            length = int(content_length)
-        except ValueError:
-            length = 0
-        if length:
-            chunk = await reader.readexactly(length)
-            wire.extend(chunk)
-            if connection_wire is not None:
-                connection_wire.extend(chunk)
-            return chunk
-        return None
 
     def _extract_client_info(self, writer: Writer) -> tuple[str, int] | None:
         """Extract client (host, port) from the writer's peername."""
@@ -980,86 +855,6 @@ class AsyncHTTPTestServer:
         if isinstance(peer, tuple) and len(peer) >= 2:
             return (peer[0], peer[1])
         return None
-
-    def _extend_wire_buffers(
-        self,
-        data: bytes,
-        wire: bytearray,
-        connection_wire: bytearray | None,
-    ) -> None:
-        """Extend both per-request and connection-level wire buffers."""
-        wire.extend(data)
-        if connection_wire is not None:
-            connection_wire.extend(data)
-
-    def _parse_chunk_size(self, header: str) -> int | None:
-        """Parse chunk size from header, handling aws-chunked format."""
-        size_str = header.split(";", 1)[0] if ";" in header else header
-        try:
-            return int(size_str, 16)
-        except ValueError:
-            LOG.debug("Invalid chunk size header: %r", header)
-            return None
-
-    async def _read_chunk_trailers(
-        self,
-        reader: asyncio.StreamReader,
-        wire: bytearray,
-        connection_wire: bytearray | None,
-    ) -> None:
-        """Read trailing headers after final chunk."""
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            self._extend_wire_buffers(line, wire, connection_wire)
-            if line in (b"\r\n", b"\n", b""):
-                break
-
-    async def _read_chunked_body(
-        self,
-        reader: asyncio.StreamReader,
-        wire: bytearray,
-        connection_wire: bytearray | None = None,
-    ) -> bytes:
-        """Read a chunked transfer-encoded request body.
-
-        * `wire` accumulates the *raw* chunk framing:
-          - "<size>\\r\\n"
-          - chunk bytes
-          - "\\r\\n"
-          - trailing headers
-          - final blank line
-
-        * return value is the decoded body (concatenation of chunk bytes).
-        """
-        body = bytearray()
-
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            self._extend_wire_buffers(line, wire, connection_wire)
-            header = line.decode("ascii", errors="replace").strip()
-
-            size = self._parse_chunk_size(header)
-            if size is None:
-                break
-
-            if size == 0:
-                await self._read_chunk_trailers(reader, wire, connection_wire)
-                break
-
-            # Read chunk data
-            chunk = await reader.readexactly(size)
-            body.extend(chunk)
-            self._extend_wire_buffers(chunk, wire, connection_wire)
-
-            # Read CRLF after chunk
-            crlf = await reader.readexactly(2)
-            self._extend_wire_buffers(crlf, wire, connection_wire)
-
-        return bytes(body)
 
     def _normalize_body(self, body_obj: bytes | str | None) -> bytes:
         """Normalize response body to bytes."""

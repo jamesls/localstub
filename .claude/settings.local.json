@@ -8,7 +8,9 @@
       "Bash(poe test:*)",
       "WebFetch(domain:www.python-httpx.org)",
       "Skill(python-coding:coding-guidelines)",
-      "Skill(python-coding:class-design)"
+      "Skill(python-coding:class-design)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ],
     "deny": [],
     "ask": []
