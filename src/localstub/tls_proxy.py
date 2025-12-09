@@ -48,6 +48,24 @@ class _TrustMeCA:
         return self._ca_pem_path
 
 
+class TLSStreamReaderProtocol(asyncio.StreamReaderProtocol):
+    """Protocol variant that suppresses SSL EOF warning.
+
+    Feed EOF to the attached reader and return ``False`` so asyncio's
+    SSL layer does not warn about half‑closed behavior under TLS.
+    """
+
+    def __init__(self, stream_reader: asyncio.StreamReader) -> None:
+        super().__init__(stream_reader)
+        self._reader_ref = stream_reader
+
+    def eof_received(self) -> bool:
+        reader = self._reader_ref
+        if reader is not None:
+            reader.feed_eof()
+        return False
+
+
 class AsyncTLSInterceptProxy:
     """Minimal TLS intercept proxy that routes CONNECT traffic to localstub."""
 
@@ -166,9 +184,29 @@ class AsyncTLSInterceptProxy:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
 
-            tls_reader, tls_writer = await self._upgrade_to_tls(
-                writer, connect_host
-            )
+            try:
+                tls_reader, tls_writer = await self._upgrade_to_tls(
+                    writer, connect_host
+                )
+            except (ConnectionResetError, ssl.SSLError) as exc:
+                # Many real clients immediately drop the connection if they
+                # don't trust our ephemeral CA. Treat this as a normal
+                # condition and avoid a noisy stack trace; provide a helpful
+                # hint instead.
+                LOG.warning(
+                    "TLS handshake from client failed for %s:%s; "
+                    "client likely rejected the proxy CA (%s): %s",
+                    connect_host,
+                    connect_port,
+                    self._ca.ca_pem_path(),
+                    exc,
+                )
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
 
             if self._default_mode == "forward":
                 await self._forward(
@@ -194,6 +232,8 @@ class AsyncTLSInterceptProxy:
                 pass
             raise
         except Exception:
+            # Any other exception is unexpected; keep the traceback to aid
+            # debugging.
             LOG.exception("TLS proxy error")
             try:
                 writer.close()
@@ -274,7 +314,7 @@ class AsyncTLSInterceptProxy:
             )
 
         tls_reader = asyncio.StreamReader()
-        tls_protocol = asyncio.StreamReaderProtocol(tls_reader)
+        tls_protocol = TLSStreamReaderProtocol(tls_reader)
 
         tls_transport = await loop.start_tls(
             transport,
