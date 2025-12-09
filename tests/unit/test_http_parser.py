@@ -646,6 +646,70 @@ class TestAsyncResponseParser:
 
         assert parsed is None
 
+    @pytest.mark.asyncio
+    async def test_parse_truncated_content_length_response_returns_none(self):
+        # Response declares 100 bytes but only 10 are provided before EOF
+        response_data = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: 100\r\n"
+            b"\r\n"
+            b"Truncated!"
+        )
+        reader = _create_mock_reader([response_data])
+
+        parser = AsyncResponseParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        assert parsed is None
+
+    @pytest.mark.asyncio
+    async def test_parse_truncated_chunked_response_returns_none(self):
+        # Chunked response without the terminating "0\r\n\r\n"
+        response_data = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"\r\n"
+            b"5\r\nHello\r\n"
+        )
+        reader = _create_mock_reader([response_data])
+
+        parser = AsyncResponseParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        assert parsed is None
+
+    @pytest.mark.asyncio
+    async def test_parse_truncated_lowercase_content_length_returns_none(self):
+        # Verify case-insensitive header detection for content-length
+        response_data = (
+            b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\npartial"
+        )
+        reader = _create_mock_reader([response_data])
+
+        parser = AsyncResponseParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        assert parsed is None
+
+    @pytest.mark.asyncio
+    async def test_parse_truncated_uppercase_transfer_encoding_returns_none(
+        self,
+    ):
+        # Verify case-insensitive header detection for TRANSFER-ENCODING
+        response_data = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"TRANSFER-ENCODING: chunked\r\n"
+            b"\r\n"
+            b"5\r\nHello\r\n"
+        )
+        reader = _create_mock_reader([response_data])
+
+        parser = AsyncResponseParser()
+        parsed, wire_bytes = await parser.parse(reader)
+
+        assert parsed is None
+
 
 class TestHTTPRequestReader:
     @pytest.mark.asyncio
