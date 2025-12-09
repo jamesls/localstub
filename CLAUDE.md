@@ -105,6 +105,9 @@ You MUST load the various `python-coding:*` skills when you are checking or
 reviewing code, e.g. `python-coding:coding-guidelines`, etc.  The content
 in those python coding skills are REQUIREMENTS and cannot be ignored.
 
+You MUST NOT use `# type: ignore` or `# noqa` comments anywhere in the code.
+Both of these comments are completely BANNED from the code base.
+
 ## Coverage
 
 - Coverage tracking configured via pytest-cov
