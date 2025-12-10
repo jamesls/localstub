@@ -14,7 +14,10 @@ from typing import Optional, cast
 
 import trustme
 
-from localstub.http.response import AsyncResponseParser
+from localstub.http.response import (
+    AsyncMultiResponseParser,
+    AsyncResponseParser,
+)
 from localstub.http.request import (
     HTTPRequest,
     HTTPRequestReader,
@@ -24,6 +27,16 @@ from localstub.server import AsyncHTTPTestServer
 
 
 LOG = logging.getLogger(__name__)
+
+
+def _wire_log(direction: str, data: bytes) -> None:
+    """Log wire-level data with direction indicator."""
+    LOG.debug("[%s] %r", direction, data)
+
+
+def _close_log(direction: str, reason: str) -> None:
+    """Log connection closure with direction and reason."""
+    LOG.debug("[%s CLOSED] %s", direction, reason)
 
 
 class _TrustMeCA:
@@ -175,13 +188,24 @@ class AsyncTLSInterceptProxy:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        # Extract client port for logging
+        peername = writer.get_extra_info("peername")
+        client_port = peername[1] if peername else 0
+        client_id = f"client:{client_port}"
+
         try:
-            connect_host, connect_port = await self._parse_connect(reader)
+            connect_host, connect_port = await self._parse_connect(
+                reader, client_id
+            )
             if connect_host is None or connect_port is None:
-                await self._send_and_close(writer, b"HTTP/1.1 400 Bad Request")
+                await self._send_and_close(
+                    writer, b"HTTP/1.1 400 Bad Request", client_id
+                )
                 return
 
-            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            response_bytes = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+            _wire_log(f"lstub --> {client_id}", response_bytes)
+            writer.write(response_bytes)
             await writer.drain()
 
             try:
@@ -202,6 +226,9 @@ class AsyncTLSInterceptProxy:
                     exc,
                 )
                 try:
+                    _close_log(
+                        f"lstub --> {client_id}", "TLS handshake failed"
+                    )
                     writer.close()
                     await writer.wait_closed()
                 except Exception:
@@ -214,18 +241,20 @@ class AsyncTLSInterceptProxy:
                     connect_port,
                     tls_reader,
                     tls_writer,
+                    client_id,
                 )
                 return
 
             if self._server is None:
                 await self._send_and_close(
-                    tls_writer, b"HTTP/1.1 502 Bad Gateway"
+                    tls_writer, b"HTTP/1.1 502 Bad Gateway", client_id
                 )
                 return
 
             await self._server.handle_http_connection(tls_reader, tls_writer)
         except asyncio.CancelledError:
             try:
+                _close_log(f"lstub --> {client_id}", "task cancelled")
                 writer.close()
                 await writer.wait_closed()
             except Exception:
@@ -236,6 +265,7 @@ class AsyncTLSInterceptProxy:
             # debugging.
             LOG.exception("TLS proxy error")
             try:
+                _close_log(f"lstub --> {client_id}", "unexpected error")
                 writer.close()
                 await writer.wait_closed()
             except Exception:
@@ -251,11 +281,12 @@ class AsyncTLSInterceptProxy:
         task.add_done_callback(self._client_tasks.discard)
 
     async def _parse_connect(
-        self, reader: asyncio.StreamReader
+        self, reader: asyncio.StreamReader, client_id: str
     ) -> tuple[str | None, int | None]:
         line = await reader.readline()
         if not line:
             return None, None
+        _wire_log(f"lstub <-- {client_id}", line)
         try:
             req_line = line.decode("ascii", errors="replace").strip()
             parts = req_line.split(" ")
@@ -274,6 +305,7 @@ class AsyncTLSInterceptProxy:
             header_line = await reader.readline()
             if not header_line:
                 break
+            _wire_log(f"lstub <-- {client_id}", header_line)
             if header_line in (b"\r\n", b"\n"):
                 break
         return host, port
@@ -368,13 +400,76 @@ class AsyncTLSInterceptProxy:
                 return body
         return body
 
+    async def _read_and_relay_responses(
+        self,
+        upstream_reader: asyncio.StreamReader,
+        upstream_id: str,
+        client_writer: asyncio.StreamWriter,
+        client_id: str,
+        request_method: str | None,
+    ) -> RecordedResponse | None:
+        """Read responses from upstream, relaying each to client.
+
+        Handles 1xx informational responses by relaying them and continuing
+        to read until a final (2xx+) response is received.
+
+        Uses a single parser instance to handle cases where multiple responses
+        (e.g., 100 Continue + 200 OK) arrive in a single buffer read.
+
+        Returns the final response, or None if parsing failed.
+        """
+        multi_parser = AsyncMultiResponseParser(max_read=self._max_read)
+
+        while True:
+            parsed, wire_bytes = await multi_parser.next_response(
+                upstream_reader, request_method
+            )
+            if parsed is None:
+                return None
+
+            _wire_log(f"{upstream_id} --> lstub", wire_bytes)
+
+            # Relay the response to the client immediately
+            _wire_log(f"lstub --> {client_id}", wire_bytes)
+            client_writer.write(wire_bytes)
+            await client_writer.drain()
+
+            status = parsed.status_code or 0
+
+            # Check if this is a final response (not 1xx informational)
+            if status >= 200:
+                headers = headers_to_message(parsed.headers)
+                body_bytes = self._maybe_decompress(headers, parsed.body)
+                body_text = body_bytes.decode("utf-8", errors="replace")
+                return RecordedResponse(
+                    status=status,
+                    reason=(
+                        parsed.status_text.decode("ascii", errors="replace")
+                        if parsed.status_text
+                        else None
+                    ),
+                    headers=headers,
+                    body=body_text,
+                    wire_raw_bytes=wire_bytes,
+                )
+
+            # For 1xx responses, log and continue reading for final response
+            LOG.debug(
+                "Received 1xx informational response (%d), "
+                "waiting for final response",
+                status,
+            )
+
     async def _forward(
         self,
         host: str,
         port: int,
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
+        client_id: str,
     ) -> None:
+        upstream_id = f"{host}:{port}"
+
         # Read and record the client's decrypted HTTP request first so we
         # preserve it even if the upstream cannot be reached.
         request_reader = HTTPRequestReader()
@@ -383,10 +478,11 @@ class AsyncTLSInterceptProxy:
         )
         if request is None or request.wire_raw_bytes is None:
             await self._send_and_close(
-                client_writer, b"HTTP/1.1 400 Bad Request"
+                client_writer, b"HTTP/1.1 400 Bad Request", client_id
             )
             return
 
+        _wire_log(f"lstub <-- {client_id}", request.wire_raw_bytes)
         await self._recorded_requests.put(request)
 
         # Prepare upstream connection parameters after reading the request.
@@ -412,37 +508,47 @@ class AsyncTLSInterceptProxy:
             # Could not connect upstream; send a 502 but keep the recorded
             # request available to callers for inspection.
             await self._send_and_close(
-                client_writer, b"HTTP/1.1 502 Bad Gateway"
+                client_writer, b"HTTP/1.1 502 Bad Gateway", client_id
             )
             return
 
         # Forward the raw request to upstream
+        _wire_log(f"{upstream_id} <-- lstub", request.wire_raw_bytes)
         upstream_writer.write(request.wire_raw_bytes)
         await upstream_writer.drain()
 
-        # Read response from upstream
-        recorded_response = await self._read_upstream_response(
-            upstream_reader, request.method
+        # Read responses from upstream, handling 1xx informational responses.
+        # HTTP allows servers to send one or more 1xx responses before the
+        # final response (e.g., 100 Continue before 200 OK).
+        final_response = await self._read_and_relay_responses(
+            upstream_reader,
+            upstream_id,
+            client_writer,
+            client_id,
+            request.method,
         )
-        if recorded_response is None:
+        if final_response is None:
             await self._send_and_close(
-                client_writer, b"HTTP/1.1 502 Bad Gateway"
+                client_writer, b"HTTP/1.1 502 Bad Gateway", client_id
             )
+            _close_log(f"{upstream_id} --> lstub", "failed to parse response")
             upstream_writer.close()
             await upstream_writer.wait_closed()
             return
 
-        await self._recorded_responses.put(recorded_response)
+        # Record only the final response
+        await self._recorded_responses.put(final_response)
 
-        # Relay response to client
+        # Close upstream connection
+        _close_log(f"{upstream_id} --> lstub", "response received")
         upstream_writer.close()
         try:
             await upstream_writer.wait_closed()
         except Exception:
             pass
 
-        client_writer.write(recorded_response.wire_raw_bytes)
-        await client_writer.drain()
+        # Close client connection
+        _close_log(f"lstub --> {client_id}", "response relayed")
         client_writer.close()
         try:
             await client_writer.wait_closed()
@@ -453,11 +559,16 @@ class AsyncTLSInterceptProxy:
         self,
         writer: asyncio.StreamWriter,
         status_line: bytes,
+        client_id: str,
     ) -> None:
         try:
-            writer.write(status_line + b"\r\n\r\n")
+            response_bytes = status_line + b"\r\n\r\n"
+            _wire_log(f"lstub --> {client_id}", response_bytes)
+            writer.write(response_bytes)
             await writer.drain()
         finally:
+            reason = status_line.decode("ascii", errors="replace")
+            _close_log(f"lstub --> {client_id}", f"sent {reason}")
             writer.close()
             if hasattr(writer, "wait_closed"):
                 try:

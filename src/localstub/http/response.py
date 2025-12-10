@@ -37,6 +37,10 @@ class ResponseProtocol:
         """Set the parser reference for accessing parsed metadata."""
         self._parser = parser
 
+    def reset(self) -> None:
+        """Reset the protocol for parsing the next message."""
+        self.result = ParsedResponse()
+
     def on_message_begin(self) -> None:
         """Called when a new message begins.
 
@@ -194,3 +198,147 @@ class AsyncResponseParser:
     def wire_bytes(self) -> bytes:
         """Return the accumulated wire bytes."""
         return bytes(self._wire)
+
+
+class _ByteTrackingProtocol:
+    """Protocol that tracks byte positions when messages complete."""
+
+    def __init__(self) -> None:
+        self.result = ParsedResponse()
+        self._parser: httptools.HttpResponseParser | None = None
+        self.message_complete = False
+
+    def set_parser(self, parser: httptools.HttpResponseParser) -> None:
+        self._parser = parser
+
+    def reset(self) -> None:
+        self.result = ParsedResponse()
+        self.message_complete = False
+
+    def on_message_begin(self) -> None:
+        if not self.message_complete:
+            self.result = ParsedResponse()
+
+    def on_status(self, status: bytes) -> None:
+        if not self.message_complete:
+            if self.result.status_text is None:
+                self.result.status_text = status
+            else:
+                self.result.status_text += status
+
+    def on_header(self, name: bytes, value: bytes) -> None:
+        if not self.message_complete:
+            self.result.headers.append((name, value))
+
+    def on_headers_complete(self) -> None:
+        if not self.message_complete and self._parser is not None:
+            self.result.status_code = self._parser.get_status_code()
+            self.result.http_version = self._parser.get_http_version()
+
+    def on_body(self, body: bytes) -> None:
+        if not self.message_complete:
+            self.result.body_parts.append(body)
+
+    def on_message_complete(self) -> None:
+        if not self.message_complete:
+            self.result.is_complete = True
+            self.message_complete = True
+
+    def on_chunk_header(self) -> None:
+        pass
+
+    def on_chunk_complete(self) -> None:
+        pass
+
+
+class AsyncMultiResponseParser:
+    """Parser that handles multiple HTTP responses from a stream.
+
+    This parser is designed for scenarios where a server sends one or more
+    1xx informational responses before the final response, and all responses
+    may arrive in a single buffer read.
+
+    It feeds data byte-by-byte to precisely track where each response ends,
+    preserving exact wire bytes for each response.
+    """
+
+    def __init__(self, max_read: int = 8192) -> None:
+        self._max_read = max_read
+        self._buffer = bytearray()
+        self._consumed = 0
+
+    async def next_response(
+        self,
+        reader: asyncio.StreamReader,
+        request_method: str | None = None,
+    ) -> tuple[ParsedResponse | None, bytes]:
+        """Parse and return the next complete HTTP response.
+
+        Args:
+            reader: The asyncio stream to read from.
+            request_method: The HTTP method of the request.
+
+        Returns:
+            Tuple of (parsed_response, wire_bytes_for_this_response).
+            Returns (None, wire_bytes) on parse error or EOF.
+        """
+        protocol = _ByteTrackingProtocol()
+        parser = httptools.HttpResponseParser(protocol)
+        protocol.set_parser(parser)
+
+        is_head = (
+            request_method is not None and request_method.upper() == "HEAD"
+        )
+        wire_start = self._consumed
+
+        while True:
+            # First, try to parse from any buffered data
+            while self._consumed < len(self._buffer):
+                byte = bytes([self._buffer[self._consumed]])
+                self._consumed += 1
+
+                try:
+                    parser.feed_data(byte)
+                except httptools.HttpParserError:
+                    wire = bytes(self._buffer[wire_start : self._consumed])
+                    return None, wire
+
+                if protocol.message_complete:
+                    wire = bytes(self._buffer[wire_start : self._consumed])
+                    return protocol.result, wire
+
+                if is_head and protocol.result.http_version is not None:
+                    protocol.result.is_complete = True
+                    wire = bytes(self._buffer[wire_start : self._consumed])
+                    return protocol.result, wire
+
+            # Need more data
+            try:
+                data = await reader.read(self._max_read)
+            except Exception:
+                break
+
+            if not data:
+                break
+
+            self._buffer.extend(data)
+
+        # Handle EOF - check for close-delimited response
+        if protocol.result.http_version is not None:
+            if self._is_close_delimited(protocol.result.headers):
+                protocol.result.is_complete = True
+                wire = bytes(self._buffer[wire_start : self._consumed])
+                return protocol.result, wire
+
+        wire = bytes(self._buffer[wire_start : self._consumed])
+        return None, wire
+
+    def _is_close_delimited(self, headers: list[tuple[bytes, bytes]]) -> bool:
+        """Check if the response is close-delimited."""
+        for name, _ in headers:
+            name_lower = name.lower()
+            if name_lower == b"content-length":
+                return False
+            if name_lower == b"transfer-encoding":
+                return False
+        return True
