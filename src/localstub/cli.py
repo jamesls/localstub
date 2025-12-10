@@ -9,8 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
-from localstub.tls_proxy import AsyncTLSInterceptProxy, RecordedResponse
-from localstub.server import HTTPRequest
+from localstub.tlsproxy import AsyncTLSInterceptProxy, RecordedResponse
+from localstub.http.request import HTTPRequest
 
 DEFAULT_PORT = 8888
 

@@ -13,7 +13,7 @@ from localstub.cli import (
     process_traffic,
 )
 from localstub.server import HTTPRequest
-from localstub.tls_proxy import RecordedResponse
+from localstub.tlsproxy import RecordedResponse
 
 
 class TestParseArgs:

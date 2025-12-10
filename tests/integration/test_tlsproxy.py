@@ -7,7 +7,7 @@ import trustme
 import pytest
 
 from localstub.server import AsyncHTTPTestServer
-from localstub.tls_proxy import AsyncTLSInterceptProxy
+from localstub.tlsproxy import AsyncTLSInterceptProxy
 
 
 @pytest.mark.asyncio

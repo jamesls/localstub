@@ -7,17 +7,19 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from localstub.http_parser import (
+from localstub.http.request import (
     AsyncRequestParser,
-    AsyncResponseParser,
     HTTPRequest,
     HTTPRequestReader,
     ParsedRequest,
-    ParsedResponse,
     RequestProtocol,
-    ResponseProtocol,
-    headers_to_message,
 )
+from localstub.http.response import (
+    AsyncResponseParser,
+    ParsedResponse,
+    ResponseProtocol,
+)
+from localstub.http.utils import headers_to_message
 
 
 class TestParsedRequest:
