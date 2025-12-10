@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from localstub.tls_proxy import _TrustMeCA
+from localstub.tlsproxy import _TrustMeCA
 
 
 def test_trustme_ca_closes_temp_fd(monkeypatch, tmp_path):

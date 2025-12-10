@@ -33,12 +33,10 @@ dev = [
   "mkdocstrings>=0.30.0",
   "mkdocs-material>=9.6.20",
   "pymdown-extensions>=10.16.1",
-  "pytest-github-actions-annotate-failures>=0.3.0",
   "jmeslog>=0.2.0",
   "poethepoet>=0.37.0",
   "ruff>=0.13.0",
   "pyright[nodejs]>=1.1.405",
-  "pygments>=2.19.2",
 ]
 
 
@@ -77,6 +75,9 @@ exclude_lines = [
     'pragma: no cover',
     'raise NotImplementedError',
 ]
+exclude_also = [
+    "def .*: \\.\\.\\.$",
+]
 
 [tool.pyright]
 include = ["src"]
@@ -90,20 +91,19 @@ pythonPlatform = "All"
 
 [tool.poe.tasks]
 check = [
-  { cmd = ".venv/bin/ruff check ." },
-  { cmd = ".venv/bin/ruff format --diff ." },
-  { cmd = ".venv/bin/pyright" },
+  { cmd = "uv run ruff check ." },
+  { cmd = "uv run ruff format --diff ." },
+  { cmd = "uv run pyright" },
 ]
-test = ".venv/bin/pytest tests/"
-stage-release = "python3 ./scripts/stage-release --output staged-release.zip"
+test = "uv run pytest tests/"
 format-code = [
-  { cmd = ".venv/bin/ruff format ." },
+  { cmd = "uv run ruff format ." },
 ]
 # Similar to check, but also auto fixes issues.
 auto-check = [
-  { cmd = ".venv/bin/ruff format ." },
-  { cmd = ".venv/bin/ruff check --fix ." },
-  { cmd = ".venv/bin/pyright" },
+  { cmd = "uv run ruff check --fix ." },
+  { cmd = "uv run ruff format ." },
+  { cmd = "uv run pyright" },
 ]
 prcheck = ["check", "test"]
 

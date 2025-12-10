@@ -8,11 +8,11 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
 
-from localstub.http_parser import (
+from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
-    headers_to_message,
 )
+from localstub.http.utils import headers_to_message
 
 LOG = logging.getLogger(__name__)
 

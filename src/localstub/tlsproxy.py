@@ -14,12 +14,12 @@ from typing import Optional, cast
 
 import trustme
 
-from localstub.http_parser import (
-    AsyncResponseParser,
+from localstub.http.response import AsyncResponseParser
+from localstub.http.request import (
     HTTPRequest,
     HTTPRequestReader,
-    headers_to_message,
 )
+from localstub.http.utils import headers_to_message
 from localstub.server import AsyncHTTPTestServer
 
 
