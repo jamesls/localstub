@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import signal
 import sys
 from datetime import datetime, timezone
@@ -49,11 +50,21 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Path to write the CA certificate PEM",
     )
+    parser.add_argument(
+        "--log-level",
+        default="DEBUG",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging level (default: DEBUG)",
+    )
     return parser.parse_args(args)
 
 
 async def run_proxy(args: argparse.Namespace) -> None:
     """Start and run the TLS proxy."""
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     proxy = AsyncTLSInterceptProxy(
         listen_port=args.port,
         default_mode="forward",
@@ -115,6 +126,7 @@ async def process_traffic(
 
         sys.stdout.buffer.write(b"\n--- REQUEST ---\n")
         sys.stdout.buffer.write(request.wire_raw_bytes or b"")
+        sys.stdout.buffer.write(b"\n")
         sys.stdout.buffer.flush()
 
         response: RecordedResponse | None = None
@@ -139,6 +151,7 @@ async def process_traffic(
         if response:
             sys.stdout.buffer.write(b"\n--- RESPONSE ---\n")
             sys.stdout.buffer.write(response.wire_raw_bytes)
+            sys.stdout.buffer.write(b"\n")
             sys.stdout.buffer.flush()
 
         if output_file:

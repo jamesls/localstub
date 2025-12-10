@@ -789,3 +789,242 @@ async def test_forward_handles_client_closing_connection_early():
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def _expect_continue_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Handler that sends 100 Continue before the final response."""
+    # Read full request including body
+    await reader.readuntil(b"\r\n\r\n")
+
+    # Send 100 Continue first
+    writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+    await writer.drain()
+
+    # Then send the final response
+    body = b"upload accepted"
+    writer.write(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Length: 15\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"\r\n" + body
+    )
+    await writer.drain()
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_forward_handles_100_continue_before_final_response():
+    """
+    Proxy should handle servers that send 100 Continue before the final
+    response, relaying both to the client without closing prematurely.
+    """
+    server = await asyncio.start_server(
+        _expect_continue_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.put(
+                    f"https://{server_host}:{server_port}/upload",
+                    content=b"test data",
+                    headers={"Expect": "100-continue"},
+                )
+
+        assert response.status_code == 200
+        assert response.text == "upload accepted"
+
+        recorded_request = await proxy.next_request(timeout=1.0)
+        assert recorded_request.method == "PUT"
+        assert recorded_request.path == "/upload"
+
+        # Only the final response should be recorded
+        recorded_response = await proxy.next_response(timeout=1.0)
+        assert recorded_response.status == 200
+        assert recorded_response.body == "upload accepted"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def _multiple_informational_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Handler that sends multiple 1xx responses before final response."""
+    await reader.readuntil(b"\r\n\r\n")
+
+    # Send 100 Continue
+    writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+    await writer.drain()
+
+    # Send 102 Processing (used by WebDAV for long operations)
+    writer.write(b"HTTP/1.1 102 Processing\r\n\r\n")
+    await writer.drain()
+
+    # Send final response
+    body = b"done"
+    writer.write(
+        b"HTTP/1.1 201 Created\r\n"
+        b"Content-Length: 4\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"\r\n" + body
+    )
+    await writer.drain()
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_forward_handles_multiple_informational_responses():
+    """
+    Proxy should handle multiple 1xx informational responses before the
+    final response, relaying each to the client.
+    """
+    server = await asyncio.start_server(
+        _multiple_informational_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.post(
+                    f"https://{server_host}:{server_port}/long-operation",
+                    content=b"data",
+                )
+
+        assert response.status_code == 201
+        assert response.text == "done"
+
+        recorded_request = await proxy.next_request(timeout=1.0)
+        assert recorded_request.method == "POST"
+        assert recorded_request.path == "/long-operation"
+
+        # Only the final response should be recorded
+        recorded_response = await proxy.next_response(timeout=1.0)
+        assert recorded_response.status == 201
+        assert recorded_response.body == "done"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def _chunked_with_continue_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Handler simulating S3's response to chunked uploads with Expect."""
+    await reader.readuntil(b"\r\n\r\n")
+
+    # Send 100 Continue
+    writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+    await writer.drain()
+
+    # Send chunked final response (like S3 does)
+    # Chunk size b (hex) = 11 decimal = len("<Success/>\n")
+    writer.write(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"Content-Type: application/xml\r\n"
+        b"\r\n"
+        b"b\r\n<Success/>\n\r\n"
+        b"0\r\n\r\n"
+    )
+    await writer.drain()
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_forward_handles_100_continue_with_chunked_response():
+    """
+    Proxy should handle 100 Continue followed by a chunked response,
+    which is the pattern used by S3 for uploads with Expect: 100-continue.
+    """
+    server = await asyncio.start_server(
+        _chunked_with_continue_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.put(
+                    f"https://{server_host}:{server_port}/bucket/key",
+                    content=b"file contents",
+                    headers={"Expect": "100-continue"},
+                )
+
+        assert response.status_code == 200
+        assert response.text == "<Success/>\n"
+
+        recorded_request = await proxy.next_request(timeout=1.0)
+        assert recorded_request.method == "PUT"
+        assert recorded_request.path == "/bucket/key"
+
+        recorded_response = await proxy.next_response(timeout=1.0)
+        assert recorded_response.status == 200
+        assert recorded_response.body == "<Success/>\n"
+    finally:
+        server.close()
+        await server.wait_closed()
