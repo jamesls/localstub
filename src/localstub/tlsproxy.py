@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-import os
 import ssl
 import asyncio
 import logging
-import tempfile
 from asyncio import transports
 import gzip
 from dataclasses import dataclass
 from email.message import Message
-from pathlib import Path
 from typing import Optional, cast
-
-import trustme
 
 from localstub.http.response import (
     AsyncMultiResponseParser,
@@ -24,6 +19,7 @@ from localstub.http.request import (
 )
 from localstub.http.utils import headers_to_message
 from localstub.server import AsyncHTTPTestServer
+from localstub.ca import TLSProxyCA
 
 
 LOG = logging.getLogger(__name__)
@@ -37,28 +33,6 @@ def _wire_log(direction: str, data: bytes) -> None:
 def _close_log(direction: str, reason: str) -> None:
     """Log connection closure with direction and reason."""
     LOG.debug("[%s CLOSED] %s", direction, reason)
-
-
-class _TrustMeCA:
-    """Ephemeral CA backed by trustme; issues per-host server contexts."""
-
-    def __init__(self) -> None:
-        self._ca = trustme.CA()
-        fd, path = tempfile.mkstemp(prefix="localstub-ca-", suffix=".pem")
-        os.close(fd)
-        Path(path).write_bytes(self._ca.cert_pem.bytes())
-        self._ca_pem_path = Path(path)
-
-    def issue_context(self, host: str) -> ssl.SSLContext:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        server_cert = self._ca.issue_server_cert(host)
-        server_cert.configure_cert(context)
-        context.set_alpn_protocols(["http/1.1"])
-        context.options |= ssl.OP_NO_COMPRESSION
-        return context
-
-    def ca_pem_path(self) -> Path:
-        return self._ca_pem_path
 
 
 class TLSStreamReaderProtocol(asyncio.StreamReaderProtocol):
@@ -88,7 +62,7 @@ class AsyncTLSInterceptProxy:
         listen_host: str = "127.0.0.1",
         listen_port: int = 0,
         server: Optional[AsyncHTTPTestServer] = None,
-        ca: Optional[_TrustMeCA] = None,
+        ca: Optional[TLSProxyCA] = None,
         max_read: int = 8192,
         default_mode: str = "intercept",
         verify_upstream: bool = True,
@@ -97,7 +71,7 @@ class AsyncTLSInterceptProxy:
         self._listen_host = listen_host
         self._listen_port = listen_port
         self._server = server
-        self._ca = ca or _TrustMeCA()
+        self._ca = ca or TLSProxyCA()
         self._max_read = max_read
         self._default_mode = default_mode
         self._verify_upstream = verify_upstream
@@ -125,7 +99,13 @@ class AsyncTLSInterceptProxy:
         return (self._host, self._port)
 
     @property
-    def ca(self) -> _TrustMeCA:
+    def endpoint_url(self) -> str:
+        if self._host is None or self._port is None:
+            raise RuntimeError("Proxy not started yet")
+        return f'http://{self._host}:{self._port}'
+
+    @property
+    def ca(self) -> TLSProxyCA:
         return self._ca
 
     async def next_request(self, timeout: float | None = None) -> HTTPRequest:
