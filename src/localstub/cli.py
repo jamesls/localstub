@@ -63,7 +63,7 @@ async def run_proxy(args: argparse.Namespace) -> None:
     """Start and run the TLS proxy."""
     logging.basicConfig(
         level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s: %(message)s",
     )
     proxy = AsyncTLSInterceptProxy(
         listen_port=args.port,
@@ -79,6 +79,7 @@ async def run_proxy(args: argparse.Namespace) -> None:
         host, port = proxy.address
         print(f"lstub proxy listening on {host}:{port}")
         print(f"CA certificate: {proxy.ca.ca_pem_path()}")
+        print(f"Keystore certificate: {proxy.ca.ca_pkcs12_path()}")
         if args.ca_cert:
             print(f"CA cert copied to: {args.ca_cert}")
         print("Press Ctrl+C to stop\n")
