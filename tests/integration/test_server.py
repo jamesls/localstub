@@ -1562,6 +1562,14 @@ async def test_on_headers_received_100_continue_in_connection_bytes():
         client_addr = server.last_request.client
         conn_bytes = server.get_connection_bytes_sent(client_addr)
         assert conn_bytes is not None
+
+        info_start = conn_bytes.find(b"HTTP/1.1 100 Continue\r\n")
+        assert info_start != -1
+        info_end = conn_bytes.find(b"\r\n\r\n", info_start)
+        assert info_end != -1
+        info_headers = conn_bytes[info_start:info_end]
+
+        assert b"Content-Length" not in info_headers
         assert b"HTTP/1.1 100 Continue" in conn_bytes
         assert b"HTTP/1.1 200 OK" in conn_bytes
 
@@ -1736,5 +1744,20 @@ async def test_on_headers_received_multiple_informational_responses():
         client_addr = server.last_request.client
         conn_bytes = server.get_connection_bytes_sent(client_addr)
         assert conn_bytes is not None
+
+        info_start = conn_bytes.find(b"HTTP/1.1 100 Continue\r\n")
+        assert info_start != -1
+        info_end = conn_bytes.find(b"\r\n\r\n", info_start)
+        assert info_end != -1
+        info_headers = conn_bytes[info_start:info_end]
+
+        processing_start = conn_bytes.find(b"HTTP/1.1 102 Processing\r\n")
+        assert processing_start != -1
+        processing_end = conn_bytes.find(b"\r\n\r\n", processing_start)
+        assert processing_end != -1
+        processing_headers = conn_bytes[processing_start:processing_end]
+
+        assert b"Content-Length" not in info_headers
+        assert b"Content-Length" not in processing_headers
         assert b"HTTP/1.1 100 Continue" in conn_bytes
         assert b"HTTP/1.1 102 Processing" in conn_bytes
