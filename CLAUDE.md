@@ -44,8 +44,20 @@ you MUST run `poe test` before handoff.
 
 ### Code Quality
 
-You MUST run `poe auto-check` if you make ANY code changes (including tests).
-This is a HARD REQUIREMENT.
+You MUST run `poe auto-check` if you make ANY code changes. No exceptions.
+This includes:
+- New code
+- Modified code
+- Deleted code
+- Test changes
+- Resolving merge conflicts
+- Resolving rebase conflicts
+- Any edit to any file for any reason
+
+Run `poe auto-check` IMMEDIATELY after making changes, BEFORE any git
+operations (commit, rebase --continue, merge --continue, etc.).
+
+This is a HARD REQUIREMENT. Do not skip this step. Do not defer this step.
 
 ### Test Discipline
 
