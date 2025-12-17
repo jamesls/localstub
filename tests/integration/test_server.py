@@ -7,7 +7,9 @@ import pytest_asyncio
 
 from localstub.server import (
     AsyncHTTPTestServer,
+    HTTPRequestHeaders,
     HTTPResponse,
+    SendResponse,
     ThrottledTransmission,
 )
 
@@ -1533,3 +1535,241 @@ async def test_server_handles_pipelined_requests_with_body(server):
 
     # Should have received two HTTP responses
     assert response.count(b"HTTP/1.1") == 2
+
+
+# ---------------------------------------------------------------------------
+# on_headers_received hook tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_sends_100_continue():
+    async def handle_expect(
+        headers: HTTPRequestHeaders,
+        send: SendResponse,
+    ) -> bool:
+        expect = headers.headers.get("Expect", "")
+        if "100-continue" in expect.lower():
+            await send(HTTPResponse(status=100))
+        return True
+
+    async with AsyncHTTPTestServer(
+        on_headers_received=handle_expect
+    ) as server:
+        server.set_json_response({"status": "ok"})
+
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                f"{server.url}upload",
+                content=b"test body content",
+                headers={"Expect": "100-continue"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert server.last_request is not None
+        assert server.last_request.body == "test body content"
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_100_continue_in_connection_bytes():
+    async def handle_expect(
+        headers: HTTPRequestHeaders,
+        send: SendResponse,
+    ) -> bool:
+        if "100-continue" in headers.headers.get("Expect", "").lower():
+            await send(HTTPResponse(status=100))
+        return True
+
+    async with AsyncHTTPTestServer(
+        on_headers_received=handle_expect
+    ) as server:
+        server.set_json_response({"status": "ok"})
+
+        async with httpx.AsyncClient() as client:
+            await client.put(
+                f"{server.url}upload",
+                content=b"body data",
+                headers={"Expect": "100-continue"},
+            )
+
+        assert server.last_request is not None
+        client_addr = server.last_request.client
+        conn_bytes = server.get_connection_bytes_sent(client_addr)
+        assert conn_bytes is not None
+        assert b"HTTP/1.1 100 Continue" in conn_bytes
+        assert b"HTTP/1.1 200 OK" in conn_bytes
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_can_reject_with_response():
+    async def reject_large(
+        headers: HTTPRequestHeaders,
+        send: SendResponse,
+    ) -> bool:
+        content_length = int(headers.headers.get("Content-Length", "0"))
+        if content_length > 100:
+            await send(HTTPResponse(status=413, body=b"Too large"))
+            return False
+        return True
+
+    async with AsyncHTTPTestServer(on_headers_received=reject_large) as server:
+        server.set_json_response({"status": "ok"})
+
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                f"{server.url}upload",
+                content=b"x" * 200,
+            )
+
+        assert response.status_code == 413
+        # Request should not be recorded since we rejected early
+        assert len(server.requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_not_called_without_hook(server, client):
+    server.set_json_response({"status": "ok"})
+
+    response = await client.put(
+        f"{server.url}upload",
+        content=b"test body",
+    )
+
+    # Normal behavior - no 100-continue handling
+    assert response.status_code == 200
+    assert server.last_request is not None
+    assert server.last_request.body == "test body"
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_sync_handler():
+    def sync_handler(
+        headers: HTTPRequestHeaders,
+        send: SendResponse,
+    ) -> bool:
+        # Sync handler - cannot call send() without await
+        return True
+
+    async with AsyncHTTPTestServer(on_headers_received=sync_handler) as server:
+        server.set_json_response({"status": "ok"})
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(server.url)
+
+        assert response.status_code == 200
+        assert server.last_request is not None
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_async_handler():
+    async def async_handler(
+        headers: HTTPRequestHeaders,
+        send: SendResponse,
+    ) -> bool:
+        # Simulate async work
+        await asyncio.sleep(0.01)
+        return True
+
+    async with AsyncHTTPTestServer(
+        on_headers_received=async_handler
+    ) as server:
+        server.set_json_response({"status": "ok"})
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(server.url)
+
+        assert response.status_code == 200
+        assert server.last_request is not None
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_rejection_stops_body_read():
+    body_received = []
+
+    async def reject_all(
+        headers: HTTPRequestHeaders,
+        send: SendResponse,
+    ) -> bool:
+        await send(HTTPResponse(status=403, body=b"Forbidden"))
+        return False
+
+    async with AsyncHTTPTestServer(on_headers_received=reject_all) as server:
+
+        def track_handler(request):
+            body_received.append(request.body)
+            return HTTPResponse.json({"tracked": True})
+
+        server.handler = track_handler
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{server.url}data",
+                content=b"secret data that should not be read",
+            )
+
+        assert response.status_code == 403
+        # Handler should never have been called
+        assert len(body_received) == 0
+        assert len(server.requests) == 0
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_exposes_headers():
+    received_headers: list[HTTPRequestHeaders] = []
+
+    async def capture_headers(
+        headers: HTTPRequestHeaders,
+        send: SendResponse,
+    ) -> bool:
+        received_headers.append(headers)
+        return True
+
+    async with AsyncHTTPTestServer(
+        on_headers_received=capture_headers
+    ) as server:
+        server.set_json_response({"status": "ok"})
+
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{server.url}test/path",
+                content=b"body",
+                headers={"X-Custom": "custom-value"},
+            )
+
+        assert len(received_headers) == 1
+        h = received_headers[0]
+        assert h.method == "POST"
+        assert h.path == "/test/path"
+        assert h.headers.get("X-Custom") == "custom-value"
+        assert h.wire_raw_bytes is not None
+        assert b"POST /test/path" in h.wire_raw_bytes
+
+
+@pytest.mark.asyncio
+async def test_on_headers_received_multiple_informational_responses():
+    async def multi_info(
+        headers: HTTPRequestHeaders,
+        send: SendResponse,
+    ) -> bool:
+        await send(HTTPResponse(status=100))
+        await send(HTTPResponse(status=102))  # Processing
+        return True
+
+    async with AsyncHTTPTestServer(on_headers_received=multi_info) as server:
+        server.set_json_response({"status": "ok"})
+
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                f"{server.url}upload",
+                content=b"data",
+                headers={"Expect": "100-continue"},
+            )
+
+        assert response.status_code == 200
+        assert server.last_request is not None
+        client_addr = server.last_request.client
+        conn_bytes = server.get_connection_bytes_sent(client_addr)
+        assert conn_bytes is not None
+        assert b"HTTP/1.1 100 Continue" in conn_bytes
+        assert b"HTTP/1.1 102 Processing" in conn_bytes

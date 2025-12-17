@@ -52,6 +52,7 @@ class ParsedRequest:
     headers: list[tuple[bytes, bytes]] = field(default_factory=list)
     body_parts: list[bytes] = field(default_factory=list)
     is_complete: bool = False
+    headers_complete: bool = False
 
     @property
     def body(self) -> bytes:
@@ -108,6 +109,7 @@ class RequestProtocol:
                 "ascii", errors="replace"
             )
             self.result.http_version = self._parser.get_http_version()
+            self.result.headers_complete = True
 
     def on_body(self, body: bytes) -> None:
         """Called for each chunk of body data."""
@@ -208,6 +210,111 @@ class AsyncRequestParser:
     def wire_bytes(self) -> bytes:
         """Return the accumulated wire bytes."""
         return bytes(self._wire)
+
+    async def parse_headers(
+        self,
+        reader: asyncio.StreamReader,
+        connection_wire: bytearray | None = None,
+    ) -> tuple[ParsedRequest | None, bytes, bytearray]:
+        """Parse request headers only, stopping before body.
+
+        Args:
+            reader: The asyncio stream to read from.
+            connection_wire: Optional buffer to accumulate connection-level
+                bytes (for tracking across multiple requests).
+
+        Returns:
+            Tuple of (parsed_request, header_wire_bytes, remaining_buffer).
+            The remaining_buffer contains bytes read but not yet processed,
+            which should be passed to continue_parse_body().
+            Returns (None, wire_bytes, empty_buffer) on parse error or EOF.
+        """
+        buffer = bytearray()
+
+        while not self._protocol.result.headers_complete:
+            if not buffer:
+                try:
+                    data = await reader.read(self._max_read)
+                except Exception:
+                    break
+
+                if not data:
+                    break
+
+                buffer.extend(data)
+
+            byte = bytes([buffer.pop(0)])
+            self._wire.extend(byte)
+            if connection_wire is not None:
+                connection_wire.extend(byte)
+
+            try:
+                self._parser.feed_data(byte)
+            except httptools.HttpParserError:
+                if buffer:
+                    reader.feed_data(bytes(buffer))
+                return None, bytes(self._wire), bytearray()
+
+        if not self._protocol.result.headers_complete:
+            if buffer:
+                reader.feed_data(bytes(buffer))
+            return None, bytes(self._wire), bytearray()
+
+        return self._protocol.result, bytes(self._wire), buffer
+
+    async def continue_parse_body(
+        self,
+        reader: asyncio.StreamReader,
+        remaining_buffer: bytearray,
+        connection_wire: bytearray | None = None,
+    ) -> tuple[ParsedRequest | None, bytes]:
+        """Continue parsing the request body after headers.
+
+        Call this after parse_headers() and after sending any interim
+        response (like 100 Continue).
+
+        Args:
+            reader: The asyncio stream to continue reading from.
+            remaining_buffer: Buffer returned from parse_headers().
+            connection_wire: Optional buffer for connection-level tracking.
+
+        Returns:
+            Tuple of (parsed_request, complete_wire_bytes).
+            Returns (None, wire_bytes) on parse error or EOF.
+        """
+        buffer = remaining_buffer
+
+        while not self._protocol.result.is_complete:
+            if not buffer:
+                try:
+                    data = await reader.read(self._max_read)
+                except Exception:
+                    break
+
+                if not data:
+                    break
+
+                buffer.extend(data)
+
+            byte = bytes([buffer.pop(0)])
+            self._wire.extend(byte)
+            if connection_wire is not None:
+                connection_wire.extend(byte)
+
+            try:
+                self._parser.feed_data(byte)
+            except httptools.HttpParserError:
+                if buffer:
+                    reader.feed_data(bytes(buffer))
+                return None, bytes(self._wire)
+
+        if buffer:
+            reader.feed_data(bytes(buffer))
+
+        if not self._protocol.result.is_complete:
+            return None, bytes(self._wire)
+
+        return self._protocol.result, bytes(self._wire)
 
 
 class HTTPRequestReader:

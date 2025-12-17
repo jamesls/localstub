@@ -33,7 +33,8 @@ class TestParsedRequest:
         assert req.http_version is None
         assert req.headers == []
         assert req.body_parts == []
-        assert req.is_complete is False
+        assert not req.is_complete
+        assert not req.headers_complete
 
     def test_body_property_empty(self):
         """Test body property with empty body_parts."""
@@ -516,6 +517,200 @@ class TestAsyncRequestParser:
         # Verify remaining bytes were pushed back to the reader
         remaining = await reader.read(100)
         assert len(remaining) > 0
+
+    @pytest.mark.asyncio
+    async def test_parse_headers_stops_after_headers(self):
+        request_data = (
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 5\r\n"
+            b"\r\n"
+            b"hello"
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        parser = AsyncRequestParser()
+        parsed, header_wire, remaining = await parser.parse_headers(reader)
+
+        assert parsed is not None
+        assert parsed.method == "POST"
+        assert parsed.url == b"/upload"
+        assert parsed.headers_complete
+        # Body should not be parsed yet
+        assert parsed.body == b""
+        assert not parsed.is_complete
+        # Header wire bytes should not include body
+        assert b"hello" not in header_wire
+        assert b"\r\n\r\n" in header_wire
+
+    @pytest.mark.asyncio
+    async def test_parse_headers_sets_headers_complete_flag(self):
+        request_data = b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        parser = AsyncRequestParser()
+        parsed, _, _ = await parser.parse_headers(reader)
+
+        assert parsed is not None
+        assert parsed.headers_complete
+        # For a GET with no body, headers_complete and is_complete may both
+        # be true after headers are parsed
+        assert parsed.method == "GET"
+
+    @pytest.mark.asyncio
+    async def test_parse_headers_returns_remaining_buffer(self):
+        request_data = (
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 5\r\n"
+            b"\r\n"
+            b"hello"
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        parser = AsyncRequestParser()
+        parsed, header_wire, remaining = await parser.parse_headers(reader)
+
+        assert parsed is not None
+        # The remaining buffer should contain the body bytes
+        # (either in remaining or pushed back to reader)
+        # Since we read byte-by-byte, remaining may contain body
+        assert len(remaining) > 0 or not reader.at_eof()
+
+    @pytest.mark.asyncio
+    async def test_continue_parse_body_completes_request(self):
+        request_data = (
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 5\r\n"
+            b"\r\n"
+            b"hello"
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        parser = AsyncRequestParser()
+        # First parse headers
+        parsed, header_wire, remaining = await parser.parse_headers(reader)
+        assert parsed is not None
+        assert not parsed.is_complete
+
+        # Then continue parsing body
+        parsed, wire_bytes = await parser.continue_parse_body(
+            reader, remaining
+        )
+
+        assert parsed is not None
+        assert parsed.is_complete
+        assert parsed.body == b"hello"
+        # Complete wire bytes should include everything
+        assert wire_bytes == request_data
+
+    @pytest.mark.asyncio
+    async def test_parse_headers_with_connection_wire(self):
+        request_data = (
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 5\r\n"
+            b"\r\n"
+            b"hello"
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+        connection_wire = bytearray()
+
+        parser = AsyncRequestParser()
+        parsed, header_wire, remaining = await parser.parse_headers(
+            reader, connection_wire
+        )
+
+        assert parsed is not None
+        # Connection wire should have accumulated header bytes
+        assert len(connection_wire) > 0
+        assert b"POST /upload" in bytes(connection_wire)
+
+    @pytest.mark.asyncio
+    async def test_continue_parse_body_with_connection_wire(self):
+        request_data = (
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 5\r\n"
+            b"\r\n"
+            b"hello"
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+        connection_wire = bytearray()
+
+        parser = AsyncRequestParser()
+        parsed, header_wire, remaining = await parser.parse_headers(
+            reader, connection_wire
+        )
+
+        # Continue parsing body with same connection_wire
+        parsed, wire_bytes = await parser.continue_parse_body(
+            reader, remaining, connection_wire
+        )
+
+        assert parsed is not None
+        assert parsed.is_complete
+        # Connection wire should have all bytes
+        assert bytes(connection_wire) == request_data
+
+    @pytest.mark.asyncio
+    async def test_parse_headers_eof_before_complete(self):
+        # Incomplete headers
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"GET / HTTP/1.1\r\nHost:")
+        reader.feed_eof()
+
+        parser = AsyncRequestParser()
+        parsed, header_wire, remaining = await parser.parse_headers(reader)
+
+        assert parsed is None
+
+    @pytest.mark.asyncio
+    async def test_parse_headers_malformed_request(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"INVALID HTTP DATA")
+
+        parser = AsyncRequestParser()
+        parsed, header_wire, remaining = await parser.parse_headers(reader)
+
+        assert parsed is None
+
+    @pytest.mark.asyncio
+    async def test_continue_parse_body_eof_before_complete(self):
+        # Headers complete but body truncated
+        request_data = (
+            b"POST /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 100\r\n"
+            b"\r\n"
+            b"short"
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(request_data)
+        reader.feed_eof()
+
+        parser = AsyncRequestParser()
+        parsed, header_wire, remaining = await parser.parse_headers(reader)
+        assert parsed is not None
+
+        parsed, wire_bytes = await parser.continue_parse_body(
+            reader, remaining
+        )
+
+        assert parsed is None
 
 
 class TestAsyncResponseParser:
