@@ -5,12 +5,14 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass, field
+from email.message import Message
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
 
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
+    ParsedRequest,
 )
 from localstub.http.utils import headers_to_message
 
@@ -78,6 +80,33 @@ class HTTPResponse:
 
 
 Handler = Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]
+
+
+@dataclass
+class HTTPRequestHeaders:
+    """Partial request available after headers are parsed, before body.
+
+    This is provided to the on_headers_received callback, allowing inspection
+    of request headers before the body is read. Useful for implementing
+    HTTP 100-continue or early rejection based on headers.
+    """
+
+    method: str | None
+    path: str | None
+    http_version: str | None
+    headers: Message
+    wire_raw_bytes: bytes
+
+
+# Callback to send a response to client during header processing
+SendResponse = Callable[["HTTPResponse"], Awaitable[None]]
+
+# Lifecycle hook called after headers are received, before body is read.
+# Return True to continue reading body, False to stop.
+OnHeadersReceived = Callable[
+    [HTTPRequestHeaders, SendResponse],
+    Awaitable[bool] | bool,
+]
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +480,7 @@ class AsyncHTTPTestServer:
         port: int = 0,
         handler: Handler | None = None,
         default_response: HTTPResponse | None = None,
+        on_headers_received: OnHeadersReceived | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -461,6 +491,7 @@ class AsyncHTTPTestServer:
             default_response or HTTPResponse.json({})
         )
         self._router = Router()
+        self._on_headers_received = on_headers_received
 
         # Response sequence tracking
         self._response_sequence: list[HTTPResponse] = []
@@ -822,11 +853,66 @@ class AsyncHTTPTestServer:
         connection_wire: bytearray | None = None,
     ) -> HTTPRequest | None:
         parser = AsyncRequestParser()
-        parsed, wire_bytes = await parser.parse(reader, connection_wire)
 
+        # If no on_headers_received hook, use atomic parsing (unchanged)
+        if self._on_headers_received is None:
+            parsed, wire_bytes = await parser.parse(reader, connection_wire)
+            if parsed is None:
+                return None
+            return self._build_request(parsed, wire_bytes, writer)
+
+        # Two-phase parsing with on_headers_received hook
+        # Phase 1: Parse headers only
+        parsed, header_wire, remaining = await parser.parse_headers(
+            reader, connection_wire
+        )
         if parsed is None:
             return None
 
+        # Build partial request for the hook
+        headers_msg = headers_to_message(parsed.headers)
+        partial = HTTPRequestHeaders(
+            method=parsed.method,
+            path=(
+                parsed.url.decode("ascii", errors="replace")
+                if parsed.url
+                else None
+            ),
+            http_version=parsed.http_version,
+            headers=headers_msg,
+            wire_raw_bytes=header_wire,
+        )
+
+        # Create the send callback
+        async def send_response(response: HTTPResponse) -> None:
+            await self._write_interim_response(writer, response)
+
+        # Call the hook
+        result = self._on_headers_received(partial, send_response)
+        if inspect.isawaitable(result):
+            should_continue = await result
+        else:
+            should_continue = cast(bool, result)
+
+        if not should_continue:
+            return None
+
+        # Phase 2: Parse body
+        parsed, wire_bytes = await parser.continue_parse_body(
+            reader, remaining, connection_wire
+        )
+        if parsed is None:
+            return None
+
+        return self._build_request(parsed, wire_bytes, writer)
+
+    def _build_request(
+        self,
+        parsed: ParsedRequest,
+        wire_bytes: bytes,
+        writer: Writer,
+    ) -> HTTPRequest:
+        """Build HTTPRequest from parsed data."""
         headers = headers_to_message(parsed.headers)
         body_text = (
             parsed.body.decode("utf-8", errors="replace")
@@ -834,7 +920,6 @@ class AsyncHTTPTestServer:
             else None
         )
         client = self._extract_client_info(writer)
-
         return HTTPRequest(
             method=parsed.method,
             path=(
@@ -848,6 +933,32 @@ class AsyncHTTPTestServer:
             wire_raw_bytes=wire_bytes,
             client=client,
         )
+
+    async def _write_interim_response(
+        self,
+        writer: Writer,
+        response: HTTPResponse,
+    ) -> None:
+        """Write an interim response (e.g., 100 Continue) to the client."""
+        try:
+            reason = HTTPStatus(response.status).phrase
+        except ValueError:
+            reason = "UNKNOWN"
+
+        status_line = f"HTTP/1.1 {response.status} {reason}\r\n"
+        writer.write(status_line.encode("ascii"))
+
+        body = self._normalize_body(response.body)
+        headers = self._build_response_headers(response, body, False)
+
+        for name, value in headers.items():
+            header_line = f"{name}: {value}\r\n".encode("ascii")
+            writer.write(header_line)
+
+        writer.write(b"\r\n")
+        if body:
+            writer.write(body)
+        await writer.drain()
 
     def _extract_client_info(self, writer: Writer) -> tuple[str, int] | None:
         """Extract client (host, port) from the writer's peername."""
