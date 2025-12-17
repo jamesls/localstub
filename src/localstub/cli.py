@@ -12,6 +12,8 @@ from typing import TextIO
 
 from localstub.tlsproxy import AsyncTLSInterceptProxy, RecordedResponse
 from localstub.http.request import HTTPRequest
+from localstub.server import AsyncHTTPTestServer
+from localstub.config import load_config
 
 DEFAULT_PORT = 8888
 
@@ -56,6 +58,19 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Logging level (default: DEBUG)",
     )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        choices=["forward", "intercept"],
+        default="forward",
+        help="Proxy mode: forward to upstream or intercept (default: forward)",
+    )
+    parser.add_argument(
+        "-f",
+        "--config-file",
+        type=Path,
+        help="Path to JSON config file for intercept mode responses",
+    )
     return parser.parse_args(args)
 
 
@@ -65,9 +80,21 @@ async def run_proxy(args: argparse.Namespace) -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s: %(message)s",
     )
+
+    server: AsyncHTTPTestServer | None = None
+    if args.mode == "intercept":
+        server = AsyncHTTPTestServer()
+        if args.config_file:
+            config = load_config(args.config_file)
+            if config.response_sequence:
+                server.set_response_sequence(config.response_sequence)
+            elif config.single_response:
+                server.set_default_response(config.single_response)
+
     proxy = AsyncTLSInterceptProxy(
         listen_port=args.port,
-        default_mode="forward",
+        default_mode=args.mode,
+        server=server,
         verify_upstream=True,
         upstream_tls=True,
     )
