@@ -565,6 +565,20 @@ class AsyncHTTPTestServer:
         self._response_sequence = []
         self._response_sequence_index = 0
 
+    def set_default_response(self, response: HTTPResponse) -> None:
+        """Configure a static response returned for every request.
+
+        Unlike set_json_response/set_text_response/set_raw_response, this
+        accepts an already-constructed HTTPResponse object.
+
+        Args:
+            response: HTTPResponse object to return for all requests
+        """
+        self._default_response = response
+        # Clear any response sequence (last one wins)
+        self._response_sequence = []
+        self._response_sequence_index = 0
+
     def set_response_sequence(self, responses: list[HTTPResponse]) -> None:
         """Configure a sequence of responses to return in order.
 

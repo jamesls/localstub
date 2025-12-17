@@ -60,6 +60,39 @@ class TestParseArgs:
         assert args.output == Path("/tmp/out.jsonl")
         assert args.ca_cert == Path("/tmp/ca.pem")
 
+    def test_parse_args_mode_defaults_to_forward(self) -> None:
+        args = parse_args([])
+        assert args.mode == "forward"
+
+    def test_parse_args_with_short_mode_flag_sets_mode(self) -> None:
+        args = parse_args(["-m", "intercept"])
+        assert args.mode == "intercept"
+
+    def test_parse_args_with_long_mode_flag_sets_mode(self) -> None:
+        args = parse_args(["--mode", "intercept"])
+        assert args.mode == "intercept"
+
+    def test_parse_args_mode_forward_is_valid(self) -> None:
+        args = parse_args(["--mode", "forward"])
+        assert args.mode == "forward"
+
+    def test_parse_args_config_file_defaults_to_none(self) -> None:
+        args = parse_args([])
+        assert args.config_file is None
+
+    def test_parse_args_with_short_config_file_flag_sets_path(self) -> None:
+        args = parse_args(["-f", "/tmp/config.json"])
+        assert args.config_file == Path("/tmp/config.json")
+
+    def test_parse_args_with_long_config_file_flag_sets_path(self) -> None:
+        args = parse_args(["--config-file", "/tmp/config.json"])
+        assert args.config_file == Path("/tmp/config.json")
+
+    def test_parse_args_with_intercept_mode_and_config_file(self) -> None:
+        args = parse_args(["-m", "intercept", "-f", "/tmp/stub.json"])
+        assert args.mode == "intercept"
+        assert args.config_file == Path("/tmp/stub.json")
+
 
 class TestBuildRecord:
     def test_build_record_with_request_only_sets_response_to_none(
