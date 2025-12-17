@@ -1072,11 +1072,6 @@ async def test_server_handles_invalid_status_code():
         assert b"HTTP/1.1 999 UNKNOWN" in response
 
 
-# ---------------------------------------------------------------------------
-# next_request() timeout tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_next_request_without_timeout(server):
     """Test next_request() waits indefinitely without timeout."""
@@ -1139,11 +1134,6 @@ async def test_next_request_with_timeout_expires():
             await server.next_request(timeout=0.1)
 
 
-# ---------------------------------------------------------------------------
-# Exception handling tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_server_handles_exception_during_request_processing():
     """Test server handles exceptions during request processing."""
@@ -1196,11 +1186,6 @@ async def test_server_handles_writer_close_exception():
         await asyncio.sleep(0.1)
 
 
-# ---------------------------------------------------------------------------
-# Raw socket tests for EOF in various stages
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_server_handles_immediate_eof_in_request_line(server):
     """Test server handles immediate EOF (no data at all)."""
@@ -1229,11 +1214,6 @@ async def test_server_handles_eof_after_chunk_size(server):
     await writer.wait_closed()
 
     await asyncio.sleep(0.1)
-
-
-# ---------------------------------------------------------------------------
-# Connection: close handling
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1271,11 +1251,6 @@ async def test_server_closes_connection_on_connection_close_header(server):
     assert len(server.requests) == 1
 
 
-# ---------------------------------------------------------------------------
-# Additional edge case tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_server_handles_chunked_with_trailer_headers(server):
     """Test server handles chunked encoding with trailing headers."""
@@ -1302,11 +1277,6 @@ async def test_server_handles_chunked_with_trailer_headers(server):
     await asyncio.sleep(0.1)
     assert len(server.requests) == 1
     assert server.last_request.body == "hello"
-
-
-# ---------------------------------------------------------------------------
-# Transmission strategy tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1453,11 +1423,6 @@ async def test_default_transmission_is_immediate(server, client):
     # Should be very fast (no artificial delays)
     assert elapsed < 0.1
     assert response.content == response_data
-
-
-# ---------------------------------------------------------------------------
-# Pipelined requests tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio

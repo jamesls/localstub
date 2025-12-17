@@ -19,11 +19,6 @@ from localstub.http.utils import headers_to_message
 LOG = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Stubbed response
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class HTTPResponse:
     status: int = 200
@@ -370,11 +365,6 @@ class FaultyTransmission(TransmissionStrategy):
             pass
 
 
-# ---------------------------------------------------------------------------
-# Internal layering (MVP adapters inspired by better.py)
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class ConnectionContext:
     """Per-connection tracking container.
@@ -458,11 +448,6 @@ class Router:
         raise TypeError("Handler returned unsupported type")
 
 
-# ---------------------------------------------------------------------------
-# Async HTTP server
-# ---------------------------------------------------------------------------
-
-
 class AsyncHTTPTestServer:
     """Small asyncio HTTP server used for testing SDK clients.
 
@@ -514,10 +499,6 @@ class AsyncHTTPTestServer:
 
         self.host: str | None = None
         self.port: int | None = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     @property
     def url(self) -> str:
@@ -753,10 +734,6 @@ class AsyncHTTPTestServer:
             The server manages cleanup of the writer on exit.
         """
         await self._handle_client(reader, writer)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _init_connection_tracking(
         self, client: tuple[str, int] | None

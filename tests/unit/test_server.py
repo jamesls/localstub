@@ -212,11 +212,6 @@ def test_throttled_transmission_rejects_negative_chunk_size():
         ThrottledTransmission(chunk_size=-5, delay=0.01)
 
 
-# ---------------------------------------------------------------------------
-# FaultyTransmission
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_faulty_transmission_delay():
     strategy = FaultyTransmission(faults=[Delay(0.05)])

@@ -95,10 +95,6 @@ class AsyncTLSInterceptProxy:
             asyncio.Queue()
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     @property
     def address(self) -> tuple[str, int]:
         if self._host is None or self._port is None:
@@ -165,10 +161,6 @@ class AsyncTLSInterceptProxy:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     async def _handle_client(
         self,
