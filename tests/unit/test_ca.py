@@ -1,9 +1,3 @@
-import os
-import tempfile
-from pathlib import Path
-
-import pytest
-
 from localstub.ca import TLSProxyCA
 import ssl
 from cryptography.hazmat.primitives.serialization import pkcs12

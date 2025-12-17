@@ -290,6 +290,7 @@ name = "localstub"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "httptools" },
     { name = "trustme" },
 ]
@@ -311,6 +312,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=46.0.3" },
     { name = "httptools", specifier = ">=0.6.0" },
     { name = "trustme", specifier = ">=1.1.0" },
 ]

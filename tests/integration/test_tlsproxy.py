@@ -1028,3 +1028,380 @@ async def test_forward_handles_100_continue_with_chunked_response():
     finally:
         server.close()
         await server.wait_closed()
+
+
+# ----------------------------------------------------------------------
+# Response Transformation Tests
+# ----------------------------------------------------------------------
+
+
+async def _simple_json_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Handler that returns a simple JSON response."""
+    await reader.readuntil(b"\r\n\r\n")
+    body = b'{"message":"hello","count":42}'
+    writer.write(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Length: 30\r\n"
+        b"Content-Type: application/json\r\n"
+        b"\r\n" + body
+    )
+    await writer.drain()
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_forward_transforms_response_body_with_byteflip():
+    """Transformer can flip bits in the response body using ByteFlip."""
+    from localstub.server import ByteFlip
+    from localstub.tlsproxy import fault_step_transformer
+
+    server = await asyncio.start_server(
+        _simple_json_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=fault_step_transformer(ByteFlip(offset=2)),
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    f"https://{server_host}:{server_port}/test"
+                )
+
+        # The response body should have byte at offset 2 flipped
+        # Original: {"message":"hello","count":42}
+        # Byte 2 is 'm' (0x6d), XOR with 0xFF = 0x92
+        assert response.status_code == 200
+        body = response.content
+        assert body[2] != ord("m")  # The byte should be flipped
+
+        # The recorded response should contain the original body
+        recorded = await proxy.next_response(timeout=1.0)
+        assert recorded.body == '{"message":"hello","count":42}'
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_transformer_delay_before():
+    """Transformer can add delay before sending the response."""
+    import time
+    from localstub.tlsproxy import TransformResult, UpstreamResponse
+
+    def delay_transformer(upstream: UpstreamResponse) -> TransformResult:
+        return TransformResult(body=upstream.body, delay_before=0.1)
+
+    server = await asyncio.start_server(
+        _simple_json_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=delay_transformer,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            start = time.monotonic()
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    f"https://{server_host}:{server_port}/test"
+                )
+            elapsed = time.monotonic() - start
+
+        assert response.status_code == 200
+        # Should have taken at least 100ms due to the delay
+        assert elapsed >= 0.1
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_transformer_override_response():
+    """Transformer can completely replace the response."""
+    from localstub.server import HTTPResponse
+    from localstub.tlsproxy import TransformResult, UpstreamResponse
+
+    def override_transformer(upstream: UpstreamResponse) -> TransformResult:
+        return TransformResult(
+            override_response=HTTPResponse(
+                status=503,
+                headers={"Content-Type": "text/plain"},
+                body="Service Unavailable",
+            )
+        )
+
+    server = await asyncio.start_server(
+        _simple_json_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=override_transformer,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    f"https://{server_host}:{server_port}/test"
+                )
+
+        # Should receive the overridden response
+        assert response.status_code == 503
+        assert response.text == "Service Unavailable"
+
+        # The recorded response should contain the original upstream response
+        recorded = await proxy.next_response(timeout=1.0)
+        assert recorded.status == 200
+        assert recorded.body == '{"message":"hello","count":42}'
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_async_transformer():
+    """Transformer can be an async function."""
+    from localstub.tlsproxy import TransformResult, UpstreamResponse
+
+    async def async_transformer(upstream: UpstreamResponse) -> TransformResult:
+        # Simulate some async work
+        await asyncio.sleep(0.01)
+        # Uppercase the body
+        return TransformResult(body=upstream.body.upper())
+
+    server = await asyncio.start_server(
+        _simple_json_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=async_transformer,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    f"https://{server_host}:{server_port}/test"
+                )
+
+        # Body should be uppercased
+        assert response.status_code == 200
+        assert response.text == '{"MESSAGE":"HELLO","COUNT":42}'
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_fault_step_transformer_chains_multiple_steps():
+    """fault_step_transformer can chain multiple FaultSteps."""
+    from localstub.server import ByteFlip, TruncateBody
+    from localstub.tlsproxy import fault_step_transformer
+
+    server = await asyncio.start_server(
+        _simple_json_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        # Chain: first truncate to 10 bytes, then flip byte at offset 0
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=fault_step_transformer(
+                TruncateBody(keep_bytes=10),
+                ByteFlip(offset=0),
+            ),
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    f"https://{server_host}:{server_port}/test"
+                )
+
+        # Original: {"message":"hello","count":42}
+        # Truncated to 10: {"message"
+        # Then byte 0 '{' (0x7b) XOR 0xFF = 0x84
+        body = response.content
+        assert len(body) == 10
+        assert body[0] != ord("{")  # First byte flipped
+        assert body[1:] == b'"message"'
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_transformer_passthrough_when_none_returned():
+    """Transformer returning None body passes through original response."""
+    from localstub.tlsproxy import TransformResult, UpstreamResponse
+
+    def passthrough_transformer(upstream: UpstreamResponse) -> TransformResult:
+        # Return empty result - should passthrough original
+        return TransformResult()
+
+    server = await asyncio.start_server(
+        _simple_json_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=passthrough_transformer,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    f"https://{server_host}:{server_port}/test"
+                )
+
+        # Should receive original response unchanged
+        assert response.status_code == 200
+        assert response.json() == {"message": "hello", "count": 42}
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_transformer_conditional_based_on_content_type():
+    """Transformer can conditionally modify based on response headers."""
+    from localstub.tlsproxy import TransformResult, UpstreamResponse
+
+    def conditional_transformer(upstream: UpstreamResponse) -> TransformResult:
+        content_type = ""
+        if upstream.headers:
+            content_type = upstream.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            # Corrupt JSON responses
+            return TransformResult(body=b"corrupted!")
+        # Pass through non-JSON responses
+        return TransformResult(body=upstream.body)
+
+    server = await asyncio.start_server(
+        _simple_json_handler,
+        "127.0.0.1",
+        0,
+    )
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=conditional_transformer,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    f"https://{server_host}:{server_port}/test"
+                )
+
+        # JSON response should be corrupted
+        assert response.status_code == 200
+        assert response.text == "corrupted!"
+    finally:
+        server.close()
+        await server.wait_closed()
