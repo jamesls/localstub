@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import ssl
 import asyncio
 import logging
@@ -7,19 +8,23 @@ from asyncio import transports
 import gzip
 from dataclasses import dataclass
 from email.message import Message
-from typing import Optional, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional, cast
+
+if TYPE_CHECKING:
+    from localstub.server import FaultStep
 
 from localstub.http.response import (
     AsyncMultiResponseParser,
     AsyncResponseParser,
+    ParsedResponse,
 )
 from localstub.http.request import (
     HTTPRequest,
     HTTPRequestReader,
 )
 from localstub.http.utils import headers_to_message
-from localstub.server import AsyncHTTPTestServer
 from localstub.ca import TLSProxyCA
+from localstub.server import AsyncHTTPTestServer, HTTPResponse
 
 
 LOG = logging.getLogger(__name__)
@@ -67,6 +72,7 @@ class AsyncTLSInterceptProxy:
         default_mode: str = "intercept",
         verify_upstream: bool = True,
         upstream_tls: bool = True,
+        response_transformer: "ResponseTransformer | None" = None,
     ) -> None:
         self._listen_host = listen_host
         self._listen_port = listen_port
@@ -76,6 +82,7 @@ class AsyncTLSInterceptProxy:
         self._default_mode = default_mode
         self._verify_upstream = verify_upstream
         self._upstream_tls = upstream_tls
+        self._response_transformer = response_transformer
 
         self._listener: asyncio.base_events.Server | None = None
         self._host: str | None = None
@@ -380,6 +387,155 @@ class AsyncTLSInterceptProxy:
                 return body
         return body
 
+    def _rebuild_response_wire_bytes(
+        self,
+        parsed: ParsedResponse,
+        new_body: bytes,
+    ) -> bytes:
+        """Rebuild HTTP response with new body, using identity encoding.
+
+        Strips Transfer-Encoding and Content-Encoding headers since the
+        new body is sent in plain format with Content-Length.
+        """
+        version = parsed.http_version or "1.1"
+        status_code = parsed.status_code or 200
+        status_text = (
+            parsed.status_text.decode("ascii", errors="replace")
+            if parsed.status_text
+            else "OK"
+        )
+        lines = [f"HTTP/{version} {status_code} {status_text}"]
+
+        # Filter out Content-Length, Transfer-Encoding, Content-Encoding
+        # Then add new Content-Length
+        skip_headers = {
+            b"content-length",
+            b"transfer-encoding",
+            b"content-encoding",
+        }
+        for name, value in parsed.headers:
+            if name.lower() not in skip_headers:
+                lines.append(
+                    f"{name.decode('ascii', errors='replace')}: "
+                    f"{value.decode('ascii', errors='replace')}"
+                )
+
+        lines.append(f"Content-Length: {len(new_body)}")
+        lines.append("")  # Blank line before body
+
+        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n"
+        return header_bytes + new_body
+
+    def _build_override_wire_bytes(self, response: HTTPResponse) -> bytes:
+        """Build wire bytes from an HTTPResponse for full response override."""
+        try:
+            from http import HTTPStatus
+
+            reason = HTTPStatus(response.status).phrase
+        except ValueError:
+            reason = "UNKNOWN"
+
+        lines = [f"HTTP/1.1 {response.status} {reason}"]
+
+        body: bytes
+        if isinstance(response.body, str):
+            body = response.body.encode("utf-8")
+        elif response.body is None:
+            body = b""
+        else:
+            body = response.body
+
+        # Add headers, ensuring Content-Length
+        headers = dict(response.headers) if response.headers else {}
+        if "Content-Length" not in headers and "content-length" not in headers:
+            headers["Content-Length"] = str(len(body))
+
+        for name, value in headers.items():
+            lines.append(f"{name}: {value}")
+
+        lines.append("")
+        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n"
+        return header_bytes + body
+
+    def _build_wire_bytes_for_result(
+        self,
+        result: "TransformResult",
+        parsed: ParsedResponse,
+        original_wire_bytes: bytes,
+    ) -> bytes:
+        """Build wire bytes based on transformer result."""
+        if result.override_response is not None:
+            return self._build_override_wire_bytes(result.override_response)
+        if result.body is not None:
+            return self._rebuild_response_wire_bytes(parsed, result.body)
+        return original_wire_bytes
+
+    async def _apply_transformation_and_relay(
+        self,
+        parsed: ParsedResponse,
+        wire_bytes: bytes,
+        client_writer: asyncio.StreamWriter,
+        client_id: str,
+    ) -> RecordedResponse:
+        """Apply response transformation and relay to client.
+
+        Returns the original (untransformed) response for recording.
+        """
+        status = parsed.status_code or 0
+        headers = headers_to_message(parsed.headers)
+        body_bytes = self._maybe_decompress(headers, parsed.body)
+        reason = (
+            parsed.status_text.decode("ascii", errors="replace")
+            if parsed.status_text
+            else None
+        )
+
+        upstream = UpstreamResponse(
+            status=status,
+            reason=reason,
+            headers=headers,
+            body=body_bytes,
+            wire_raw_bytes=wire_bytes,
+        )
+
+        assert self._response_transformer is not None
+        result = self._response_transformer(upstream)
+        if inspect.isawaitable(result):
+            result = await result
+
+        if result.delay_before > 0:
+            await asyncio.sleep(result.delay_before)
+
+        wire_bytes_to_send = self._build_wire_bytes_for_result(
+            result, parsed, wire_bytes
+        )
+
+        if result.drop_after is not None:
+            partial = wire_bytes_to_send[: result.drop_after]
+            _wire_log(f"lstub --> {client_id}", partial)
+            client_writer.write(partial)
+            await client_writer.drain()
+            reason = f"drop_after={result.drop_after}"
+            _close_log(f"lstub --> {client_id}", reason)
+            client_writer.close()
+            try:
+                await client_writer.wait_closed()
+            except Exception:
+                pass
+        else:
+            _wire_log(f"lstub --> {client_id}", wire_bytes_to_send)
+            client_writer.write(wire_bytes_to_send)
+            await client_writer.drain()
+
+        body_text = body_bytes.decode("utf-8", errors="replace")
+        return RecordedResponse(
+            status=status,
+            reason=reason,
+            headers=headers,
+            body=body_text,
+            wire_raw_bytes=wire_bytes,
+        )
+
     async def _read_and_relay_responses(
         self,
         upstream_reader: asyncio.StreamReader,
@@ -396,6 +552,9 @@ class AsyncTLSInterceptProxy:
         Uses a single parser instance to handle cases where multiple responses
         (e.g., 100 Continue + 200 OK) arrive in a single buffer read.
 
+        If a response_transformer is configured, it will be applied to
+        final responses (status >= 200) before relaying to the client.
+
         Returns the final response, or None if parsing failed.
         """
         multi_parser = AsyncMultiResponseParser(max_read=self._max_read)
@@ -409,12 +568,18 @@ class AsyncTLSInterceptProxy:
 
             _wire_log(f"{upstream_id} --> lstub", wire_bytes)
 
-            # Relay the response to the client immediately
+            status = parsed.status_code or 0
+
+            # Only transform final responses (not 1xx informational)
+            if self._response_transformer is not None and status >= 200:
+                return await self._apply_transformation_and_relay(
+                    parsed, wire_bytes, client_writer, client_id
+                )
+
+            # No transformation - relay original wire bytes
             _wire_log(f"lstub --> {client_id}", wire_bytes)
             client_writer.write(wire_bytes)
             await client_writer.drain()
-
-            status = parsed.status_code or 0
 
             # Check if this is a final response (not 1xx informational)
             if status >= 200:
@@ -564,3 +729,82 @@ class RecordedResponse:
     headers: Message | None
     body: str | None
     wire_raw_bytes: bytes
+
+
+@dataclass
+class UpstreamResponse:
+    """Upstream response context provided to transformers.
+
+    Contains the parsed response data for inspection and transformation.
+    The transformer can inspect any of these to decide how to transform
+    the body.
+    """
+
+    status: int
+    reason: str | None
+    headers: Message | None
+    body: bytes  # Decompressed body (raw bytes, not str)
+    wire_raw_bytes: bytes  # Original wire format
+
+
+@dataclass
+class TransformResult:
+    """Result of transforming an upstream response.
+
+    The body field contains the new body bytes to send. When override_response
+    is set, it takes precedence and completely replaces the upstream response.
+    This is useful for fault injection scenarios like returning random errors.
+    """
+
+    body: bytes | None = None  # Transformed body (None = passthrough)
+    override_response: HTTPResponse | None = None  # Replace entire response
+    delay_before: float = 0.0  # Delay before sending
+    drop_after: int | None = None  # Drop connection after N bytes
+
+
+ResponseTransformer = Callable[
+    [UpstreamResponse],
+    TransformResult | Awaitable[TransformResult],
+]
+
+
+def fault_step_transformer(
+    *steps: "FaultStep",
+) -> ResponseTransformer:
+    """Create a ResponseTransformer from FaultStep instances.
+
+    This adapter allows reusing the fault injection primitives from
+    server.py (ByteFlip, TruncateBody, Delay, DropConnection) with
+    the proxy's response transformation.
+
+    Example:
+        from localstub.server import ByteFlip, Delay
+
+        proxy = AsyncTLSInterceptProxy(
+            default_mode="forward",
+            response_transformer=fault_step_transformer(
+                ByteFlip(offset=100, mask=0xFF),
+                Delay(0.5),
+            ),
+        )
+    """
+
+    def transform(upstream: UpstreamResponse) -> TransformResult:
+        body = upstream.body
+        total_delay = 0.0
+        drop_after: int | None = None
+
+        for step in steps:
+            result = step.apply(body)
+            body = result.body
+            total_delay += result.delay_before
+            if drop_after is None and result.drop_after is not None:
+                drop_after = result.drop_after
+
+        return TransformResult(
+            body=body,
+            delay_before=total_delay,
+            drop_after=drop_after,
+        )
+
+    return transform
