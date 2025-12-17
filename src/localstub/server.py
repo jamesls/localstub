@@ -925,7 +925,8 @@ class AsyncHTTPTestServer:
         status_line = f"HTTP/1.1 {response.status} {reason}\r\n"
         writer.write(status_line.encode("ascii"))
 
-        body = self._normalize_body(response.body)
+        is_informational = 100 <= response.status < 200
+        body = b"" if is_informational else self._normalize_body(response.body)
         headers = self._build_response_headers(response, body, False)
 
         for name, value in headers.items():
@@ -933,7 +934,7 @@ class AsyncHTTPTestServer:
             writer.write(header_line)
 
         writer.write(b"\r\n")
-        if body:
+        if not is_informational and body:
             writer.write(body)
         await writer.drain()
 
@@ -969,7 +970,14 @@ class AsyncHTTPTestServer:
         headers = dict(response.headers) if response.headers else {}
         header_names = {k.lower() for k in headers}
 
-        if "content-length" not in header_names:
+        if 100 <= response.status < 200:
+            headers = {
+                name: value
+                for name, value in headers.items()
+                if name.lower() != "content-length"
+            }
+            header_names = {k.lower() for k in headers}
+        elif "content-length" not in header_names:
             headers["Content-Length"] = str(len(body))
 
         if "connection" not in header_names and should_close:
