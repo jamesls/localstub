@@ -1,7 +1,9 @@
 import httpx
 import asyncio
 import gzip
+import socket
 import ssl
+import threading
 
 import trustme
 import pytest
@@ -216,6 +218,57 @@ async def test_forward_returns_502_when_upstream_connection_fails():
     assert recorded_request.path == "/unreachable"
     assert recorded_request.headers is not None
     assert "127.0.0.1" in recorded_request.headers["host"]
+
+    # No upstream response should be recorded.
+    with pytest.raises(asyncio.TimeoutError):
+        await proxy.next_response(timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_forward_returns_502_on_connect_fail_with_expect_100_continue():
+    # Acquire an unused local port, then close the server so that connecting
+    # to the port will be refused.
+    tmp = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    unused_port = tmp.sockets[0].getsockname()[1]
+    tmp.close()
+    await tmp.wait_closed()
+
+    async with AsyncTLSInterceptProxy(
+        server=None,
+        default_mode="forward",
+        verify_upstream=False,
+        upstream_tls=False,
+    ) as proxy:
+        proxy_host, proxy_port = proxy.address
+        ca_pem_path = str(proxy.ca.ca_pem_path())
+
+        try:
+            response_bytes = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _do_100_continue_headers_only_request,
+                    proxy_host,
+                    proxy_port,
+                    "127.0.0.1",
+                    unused_port,
+                    ca_pem_path,
+                ),
+                timeout=10.0,
+            )
+        except TimeoutError:
+            pytest.fail(
+                "Timed out waiting for 502 after sending Expect: 100-continue "
+                "headers. The proxy likely blocked while reading a body that "
+                "the client never sent."
+            )
+
+    assert b"502" in response_bytes
+
+    recorded_request = await proxy.next_request(timeout=1.0)
+    assert recorded_request.method == "PUT"
+    assert recorded_request.path == "/unreachable-continue"
+    assert recorded_request.headers is not None
+    assert recorded_request.headers["expect"] == "100-continue"
+    assert recorded_request.body is None
 
     # No upstream response should be recorded.
     with pytest.raises(asyncio.TimeoutError):
@@ -868,6 +921,491 @@ async def test_forward_handles_100_continue_before_final_response():
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def _proper_expect_continue_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """
+    Handler that properly implements 100-continue semantics:
+    1. Read ONLY headers
+    2. If Expect: 100-continue, send 100 Continue
+    3. THEN wait for and read the body
+    4. Send final response
+    """
+    # Read only headers
+    headers_data = await reader.readuntil(b"\r\n\r\n")
+
+    # Parse Content-Length from headers
+    headers_str = headers_data.decode("utf-8", errors="replace")
+    content_length = 0
+    for line in headers_str.split("\r\n"):
+        if line.lower().startswith("content-length:"):
+            content_length = int(line.split(":")[1].strip())
+            break
+
+    # Send 100 Continue
+    writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+    await writer.drain()
+
+    # Now wait for and read the body
+    body = b""
+    if content_length > 0:
+        body = await reader.readexactly(content_length)
+
+    # Send final response
+    response_body = f"received {len(body)} bytes".encode()
+    writer.write(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Length: " + str(len(response_body)).encode() + b"\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"\r\n" + response_body
+    )
+    await writer.drain()
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+def _do_100_continue_request(
+    proxy_host: str,
+    proxy_port: int,
+    upstream_host: str,
+    upstream_port: int,
+    ca_pem_path: str,
+    *,
+    path: str = "/upload",
+    body_content: bytes = b"test body data for 100-continue",
+) -> tuple[bytes, bytes]:
+    """
+    Execute HTTP request with proper 100-continue semantics using sync sockets.
+
+    Returns tuple of (100-continue response, final response).
+    """
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=5.0)
+    try:
+        sock.settimeout(None)
+
+        # Send CONNECT and get tunnel
+        connect_req = (
+            f"CONNECT {upstream_host}:{upstream_port} HTTP/1.1\r\n"
+            f"Host: {upstream_host}:{upstream_port}\r\n"
+            "\r\n"
+        ).encode()
+        sock.sendall(connect_req)
+
+        connect_resp, _ = _recv_until_with_timeout(
+            sock,
+            b"\r\n\r\n",
+            timeout=3.0,
+            timeout_message="Timeout waiting for CONNECT response from proxy.",
+        )
+        if b"200" not in connect_resp:
+            raise AssertionError(
+                f"Expected 200 from CONNECT: {connect_resp!r}"
+            )
+
+        # Upgrade to TLS and trust the proxy's CA
+        sock.settimeout(3.0)
+        ssl_ctx = ssl.create_default_context(cafile=ca_pem_path)
+        tls_sock: ssl.SSLSocket | None = None
+        tls_sock = ssl_ctx.wrap_socket(sock, server_hostname=upstream_host)
+        try:
+            tls_sock.settimeout(None)
+
+            # Send ONLY headers with Expect: 100-continue
+            request_headers = (
+                f"PUT {path} HTTP/1.1\r\n"
+                f"Host: {upstream_host}:{upstream_port}\r\n"
+                f"Content-Length: {len(body_content)}\r\n"
+                f"Expect: 100-continue\r\n"
+                f"\r\n"
+            ).encode()
+            tls_sock.sendall(request_headers)
+
+            # Wait for 100 Continue (this is where the bug manifests)
+            first_response, tail = _recv_until_with_timeout(
+                tls_sock,
+                b"\r\n\r\n",
+                timeout=3.0,
+                timeout_message=(
+                    "Timeout waiting for 100 Continue response. "
+                    "The proxy is likely stuck reading the full request "
+                    "before forwarding headers to upstream."
+                ),
+            )
+            if b"100" not in first_response:
+                raise AssertionError(
+                    f"Expected 100 Continue, got: {first_response!r}"
+                )
+
+            # Now send body
+            if body_content:
+                tls_sock.sendall(body_content)
+
+            # Read final response
+            final_response = _recv_http_response_from_prefetched(
+                tls_sock,
+                tail,
+                timeout_message="Timeout waiting for final response.",
+            )
+            return first_response, final_response
+        finally:
+            if tls_sock is not None:
+                tls_sock.close()
+    finally:
+        sock.close()
+
+
+def _do_100_continue_headers_only_request(
+    proxy_host: str,
+    proxy_port: int,
+    upstream_host: str,
+    upstream_port: int,
+    ca_pem_path: str,
+) -> bytes:
+    """Send Expect: 100-continue headers but withhold the body.
+
+    This simulates a correct 100-continue client that waits for an interim
+    response before sending the request body.
+    """
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=5.0)
+    try:
+        sock.settimeout(None)
+
+        connect_req = (
+            f"CONNECT {upstream_host}:{upstream_port} HTTP/1.1\r\n"
+            f"Host: {upstream_host}:{upstream_port}\r\n"
+            "\r\n"
+        ).encode()
+        sock.sendall(connect_req)
+
+        connect_resp, _ = _recv_until_with_timeout(
+            sock,
+            b"\r\n\r\n",
+            timeout=3.0,
+            timeout_message="Timeout waiting for CONNECT response from proxy.",
+        )
+        if b"200" not in connect_resp:
+            raise AssertionError(
+                f"Expected 200 from CONNECT: {connect_resp!r}"
+            )
+
+        sock.settimeout(3.0)
+        ssl_ctx = ssl.create_default_context(cafile=ca_pem_path)
+        tls_sock: ssl.SSLSocket | None = None
+        tls_sock = ssl_ctx.wrap_socket(sock, server_hostname=upstream_host)
+        try:
+            tls_sock.settimeout(None)
+
+            body_content = b"test body data for 100-continue"
+            request_headers = (
+                f"PUT /unreachable-continue HTTP/1.1\r\n"
+                f"Host: {upstream_host}:{upstream_port}\r\n"
+                f"Content-Length: {len(body_content)}\r\n"
+                f"Expect: 100-continue\r\n"
+                f"\r\n"
+            ).encode()
+            tls_sock.sendall(request_headers)
+
+            response, _ = _recv_until_with_timeout(
+                tls_sock,
+                b"\r\n\r\n",
+                timeout=3.0,
+                timeout_message=(
+                    "Timeout waiting for final response after sending only "
+                    "Expect: 100-continue headers."
+                ),
+            )
+            return response
+        finally:
+            if tls_sock is not None:
+                tls_sock.close()
+    finally:
+        sock.close()
+
+
+def _recv_until(
+    sock: socket.socket,
+    delimiter: bytes,
+) -> tuple[bytes, bytes]:
+    """Receive data until delimiter is found, returning (head, tail)."""
+    data = b""
+    while delimiter not in data:
+        chunk = sock.recv(1024)
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        data += chunk
+    head, tail = data.split(delimiter, 1)
+    return head + delimiter, tail
+
+
+def _recv_until_with_timeout(
+    sock: socket.socket,
+    delimiter: bytes,
+    *,
+    timeout: float,
+    timeout_message: str,
+) -> tuple[bytes, bytes]:
+    timer = threading.Timer(timeout, sock.close)
+    timer.daemon = True
+    timer.start()
+    try:
+        return _recv_until(sock, delimiter)
+    except Exception as exc:
+        raise AssertionError(timeout_message) from exc
+    finally:
+        timer.cancel()
+
+
+def _recv_exactly(
+    sock: ssl.SSLSocket,
+    size: int,
+) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        data += chunk
+    return data
+
+
+def _recv_exactly_with_timeout(
+    sock: ssl.SSLSocket,
+    size: int,
+    *,
+    timeout: float,
+    timeout_message: str,
+) -> bytes:
+    timer = threading.Timer(timeout, sock.close)
+    timer.daemon = True
+    timer.start()
+    try:
+        return _recv_exactly(sock, size)
+    except Exception as exc:
+        raise AssertionError(timeout_message) from exc
+    finally:
+        timer.cancel()
+
+
+def _parse_content_length(headers: bytes) -> int | None:
+    for line in headers.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            value = line.split(b":", 1)[1].strip()
+            return int(value)
+    return None
+
+
+def _recv_http_response_from_prefetched(
+    sock: ssl.SSLSocket,
+    prefetched: bytes,
+    *,
+    timeout_message: str,
+) -> bytes:
+    """Receive a full HTTP response, starting with prefetched bytes."""
+    timer = threading.Timer(3.0, sock.close)
+    timer.daemon = True
+    timer.start()
+    try:
+        data = prefetched
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(1024)
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            data += chunk
+
+        headers, body_start = data.split(b"\r\n\r\n", 1)
+        headers += b"\r\n\r\n"
+        content_length = _parse_content_length(headers)
+        if content_length is None:
+            return headers + body_start
+        if len(body_start) < content_length:
+            body_start += _recv_exactly_with_timeout(
+                sock,
+                content_length - len(body_start),
+                timeout=3.0,
+                timeout_message=timeout_message,
+            )
+        return headers + body_start[:content_length]
+    except Exception as exc:
+        raise AssertionError(timeout_message) from exc
+    finally:
+        timer.cancel()
+
+
+def _recv_http_response(
+    sock: ssl.SSLSocket,
+    *,
+    timeout_message: str,
+) -> bytes:
+    headers, body_start = _recv_until_with_timeout(
+        sock,
+        b"\r\n\r\n",
+        timeout=3.0,
+        timeout_message=timeout_message,
+    )
+    content_length = _parse_content_length(headers)
+    if content_length is None:
+        return headers + body_start
+    if len(body_start) < content_length:
+        body_start += _recv_exactly_with_timeout(
+            sock,
+            content_length - len(body_start),
+            timeout=3.0,
+            timeout_message=timeout_message,
+        )
+    return headers + body_start[:content_length]
+
+
+@pytest.mark.asyncio
+async def test_forward_client_waits_for_100_continue_before_sending_body():
+    """
+    Test that the proxy properly handles the 100-continue protocol where
+    the client sends only headers first, waits for 100 Continue, then
+    sends the body.
+
+    This test uses low-level socket operations because httpx doesn't
+    implement proper 100-continue semantics (it sends headers and body
+    together without waiting for 100 Continue).
+
+    Expected: the proxy forwards headers upstream, relays 100 Continue to
+    the client, then forwards the body and relays the final response.
+    """
+    upstream_server = await asyncio.start_server(
+        _proper_expect_continue_handler,
+        "127.0.0.1",
+        0,
+    )
+    upstream_host, upstream_port = upstream_server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            ca_pem_path = str(proxy.ca.ca_pem_path())
+
+            try:
+                first_resp, final_resp = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _do_100_continue_request,
+                        proxy_host,
+                        proxy_port,
+                        upstream_host,
+                        upstream_port,
+                        ca_pem_path,
+                    ),
+                    timeout=10.0,
+                )
+            except TimeoutError:
+                pytest.fail(
+                    "Test timed out waiting for 100-continue flow. "
+                    "The proxy likely has a bug in forward mode where it "
+                    "doesn't relay 100-continue from upstream to client."
+                )
+
+            assert b"100" in first_resp
+            assert b"200 OK" in final_resp
+            assert b"received 31 bytes" in final_resp
+
+            recorded_request = await proxy.next_request(timeout=1.0)
+            assert recorded_request.method == "PUT"
+            assert recorded_request.path == "/upload"
+
+    finally:
+        upstream_server.close()
+        await upstream_server.wait_closed()
+
+
+async def _coalesced_expect_continue_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Handler that sends 100 Continue and 200 OK in one write."""
+    body = b"OK"
+    writer.write(
+        b"HTTP/1.1 100 Continue\r\n\r\n"
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Length: 2\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"\r\n" + body
+    )
+    await writer.drain()
+
+    # Keep the connection open long enough for the proxy to send the request.
+    try:
+        await reader.readuntil(b"\r\n\r\n")
+    except Exception:
+        pass
+
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_forward_preserves_final_response_when_100_and_200_coalesce():
+    """Proxy should not lose buffered bytes from coalesced responses."""
+    upstream_server = await asyncio.start_server(
+        _coalesced_expect_continue_handler,
+        "127.0.0.1",
+        0,
+    )
+    upstream_host, upstream_port = upstream_server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            ca_pem_path = str(proxy.ca.ca_pem_path())
+
+            try:
+                first_resp, final_resp = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _do_100_continue_request,
+                        proxy_host,
+                        proxy_port,
+                        upstream_host,
+                        upstream_port,
+                        ca_pem_path,
+                        path="/coalesced",
+                        body_content=b"",
+                    ),
+                    timeout=10.0,
+                )
+            except TimeoutError:
+                pytest.fail(
+                    "Timed out waiting for final response after receiving "
+                    "100 Continue. The proxy may have dropped buffered "
+                    "upstream bytes."
+                )
+
+        assert b"100" in first_resp
+        assert b"200 OK" in final_resp
+        assert final_resp.endswith(b"OK")
+
+        recorded_request = await proxy.next_request(timeout=1.0)
+        assert recorded_request.method == "PUT"
+        assert recorded_request.path == "/coalesced"
+        assert recorded_request.body is None
+
+        recorded_response = await proxy.next_response(timeout=1.0)
+        assert recorded_response.status == 200
+        assert recorded_response.body == "OK"
+    finally:
+        upstream_server.close()
+        await upstream_server.wait_closed()
 
 
 async def _multiple_informational_handler(
