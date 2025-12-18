@@ -1502,11 +1502,6 @@ async def test_server_handles_pipelined_requests_with_body(server):
     assert response.count(b"HTTP/1.1") == 2
 
 
-# ---------------------------------------------------------------------------
-# on_headers_received hook tests
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_on_headers_received_sends_100_continue():
     async def handle_expect(

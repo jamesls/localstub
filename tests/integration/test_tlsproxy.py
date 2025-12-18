@@ -1568,11 +1568,6 @@ async def test_forward_handles_100_continue_with_chunked_response():
         await server.wait_closed()
 
 
-# ----------------------------------------------------------------------
-# Response Transformation Tests
-# ----------------------------------------------------------------------
-
-
 async def _simple_json_handler(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
