@@ -104,11 +104,6 @@ OnHeadersReceived = Callable[
 ]
 
 
-# ---------------------------------------------------------------------------
-# Transmission strategies
-# ---------------------------------------------------------------------------
-
-
 class Writer(Protocol):
     """Minimal StreamWriter interface used by transmission strategies."""
 
@@ -514,9 +509,20 @@ class AsyncHTTPTestServer:
     def handler(self, value: Handler | None) -> None:
         self._handler = value
 
-    # Optional convenience for method/path handlers; tests don't use this.
     def add_route(self, method: str, path: str, handler: Handler) -> None:
         self._router.add_route(method, path, handler)
+
+    def set_request_headers_handler(
+        self,
+        handler: OnHeadersReceived,
+    ) -> None:
+        """Set handler when client request headers are received.
+
+        This will overwrite the `on_headers_received` value if one was
+        provided when this class was instantiated.
+
+        """
+        self._on_headers_received = handler
 
     def set_json_response(
         self,
