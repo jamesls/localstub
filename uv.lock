@@ -17,6 +17,21 @@ wheels = [
 ]
 
 [[package]]
+name = "ast-grep-cli"
+version = "0.40.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6a/45/f96d8a5a24b272f0dada42378281bce99771fc4c2f1ef7b8bfe45d768226/ast_grep_cli-0.40.3.tar.gz", hash = "sha256:6fdaa9496b3878b14dda3754b38793fd3b6c7c0d95ec2238c86a09938f064c72", size = 213692, upload-time = "2025-12-15T15:52:51.551Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/a6/9aa6800a2c8a347436c43d1f5f5d418aa157a89f5802e3e8795702b8f6eb/ast_grep_cli-0.40.3-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:c42b44b569bc5c4d683f525a544ce1d9b32242ebdbd854f39c569ce9b8afbbaa", size = 14356326, upload-time = "2025-12-15T15:52:52.964Z" },
+    { url = "https://files.pythonhosted.org/packages/04/d0/799b93de21100a946442f21231d0c4c347dd65f938cc4cb0bb4bff58decd/ast_grep_cli-0.40.3-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:b433bd3eab8fdbc9ccc1eef24d6bd890c69550e37d5ad2ebd0ee613445be8520", size = 7179287, upload-time = "2025-12-15T15:52:48.454Z" },
+    { url = "https://files.pythonhosted.org/packages/88/6a/5cb400f63fb00eb3ebb666ebcc51c5949d62703e55013f3f2930a7126fc9/ast_grep_cli-0.40.3-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:c3250b769da93bd379a7dd633b795997ae1308944174d47cf74a59a7dc6923c4", size = 7030797, upload-time = "2025-12-15T15:52:57.606Z" },
+    { url = "https://files.pythonhosted.org/packages/37/2b/8de01a6494d81d55e6e2ef11a3827970247c9e5d8adef01817ebd603c83e/ast_grep_cli-0.40.3-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:8a41788efd7dfcee1c1ae9fa48735278d59ce52dae1fa2123a74a5d67d6bd326", size = 7326573, upload-time = "2025-12-15T15:52:54.751Z" },
+    { url = "https://files.pythonhosted.org/packages/da/c8/80cd68186a343e1447994ff589cf9e1641de214f171ac04ad5d77f3e02e6/ast_grep_cli-0.40.3-py3-none-win32.whl", hash = "sha256:bbcf1a360f20ffed91b830ba33a94ba1d048f0e4ad8b7abdff734607804341b3", size = 6869662, upload-time = "2025-12-15T15:49:28.515Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/47/2a2b894ebc51c3a5bc2011672bc562678e81f83c60f2e10ff7b34b4105dc/ast_grep_cli-0.40.3-py3-none-win_amd64.whl", hash = "sha256:30044cf1d62b7d079d542894cb490d657661e65a5983ed394216399cc40ff9e4", size = 7347268, upload-time = "2025-12-15T15:52:56.253Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/3d/b9ee0d0229becb338bc1a1962bfffbabd5af49bdea1cd0dc7d2d3a9f3a45/ast_grep_cli-0.40.3-py3-none-win_arm64.whl", hash = "sha256:0033fb25361edb6e12f891220eedd4475da415df2986aae132130179bd8b04e5", size = 7043611, upload-time = "2025-12-15T15:52:50.371Z" },
+]
+
+[[package]]
 name = "babel"
 version = "2.17.0"
 source = { registry = "https://pypi.org/simple" }
@@ -297,6 +312,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "ast-grep-cli" },
     { name = "httpx" },
     { name = "jmeslog" },
     { name = "mkdocs-material" },
@@ -319,6 +335,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "ast-grep-cli" },
     { name = "httpx" },
     { name = "jmeslog", specifier = ">=0.2.0" },
     { name = "mkdocs-material", specifier = ">=9.6.20" },

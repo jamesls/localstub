@@ -1,15 +1,26 @@
-import httpx
 import asyncio
 import gzip
 import socket
 import ssl
 import threading
+import time
 
-import trustme
+import httpx
 import pytest
+import trustme
 
-from localstub.server import AsyncHTTPTestServer
-from localstub.tlsproxy import AsyncTLSInterceptProxy
+from localstub.server import (
+    AsyncHTTPTestServer,
+    ByteFlip,
+    HTTPResponse,
+    TruncateBody,
+)
+from localstub.tlsproxy import (
+    AsyncTLSInterceptProxy,
+    TransformResult,
+    UpstreamResponse,
+    fault_step_transformer,
+)
 
 
 @pytest.mark.asyncio
@@ -1591,9 +1602,6 @@ async def _simple_json_handler(
 @pytest.mark.asyncio
 async def test_forward_transforms_response_body_with_byteflip():
     """Transformer can flip bits in the response body using ByteFlip."""
-    from localstub.server import ByteFlip
-    from localstub.tlsproxy import fault_step_transformer
-
     server = await asyncio.start_server(
         _simple_json_handler,
         "127.0.0.1",
@@ -1641,8 +1649,6 @@ async def test_forward_transforms_response_body_with_byteflip():
 @pytest.mark.asyncio
 async def test_forward_transformer_delay_before():
     """Transformer can add delay before sending the response."""
-    import time
-    from localstub.tlsproxy import TransformResult, UpstreamResponse
 
     def delay_transformer(upstream: UpstreamResponse) -> TransformResult:
         return TransformResult(body=upstream.body, delay_before=0.1)
@@ -1689,8 +1695,6 @@ async def test_forward_transformer_delay_before():
 @pytest.mark.asyncio
 async def test_forward_transformer_override_response():
     """Transformer can completely replace the response."""
-    from localstub.server import HTTPResponse
-    from localstub.tlsproxy import TransformResult, UpstreamResponse
 
     def override_transformer(upstream: UpstreamResponse) -> TransformResult:
         return TransformResult(
@@ -1746,7 +1750,6 @@ async def test_forward_transformer_override_response():
 @pytest.mark.asyncio
 async def test_forward_async_transformer():
     """Transformer can be an async function."""
-    from localstub.tlsproxy import TransformResult, UpstreamResponse
 
     async def async_transformer(upstream: UpstreamResponse) -> TransformResult:
         # Simulate some async work
@@ -1794,9 +1797,6 @@ async def test_forward_async_transformer():
 @pytest.mark.asyncio
 async def test_fault_step_transformer_chains_multiple_steps():
     """fault_step_transformer can chain multiple FaultSteps."""
-    from localstub.server import ByteFlip, TruncateBody
-    from localstub.tlsproxy import fault_step_transformer
-
     server = await asyncio.start_server(
         _simple_json_handler,
         "127.0.0.1",
@@ -1845,7 +1845,6 @@ async def test_fault_step_transformer_chains_multiple_steps():
 @pytest.mark.asyncio
 async def test_forward_transformer_passthrough_when_none_returned():
     """Transformer returning None body passes through original response."""
-    from localstub.tlsproxy import TransformResult, UpstreamResponse
 
     def passthrough_transformer(upstream: UpstreamResponse) -> TransformResult:
         # Return empty result - should passthrough original
@@ -1891,7 +1890,6 @@ async def test_forward_transformer_passthrough_when_none_returned():
 @pytest.mark.asyncio
 async def test_forward_transformer_conditional_based_on_content_type():
     """Transformer can conditionally modify based on response headers."""
-    from localstub.tlsproxy import TransformResult, UpstreamResponse
 
     def conditional_transformer(upstream: UpstreamResponse) -> TransformResult:
         content_type = ""

@@ -379,33 +379,6 @@ class ConnectionContext:
     )
 
 
-class HTTPProtocol:
-    """Thin protocol facade that delegates to existing helpers.
-
-    This allows us to separate parsing/formatting concerns from the server
-    loop without changing the tested public API or behavior.
-    """
-
-    def __init__(self, server: "AsyncHTTPTestServer") -> None:  # noqa: F821
-        self._server = server
-
-    async def parse_request(
-        self,
-        reader: asyncio.StreamReader,
-        writer: Writer,
-        conn_recv: bytearray | None,
-    ) -> HTTPRequest | None:
-        return await self._server._read_request(reader, writer, conn_recv)
-
-    async def send_response(
-        self,
-        writer: Writer,
-        response: HTTPResponse,
-        request: HTTPRequest,
-    ) -> bool:
-        return await self._server._write_response(writer, response, request)
-
-
 class Router:
     """Small router wrapper with optional method/path routes.
 
@@ -802,7 +775,6 @@ class AsyncHTTPTestServer:
         client = self._extract_client_info(writer)
         conn_recv, conn_sent = self._init_connection_tracking(client)
         recording_writer = RecordingStreamWriter(writer, conn_sent)
-        protocol = HTTPProtocol(self)
         ctx = ConnectionContext(
             reader=reader,
             writer=recording_writer,
@@ -813,7 +785,7 @@ class AsyncHTTPTestServer:
 
         try:
             while True:
-                request = await protocol.parse_request(
+                request = await self._read_request(
                     reader, recording_writer, conn_recv
                 )
                 if request is None:
@@ -824,7 +796,7 @@ class AsyncHTTPTestServer:
                 await self._request_queue.put(request)
 
                 response = await self._get_response(request)
-                should_close = await protocol.send_response(
+                should_close = await self._write_response(
                     recording_writer, response, request
                 )
 

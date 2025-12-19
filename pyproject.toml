@@ -27,6 +27,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+  "ast-grep-cli",
   "pytest>=8.4.2",
   "httpx",
   "pytest-asyncio",
@@ -52,7 +53,7 @@ packages = ["src/localstub"]
 line-length = 79
 
 [tool.ruff.lint]
-extend-select = ["C901", "PLR0915", "E501"]
+extend-select = ["C901", "PLR0915", "E501", "SLF001"]
 
 [tool.ruff.format]
 quote-style = "preserve"
@@ -95,6 +96,7 @@ check = [
   { cmd = "uv run ruff check ." },
   { cmd = "uv run ruff format --diff ." },
   { cmd = "uv run pyright" },
+  { cmd = "uv run ast-grep scan ." },
 ]
 test = "uv run pytest tests/"
 format-code = [
@@ -105,6 +107,7 @@ auto-check = [
   { cmd = "uv run ruff check --fix ." },
   { cmd = "uv run ruff format ." },
   { cmd = "uv run pyright" },
+  { cmd = "uv run ast-grep scan ." },
 ]
 prcheck = ["check", "test"]
 
