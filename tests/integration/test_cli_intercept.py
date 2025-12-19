@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import ssl
 
@@ -177,9 +178,6 @@ async def test_intercept_mode_with_custom_headers(
 async def test_intercept_mode_with_raw_base64_response(
     tmp_path,
 ) -> None:
-    # "binary data" in base64
-    import base64
-
     raw_data = b"binary data"
     b64_data = base64.b64encode(raw_data).decode("utf-8")
 
