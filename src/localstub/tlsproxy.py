@@ -33,7 +33,11 @@ LOG = logging.getLogger(__name__)
 
 def _wire_log(direction: str, data: bytes) -> None:
     """Log wire-level data with direction indicator."""
-    LOG.debug("[%s] %r", direction, data)
+    text = data.decode("utf-8", errors="replace").rstrip("\r\n")
+    # Truncate long messages for readability
+    if len(text) > 200:
+        text = text[:200] + "..."
+    LOG.debug("[%s] %s", direction, text)
 
 
 def _close_log(direction: str, reason: str) -> None:
