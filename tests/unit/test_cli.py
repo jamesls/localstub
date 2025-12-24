@@ -21,7 +21,7 @@ class TestParseArgs:
         args = parse_args([])
         assert args.port == DEFAULT_PORT
         assert args.output is None
-        assert args.ca_cert is None
+        assert args.ca_dir is None
 
     def test_parse_args_with_short_port_flag_sets_port(self) -> None:
         args = parse_args(["-p", "9999"])
@@ -39,13 +39,9 @@ class TestParseArgs:
         args = parse_args(["--output", "/tmp/traffic.jsonl"])
         assert args.output == Path("/tmp/traffic.jsonl")
 
-    def test_parse_args_with_short_ca_cert_flag_sets_path(self) -> None:
-        args = parse_args(["-c", "/tmp/ca.pem"])
-        assert args.ca_cert == Path("/tmp/ca.pem")
-
-    def test_parse_args_with_long_ca_cert_flag_sets_path(self) -> None:
-        args = parse_args(["--ca-cert", "/tmp/ca.pem"])
-        assert args.ca_cert == Path("/tmp/ca.pem")
+    def test_parse_args_with_ca_dir_flag_sets_path(self) -> None:
+        args = parse_args(["--ca-dir", "/tmp/my-ca"])
+        assert args.ca_dir == Path("/tmp/my-ca")
 
     def test_parse_args_with_all_flags_sets_all_values(self) -> None:
         args = parse_args([
@@ -53,12 +49,12 @@ class TestParseArgs:
             "7777",
             "-o",
             "/tmp/out.jsonl",
-            "-c",
-            "/tmp/ca.pem",
+            "--ca-dir",
+            "/tmp/my-ca",
         ])
         assert args.port == 7777
         assert args.output == Path("/tmp/out.jsonl")
-        assert args.ca_cert == Path("/tmp/ca.pem")
+        assert args.ca_dir == Path("/tmp/my-ca")
 
     def test_parse_args_mode_defaults_to_forward(self) -> None:
         args = parse_args([])
