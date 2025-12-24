@@ -12,11 +12,12 @@ from typing import TextIO
 from rich.logging import RichHandler
 from rich.syntax import Syntax
 
+from localstub.ca import TLSProxyCA
+from localstub.config import load_config
 from localstub.console import console
-from localstub.tlsproxy import AsyncTLSInterceptProxy, RecordedResponse
 from localstub.http.request import HTTPRequest
 from localstub.server import AsyncHTTPTestServer
-from localstub.config import load_config
+from localstub.tlsproxy import AsyncTLSInterceptProxy, RecordedResponse
 
 DEFAULT_PORT = 8888
 
@@ -121,10 +122,9 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="Path to JSONL file for persisting traffic",
     )
     parser.add_argument(
-        "-c",
-        "--ca-cert",
+        "--ca-dir",
         type=Path,
-        help="Path to write the CA certificate PEM",
+        help="Directory to persist/load CA certificate and key",
     )
     parser.add_argument(
         "--log-level",
@@ -166,7 +166,12 @@ async def run_proxy(args: argparse.Namespace) -> None:
             elif config.single_response:
                 server.set_default_response(config.single_response)
 
+    ca: TLSProxyCA | None = None
+    if args.ca_dir:
+        ca = TLSProxyCA.from_directory(args.ca_dir)
+
     proxy = AsyncTLSInterceptProxy(
+        ca=ca,
         listen_port=args.port,
         default_mode=args.mode,
         server=server,
@@ -175,9 +180,6 @@ async def run_proxy(args: argparse.Namespace) -> None:
     )
 
     async with proxy:
-        if args.ca_cert:
-            args.ca_cert.write_bytes(proxy.ca.ca_pem_path().read_bytes())
-
         host, port = proxy.address
         console.print()
         console.print(
@@ -185,8 +187,6 @@ async def run_proxy(args: argparse.Namespace) -> None:
         )
         console.print(f"[dim]CA certificate:[/] {proxy.ca.ca_pem_path()}")
         console.print(f"[dim]Keystore:[/] {proxy.ca.ca_pkcs12_path()}")
-        if args.ca_cert:
-            console.print(f"[dim]CA cert copied to:[/] {args.ca_cert}")
         console.print("[dim]Press Ctrl+C to stop[/]")
         console.print()
 

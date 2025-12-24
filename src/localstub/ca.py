@@ -1,19 +1,54 @@
+from __future__ import annotations
+
+import ssl
 import tempfile
 from pathlib import Path
-import ssl
+from typing import Self
 
+import trustme
 from cryptography import x509
 from cryptography.hazmat.primitives.serialization import (
-    pkcs12,
     BestAvailableEncryption,
+    pkcs12,
 )
-import trustme
 
 
 class TLSProxyCA:
     """CA used for TLS proxy, issues per-host server contexts on demand."""
 
-    def __init__(self) -> None:
+    _ca: trustme.CA
+    _ca_pem_path: Path
+    _ca_pkcs12_path: Path
+
+    def __init__(
+        self,
+        *,
+        ca: trustme.CA | None = None,
+        pem_path: Path | None = None,
+        pkcs12_path: Path | None = None,
+    ) -> None:
+        if ca is not None:
+            self._ca = ca
+            if pem_path is None:
+                with tempfile.NamedTemporaryFile(
+                    prefix="localstub-ca-", suffix=".pem", delete=False
+                ) as f:
+                    f.write(self._ca.cert_pem.bytes())
+                    self._ca_pem_path = Path(f.name)
+            else:
+                self._ca_pem_path = pem_path
+            self._ca_pkcs12_path = (
+                pkcs12_path
+                if pkcs12_path is not None
+                else self._ca_pem_path.with_suffix(".p12")
+            )
+            if not self._ca_pkcs12_path.exists():
+                p12_bytes = self._convert_to_pkcs12_truststore(
+                    self._load_pem_certificate()
+                )
+                self._ca_pkcs12_path.write_bytes(p12_bytes)
+            return
+
         self._ca = trustme.CA()
         with tempfile.NamedTemporaryFile(
             prefix="localstub-ca-", suffix=".pem", delete=False
@@ -23,11 +58,11 @@ class TLSProxyCA:
         with tempfile.NamedTemporaryFile(
             prefix="localstub-ca-", suffix=".p12", delete=False
         ) as f:
-            pkcs12_bytes = self._convert_to_pkcs12_truststore(
+            p12_bytes = self._convert_to_pkcs12_truststore(
                 self._load_pem_certificate()
             )
             self._ca_pkcs12_path = Path(f.name)
-            self._ca_pkcs12_path.write_bytes(pkcs12_bytes)
+            self._ca_pkcs12_path.write_bytes(p12_bytes)
 
     def issue_context(self, host: str) -> ssl.SSLContext:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -69,3 +104,39 @@ class TLSProxyCA:
             BestAvailableEncryption(password.encode('utf-8')),
         )
         return p12_bytes
+
+    @classmethod
+    def from_directory(cls, ca_dir: Path) -> Self:
+        """Load or create a CA from a directory.
+
+        If the directory contains a .pem and .key file, loads the existing CA.
+        Otherwise, generates a new CA and saves to ca.pem, ca.key, ca.p12.
+
+        Raises ValueError if multiple .pem or .key files are found.
+        """
+        ca_dir.mkdir(parents=True, exist_ok=True)
+
+        pem_files = list(ca_dir.glob("*.pem"))
+        key_files = list(ca_dir.glob("*.key"))
+
+        if len(pem_files) > 1:
+            raise ValueError(f"Multiple .pem files in {ca_dir}: {pem_files}")
+        if len(key_files) > 1:
+            raise ValueError(f"Multiple .key files in {ca_dir}: {key_files}")
+
+        if pem_files and key_files:
+            ca = trustme.CA.from_pem(
+                cert_bytes=pem_files[0].read_bytes(),
+                private_key_bytes=key_files[0].read_bytes(),
+            )
+            return cls(ca=ca, pem_path=pem_files[0])
+
+        cert_path = ca_dir / "ca.pem"
+        key_path = ca_dir / "ca.key"
+        pkcs12_path = ca_dir / "ca.p12"
+
+        ca = trustme.CA()
+        cert_path.write_bytes(ca.cert_pem.bytes())
+        key_path.write_bytes(ca.private_key_pem.bytes())
+
+        return cls(ca=ca, pem_path=cert_path, pkcs12_path=pkcs12_path)
