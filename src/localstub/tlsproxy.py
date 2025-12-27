@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from email.message import Message
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional, cast
 
+from rich.markup import escape as rich_escape
+
 if TYPE_CHECKING:
     from localstub.server import FaultStep
 
@@ -31,13 +33,51 @@ from localstub.server import AsyncHTTPTestServer, HTTPResponse
 LOG = logging.getLogger(__name__)
 
 
+def _hexdump(data: bytes, bytes_per_line: int = 32) -> str:
+    """Format bytes as tcpdump -X style hexdump.
+
+    Args:
+        data: Raw bytes to format.
+        bytes_per_line: Number of bytes per line (default 32).
+
+    Returns:
+        Formatted hexdump string with Rich markup for consistent coloring.
+    """
+    lines = []
+    # Calculate width for hex part: pairs * 4 chars + (pairs - 1) spaces
+    num_pairs = bytes_per_line // 2
+    hex_width = num_pairs * 4 + (num_pairs - 1)
+    for offset in range(0, len(data), bytes_per_line):
+        chunk = data[offset : offset + bytes_per_line]
+        # Build hex pairs
+        hex_pairs = []
+        for i in range(0, len(chunk), 2):
+            pair = chunk[i : i + 2]
+            hex_pairs.append(pair.hex())
+        hex_part = " ".join(hex_pairs)
+        # Build ASCII part (escape for Rich markup safety)
+        ascii_part = rich_escape(
+            "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+        )
+        # Use Rich markup: dim for offset, grey70 for hex
+        lines.append(
+            f"[dim]0x{offset:04x}:[/dim]  "
+            f"[grey39]{hex_part:<{hex_width}}[/grey39]  {ascii_part}"
+        )
+    return "\n".join(lines)
+
+
 def _wire_log(direction: str, data: bytes) -> None:
-    """Log wire-level data with direction indicator."""
-    text = data.decode("utf-8", errors="replace").rstrip("\r\n")
-    # Truncate long messages for readability
-    if len(text) > 200:
-        text = text[:200] + "..."
-    LOG.debug("[%s] %s", direction, text)
+    """Log wire-level data with direction indicator in hexdump format."""
+    hexdump = _hexdump(data)
+    # Escape direction (contains brackets), enable markup, disable highlighter
+    escaped_dir = rich_escape(f"[{direction}]")
+    LOG.debug(
+        "%s\n%s",
+        escaped_dir,
+        hexdump,
+        extra={"markup": True, "highlighter": None},
+    )
 
 
 def _close_log(direction: str, reason: str) -> None:

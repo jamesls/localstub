@@ -70,7 +70,8 @@ def _print_http_block(
     console.print()
 
     # Print headers with cleaner syntax highlighting
-    console.print(Syntax(headers, "http", theme="native", word_wrap=True))
+    theme = 'nord'
+    console.print(Syntax(headers, "http", theme=theme, word_wrap=True))
 
     # Print body with detected syntax highlighting
     if body.strip():
@@ -81,12 +82,12 @@ def _print_http_block(
                 Syntax(
                     body.strip(),
                     syntax,
-                    theme="native",
+                    theme=theme,
                     word_wrap=True,
                 )
             )
         else:
-            console.print(f"[dim]{body.strip()}[/]")
+            console.print(f"{body.strip()}")
 
     # End marker
     console.print()
