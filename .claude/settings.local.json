@@ -10,7 +10,10 @@
       "Skill(python-coding:coding-guidelines)",
       "Skill(python-coding:class-design)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:ast-grep.github.io)",
+      "Bash(ast-grep run:*)",
+      "Bash(ast-grep scan:*)"
     ],
     "deny": [],
     "ask": []
