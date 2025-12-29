@@ -5,17 +5,93 @@ import asyncio
 import json
 import logging
 import signal
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
-from localstub.tlsproxy import AsyncTLSInterceptProxy, RecordedResponse
+from rich.logging import RichHandler
+from rich.syntax import Syntax
+
+from localstub.ca import TLSProxyCA
+from localstub.config import load_config
+from localstub.console import console
 from localstub.http.request import HTTPRequest
 from localstub.server import AsyncHTTPTestServer
-from localstub.config import load_config
+from localstub.tlsproxy import AsyncTLSInterceptProxy, RecordedResponse
 
 DEFAULT_PORT = 8888
+
+
+def _detect_syntax(body: str, headers: str) -> str:
+    """Detect syntax type from headers or body heuristics."""
+    headers_lower = headers.lower()
+    if "application/json" in headers_lower or "text/json" in headers_lower:
+        return "json"
+    if "application/xml" in headers_lower or "text/xml" in headers_lower:
+        return "xml"
+    body_stripped = body.strip()
+    if body_stripped.startswith("{") or body_stripped.startswith("["):
+        return "json"
+    if body_stripped.startswith("<"):
+        return "xml"
+    return "text"
+
+
+def _print_http_block(
+    wire_bytes: bytes,
+    label: str,
+    color: str,
+    status: int | None = None,
+) -> None:
+    """Print an HTTP request or response block with rich formatting."""
+    text = wire_bytes.decode("utf-8", errors="replace")
+
+    if "\r\n\r\n" in text:
+        headers, body = text.split("\r\n\r\n", 1)
+    else:
+        headers, body = text, ""
+
+    # Build the label with optional status
+    if status is not None:
+        if 200 <= status < 300:
+            status_style = "green"
+        elif 300 <= status < 400:
+            status_style = "yellow"
+        else:
+            status_style = "red"
+        label_text = f"[bold {color}]── {label}[/] [{status_style}]{status}[/]"
+    else:
+        label_text = f"[bold {color}]── {label}[/]"
+
+    # Print with extra spacing before
+    console.print()
+    console.print()
+    console.print(label_text)
+    console.print()
+
+    # Print headers with cleaner syntax highlighting
+    theme = 'nord'
+    console.print(Syntax(headers, "http", theme=theme, word_wrap=True))
+
+    # Print body with detected syntax highlighting
+    if body.strip():
+        console.print()
+        syntax = _detect_syntax(body, headers)
+        if syntax in ("json", "xml"):
+            console.print(
+                Syntax(
+                    body.strip(),
+                    syntax,
+                    theme=theme,
+                    word_wrap=True,
+                )
+            )
+        else:
+            console.print(f"{body.strip()}")
+
+    # End marker
+    console.print()
+    console.print(f"[{color}]──[/]")
 
 
 def main() -> None:
@@ -47,10 +123,9 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="Path to JSONL file for persisting traffic",
     )
     parser.add_argument(
-        "-c",
-        "--ca-cert",
+        "--ca-dir",
         type=Path,
-        help="Path to write the CA certificate PEM",
+        help="Directory to persist/load CA certificate and key",
     )
     parser.add_argument(
         "--log-level",
@@ -78,7 +153,8 @@ async def run_proxy(args: argparse.Namespace) -> None:
     """Start and run the TLS proxy."""
     logging.basicConfig(
         level=getattr(logging, args.log_level),
-        format="%(asctime)s: %(message)s",
+        handlers=[RichHandler(console=console, show_path=False)],
+        format="%(message)s",
     )
 
     server: AsyncHTTPTestServer | None = None
@@ -91,7 +167,12 @@ async def run_proxy(args: argparse.Namespace) -> None:
             elif config.single_response:
                 server.set_default_response(config.single_response)
 
+    ca: TLSProxyCA | None = None
+    if args.ca_dir:
+        ca = TLSProxyCA.from_directory(args.ca_dir)
+
     proxy = AsyncTLSInterceptProxy(
+        ca=ca,
         listen_port=args.port,
         default_mode=args.mode,
         server=server,
@@ -100,16 +181,15 @@ async def run_proxy(args: argparse.Namespace) -> None:
     )
 
     async with proxy:
-        if args.ca_cert:
-            args.ca_cert.write_bytes(proxy.ca.ca_pem_path().read_bytes())
-
         host, port = proxy.address
-        print(f"lstub proxy listening on {host}:{port}")
-        print(f"CA certificate: {proxy.ca.ca_pem_path()}")
-        print(f"Keystore certificate: {proxy.ca.ca_pkcs12_path()}")
-        if args.ca_cert:
-            print(f"CA cert copied to: {args.ca_cert}")
-        print("Press Ctrl+C to stop\n")
+        console.print()
+        console.print(
+            f"[bold cyan]lstub[/] listening on [bold]{host}:{port}[/]"
+        )
+        console.print(f"[dim]CA certificate:[/] {proxy.ca.ca_pem_path()}")
+        console.print(f"[dim]Keystore:[/] {proxy.ca.ca_pkcs12_path()}")
+        console.print("[dim]Press Ctrl+C to stop[/]")
+        console.print()
 
         shutdown_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -152,10 +232,11 @@ async def process_traffic(
         except asyncio.TimeoutError:
             continue
 
-        sys.stdout.buffer.write(b"\n--- REQUEST ---\n")
-        sys.stdout.buffer.write(request.wire_raw_bytes or b"")
-        sys.stdout.buffer.write(b"\n")
-        sys.stdout.buffer.flush()
+        _print_http_block(
+            request.wire_raw_bytes or b"",
+            "REQUEST",
+            "green",
+        )
 
         response: RecordedResponse | None = None
         timeouts = 0
@@ -165,11 +246,10 @@ async def process_traffic(
             except asyncio.TimeoutError:
                 timeouts += 1
                 if timeouts >= response_max_timeouts:
-                    sys.stderr.write(
-                        "No upstream response recorded; "
-                        "logging without response\n"
+                    console.print(
+                        "[yellow]No upstream response recorded; "
+                        "logging without response[/]"
                     )
-                    sys.stderr.flush()
                     break
                 continue
 
@@ -177,10 +257,12 @@ async def process_traffic(
             break
 
         if response:
-            sys.stdout.buffer.write(b"\n--- RESPONSE ---\n")
-            sys.stdout.buffer.write(response.wire_raw_bytes)
-            sys.stdout.buffer.write(b"\n")
-            sys.stdout.buffer.flush()
+            _print_http_block(
+                response.wire_raw_bytes,
+                "RESPONSE",
+                "blue",
+                status=response.status,
+            )
 
         if output_file:
             record = build_record(request, response)
