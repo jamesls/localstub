@@ -856,17 +856,6 @@ class AsyncHTTPTestServer:
                 body=f"Bad Gateway: {e}".encode(),
             )
 
-    @staticmethod
-    def _extract_request_body_wire_bytes(request: HTTPRequest) -> bytes:
-        if request.wire_raw_bytes is None:
-            return request.body.encode() if request.body else b""
-
-        header_end = request.wire_raw_bytes.find(b"\r\n\r\n")
-        if header_end == -1:
-            return request.body.encode() if request.body else b""
-
-        return request.wire_raw_bytes[header_end + 4 :]
-
     def _build_origin_form_request(
         self,
         request: HTTPRequest,
@@ -920,7 +909,7 @@ class AsyncHTTPTestServer:
 
         header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n\r\n"
 
-        body_bytes = self._extract_request_body_wire_bytes(request)
+        body_bytes = request.wire_body_bytes
         return header_bytes + body_bytes
 
     async def _forward_proxy_raw(
