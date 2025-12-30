@@ -9,11 +9,16 @@ from email.message import Message
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
 
+import httpx
+
+from localstub.forward import Forwarder, ForwardResult
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
     ParsedRequest,
 )
+from localstub.http.response import RecordedResponse
+from localstub.http.uri import ParsedURI
 from localstub.http.utils import headers_to_message
 
 LOG = logging.getLogger(__name__)
@@ -399,9 +404,11 @@ class Router:
         fallback_handler: Handler | None,
         default_response: HTTPResponse,
     ) -> HTTPResponse:
+        # Use effective_path for route matching to support both origin-form
+        # ("/path") and absolute-form ("http://host/path") URIs
         key = (
             request.method.upper() if request.method else "",
-            request.path or "/",
+            request.effective_path,
         )
         handler = self._routes.get(key, fallback_handler)
 
@@ -434,6 +441,8 @@ class AsyncHTTPTestServer:
         handler: Handler | None = None,
         default_response: HTTPResponse | None = None,
         on_headers_received: OnHeadersReceived | None = None,
+        proxy_forwarder: httpx.AsyncClient | None = None,
+        raw_forwarder: Forwarder | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -445,6 +454,8 @@ class AsyncHTTPTestServer:
         )
         self._router = Router()
         self._on_headers_received = on_headers_received
+        self._proxy_forwarder = proxy_forwarder
+        self._raw_forwarder = raw_forwarder
 
         # Response sequence tracking
         self._response_sequence: list[HTTPResponse] = []
@@ -458,6 +469,7 @@ class AsyncHTTPTestServer:
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
         self._request_queue: asyncio.Queue[HTTPRequest] = asyncio.Queue()
+        self._response_queue: asyncio.Queue[RecordedResponse] = asyncio.Queue()
 
         # Connection-level raw bytes tracking (keyed by client address)
         self._connection_raw_bytes_received: dict[
@@ -657,6 +669,7 @@ class AsyncHTTPTestServer:
         self.last_request = None
         self.requests = []
         self._request_queue = asyncio.Queue()
+        self._response_queue = asyncio.Queue()
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
         # Reset response sequence index to allow reuse
@@ -699,6 +712,16 @@ class AsyncHTTPTestServer:
             )
         self.last_request = req
         return req
+
+    async def next_response(
+        self, timeout: float | None = None
+    ) -> RecordedResponse:
+        """Await and return the next response sent by this server."""
+        if timeout is None:
+            return await self._response_queue.get()
+        return await asyncio.wait_for(
+            self._response_queue.get(), timeout=timeout
+        )
 
     async def handle_http_connection(
         self,
@@ -750,9 +773,10 @@ class AsyncHTTPTestServer:
 
         Priority order:
         1. Response sequence (if set and not exhausted)
-        2. Router with method/path matching
-        3. Handler (if set)
-        4. Default response
+        2. Proxy forwarding (if proxy request and forwarder is set)
+        3. Router with method/path matching
+        4. Handler (if set)
+        5. Default response
         """
         # Check sequence first - consumes next response if available
         if self._response_sequence and self._response_sequence_index < len(
@@ -762,9 +786,167 @@ class AsyncHTTPTestServer:
             self._response_sequence_index += 1
             return response
 
+        # Forward proxy requests to upstream if forwarder is configured
+        if request.is_proxy_request and self._proxy_forwarder is not None:
+            return await self._forward_to_upstream(request)
+
         # Fall back to existing routing logic
         return await self._router.resolve(
             request, self._handler, self._default_response
+        )
+
+    async def _forward_to_upstream(
+        self,
+        request: HTTPRequest,
+    ) -> HTTPResponse:
+        """Forward a proxy request to the upstream server."""
+        uri = request.target_uri
+        if uri is None:
+            return HTTPResponse(
+                status=400,
+                body=b"Bad Request: Not an absolute URI",
+            )
+
+        # Build the upstream URL (the full absolute URI from request.path)
+        upstream_url = request.path or "/"
+
+        # Build headers, excluding hop-by-hop headers
+        hop_by_hop = {
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        }
+        headers: dict[str, str] = {}
+        if request.headers:
+            for name, value in request.headers.items():
+                if name.lower() not in hop_by_hop:
+                    headers[name] = value
+
+        assert self._proxy_forwarder is not None
+        try:
+            upstream_response = await self._proxy_forwarder.request(
+                method=request.method or "GET",
+                url=upstream_url,
+                headers=headers,
+                content=request.body_bytes,
+            )
+
+            # Build response headers, excluding hop-by-hop
+            response_headers: dict[str, str] = {}
+            for name, value in upstream_response.headers.items():
+                if name.lower() not in hop_by_hop:
+                    response_headers[name] = value
+
+            return HTTPResponse(
+                status=upstream_response.status_code,
+                headers=response_headers,
+                body=upstream_response.content,
+            )
+
+        except httpx.RequestError as e:
+            LOG.warning("Upstream request failed: %s", e)
+            return HTTPResponse(
+                status=502,
+                body=f"Bad Gateway: {e}".encode(),
+            )
+
+    def _build_origin_form_request(
+        self,
+        request: HTTPRequest,
+        uri: ParsedURI,
+    ) -> bytes:
+        """Convert absolute-form proxy request to origin-form for upstream.
+
+        Converts a request like "GET http://example.com/path HTTP/1.1"
+        to "GET /path HTTP/1.1" for sending to the upstream server.
+
+        Args:
+            request: The original HTTP request with absolute-form URI.
+            uri: Parsed URI components from the request.
+
+        Returns:
+            Wire bytes for the origin-form request.
+        """
+        path = request.effective_path or "/"
+        method = request.method or "GET"
+        version = request.http_version or "HTTP/1.1"
+
+        lines = [f"{method} {path} {version}"]
+
+        # Add headers, filtering proxy-specific hop-by-hop headers
+        hop_by_hop = {
+            "proxy-connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+        }
+        host_added = False
+        if request.headers:
+            for name, value in request.headers.items():
+                name_lower = name.lower()
+                if name_lower in hop_by_hop:
+                    continue
+                if name_lower == "host":
+                    # Ensure Host header matches target
+                    port_suffix = ""
+                    if uri.port and uri.port not in (80, 443):
+                        port_suffix = f":{uri.port}"
+                    lines.append(f"Host: {uri.host}{port_suffix}")
+                    host_added = True
+                else:
+                    lines.append(f"{name}: {value}")
+
+        if not host_added:
+            port_suffix = ""
+            if uri.port and uri.port not in (80, 443):
+                port_suffix = f":{uri.port}"
+            lines.append(f"Host: {uri.host}{port_suffix}")
+
+        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n\r\n"
+
+        body_bytes = request.wire_body_bytes
+        return header_bytes + body_bytes
+
+    async def _forward_proxy_raw(
+        self,
+        request: HTTPRequest,
+        writer: Writer,
+    ) -> ForwardResult | None:
+        """Forward a proxy request using raw sockets.
+
+        Uses the Forwarder to send the request to upstream and relay
+        the response directly to the client, preserving exact wire bytes
+        including Transfer-Encoding.
+
+        Args:
+            request: The HTTP request to forward.
+            writer: The writer to relay the response to.
+
+        Returns:
+            ForwardResult for recording, or None on failure.
+        """
+        if self._raw_forwarder is None:
+            return None
+
+        uri = request.target_uri
+        if uri is None:
+            return None
+
+        request_wire = self._build_origin_form_request(request, uri)
+        upstream_tls = uri.scheme == "https"
+
+        return await self._raw_forwarder.forward_and_relay(
+            host=uri.host,
+            port=uri.port,
+            request_wire_bytes=request_wire,
+            client_writer=cast(asyncio.StreamWriter, writer),
+            request_method=request.method,
+            upstream_tls=upstream_tls,
         )
 
     async def _handle_client(
@@ -795,10 +977,49 @@ class AsyncHTTPTestServer:
                 self.requests.append(request)
                 await self._request_queue.put(request)
 
+                # Check for raw proxy forwarding
+                if (
+                    request.is_proxy_request
+                    and self._raw_forwarder is not None
+                ):
+                    wire_offset = len(recording_writer.bytes_sent)
+                    forward_result = await self._forward_proxy_raw(
+                        request, recording_writer
+                    )
+                    if forward_result is not None:
+                        # Build response and recorded response from result
+                        response = HTTPResponse(
+                            status=forward_result.status,
+                            headers=dict(forward_result.headers.items()),
+                            body=forward_result.body,
+                        )
+                        wire_bytes = recording_writer.bytes_sent[wire_offset:]
+                        recorded = RecordedResponse(
+                            status=forward_result.status,
+                            reason=forward_result.reason,
+                            headers=forward_result.headers,
+                            body=forward_result.body.decode(
+                                "utf-8", errors="replace"
+                            ),
+                            wire_raw_bytes=wire_bytes,
+                        )
+                        await self._response_queue.put(recorded)
+                        ctx.history.append((request, response))
+                        if self._should_close_connection(request):
+                            break
+                        continue
+                    # Fall through to normal handling if forwarding failed
+
                 response = await self._get_response(request)
+                wire_offset = len(recording_writer.bytes_sent)
                 should_close = await self._write_response(
                     recording_writer, response, request
                 )
+                wire_bytes = recording_writer.bytes_sent[wire_offset:]
+
+                # Record response for async consumers
+                recorded = self._build_recorded_response(response, wire_bytes)
+                await self._response_queue.put(recorded)
 
                 # Keep a lightweight per-connection history for debugging
                 ctx.history.append((request, response))
@@ -882,25 +1103,34 @@ class AsyncHTTPTestServer:
         writer: Writer,
     ) -> HTTPRequest:
         """Build HTTPRequest from parsed data."""
-        headers = headers_to_message(parsed.headers)
-        body_text = (
-            parsed.body.decode("utf-8", errors="replace")
-            if parsed.body
-            else None
+        return HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
+
+    def _build_recorded_response(
+        self,
+        response: HTTPResponse,
+        wire_bytes: bytes,
+    ) -> RecordedResponse:
+        """Build RecordedResponse from response and wire bytes."""
+        try:
+            reason = HTTPStatus(response.status).phrase
+        except ValueError:
+            reason = None
+
+        body = self._normalize_body(response.body)
+        body_text = body.decode("utf-8", errors="replace") if body else None
+
+        headers = headers_to_message(
+            [(k.encode(), v.encode()) for k, v in response.headers.items()]
+            if response.headers
+            else []
         )
-        client = self._extract_client_info(writer)
-        return HTTPRequest(
-            method=parsed.method,
-            path=(
-                parsed.url.decode("ascii", errors="replace")
-                if parsed.url
-                else None
-            ),
-            http_version=parsed.http_version,
+
+        return RecordedResponse(
+            status=response.status,
+            reason=reason,
             headers=headers,
             body=body_text,
             wire_raw_bytes=wire_bytes,
-            client=client,
         )
 
     async def _write_interim_response(
