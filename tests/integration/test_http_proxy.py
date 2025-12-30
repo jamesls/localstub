@@ -119,6 +119,78 @@ class TestProxyForwarding:
                     await writer.wait_closed()
 
     @pytest.mark.asyncio
+    async def test_forwarder_preserves_non_utf8_request_body(self) -> None:
+        captured_body = b""
+        request_received = asyncio.Event()
+
+        async def upstream_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            nonlocal captured_body
+            headers = await reader.readuntil(b"\r\n\r\n")
+            content_length = 0
+            for line in headers.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    content_length = int(line.split(b":", 1)[1].strip())
+                    break
+
+            if content_length:
+                captured_body = await reader.read(content_length)
+            else:
+                captured_body = b""
+
+            request_received.set()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        assert upstream.sockets is not None
+        addr = upstream.sockets[0].getsockname()
+        upstream_host, upstream_port = addr[0], addr[1]
+
+        try:
+            body = b"\xff\xfe\xfd\x00abc"
+            async with httpx.AsyncClient() as http_client:
+                async with AsyncHTTPTestServer(
+                    proxy_forwarder=http_client
+                ) as proxy:
+                    reader, writer = await asyncio.open_connection(
+                        proxy.host, proxy.port
+                    )
+                    try:
+                        request = (
+                            f"POST http://{upstream_host}:{upstream_port}"
+                            "/upload HTTP/1.1\r\n"
+                            f"Host: {upstream_host}:{upstream_port}\r\n"
+                            f"Content-Length: {len(body)}\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                        ).encode() + body
+                        writer.write(request)
+                        await writer.drain()
+
+                        await reader.read(4096)
+                        await asyncio.wait_for(
+                            request_received.wait(), timeout=1.0
+                        )
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert captured_body == body
+
+    @pytest.mark.asyncio
     async def test_record_mode_without_forwarder(self) -> None:
         async with AsyncHTTPTestServer() as server:
             server.set_json_response({"mocked": True})

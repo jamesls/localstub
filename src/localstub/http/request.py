@@ -23,6 +23,7 @@ class HTTPRequest:
     """Snapshot of a single HTTP request.
 
     `body` is decoded as UTF-8 (like the original code).
+    `body_bytes` is the parsed body bytes (may differ from wire framing).
     `wire_raw_bytes` is *exactly* what came off the wire, including:
       - request line
       - headers
@@ -35,6 +36,7 @@ class HTTPRequest:
     http_version: str | None = None
     headers: Message | None = None
     body: str | None = None
+    body_bytes: bytes | None = None
     wire_raw_bytes: bytes | None = None
     client: tuple[str, int] | None = None
 
@@ -47,6 +49,7 @@ class HTTPRequest:
         writer: Writer | None = None,
     ) -> HTTPRequest:
         headers = headers_to_message(parsed.headers)
+        body_bytes = parsed.body if parsed.body else None
         body_text = (
             parsed.body.decode("utf-8", errors="replace")
             if parsed.body
@@ -69,6 +72,7 @@ class HTTPRequest:
             http_version=parsed.http_version,
             headers=headers,
             body=body_text,
+            body_bytes=body_bytes,
             wire_raw_bytes=wire_raw_bytes,
             client=client,
         )
@@ -80,7 +84,12 @@ class HTTPRequest:
         For chunked uploads this includes the original chunk
         framing and any trailer bytes.
         """
-        body_fallback = self.body.encode() if self.body else b""
+        if self.body_bytes is not None:
+            body_fallback = self.body_bytes
+        elif self.body:
+            body_fallback = self.body.encode()
+        else:
+            body_fallback = b""
         if self.wire_raw_bytes is None:
             return body_fallback
 
