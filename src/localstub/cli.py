@@ -18,8 +18,9 @@ from localstub.ca import TLSProxyCA
 from localstub.config import load_config
 from localstub.console import console
 from localstub.http.request import HTTPRequest
+from localstub.http.response import RecordedResponse
 from localstub.server import AsyncHTTPTestServer
-from localstub.tlsproxy import AsyncTLSInterceptProxy, RecordedResponse
+from localstub.tlsproxy import AsyncTLSInterceptProxy
 
 DEFAULT_PORT = 8888
 
@@ -346,8 +347,11 @@ async def process_http_proxy_traffic(
     server: AsyncHTTPTestServer,
     output_file: TextIO | None,
     shutdown_event: asyncio.Event,
+    *,
+    response_timeout: float = 5.0,
+    response_max_timeouts: int = 3,
 ) -> None:
-    """Poll for recorded requests and output them (HTTP forward proxy mode)."""
+    """Poll for recorded requests/responses (HTTP forward proxy mode)."""
     while not shutdown_event.is_set():
         try:
             request = await server.next_request(timeout=0.1)
@@ -360,14 +364,43 @@ async def process_http_proxy_traffic(
             "green",
         )
 
+        response: RecordedResponse | None = None
+        timeouts = 0
+        while not shutdown_event.is_set() and response is None:
+            try:
+                response = await server.next_response(timeout=response_timeout)
+            except asyncio.TimeoutError:
+                timeouts += 1
+                if timeouts >= response_max_timeouts:
+                    console.print(
+                        "[yellow]No response recorded; "
+                        "logging without response[/]"
+                    )
+                    break
+                continue
+
+        if shutdown_event.is_set() and response is None:
+            break
+
+        if response:
+            _print_http_block(
+                response.wire_raw_bytes,
+                "RESPONSE",
+                "blue",
+                status=response.status,
+            )
+
         if output_file:
-            record = build_http_proxy_record(request)
+            record = build_http_proxy_record(request, response)
             output_file.write(json.dumps(record) + "\n")
             output_file.flush()
 
 
-def build_http_proxy_record(request: HTTPRequest) -> dict[str, object]:
-    """Build a JSON-serializable record from an HTTP proxy request."""
+def build_http_proxy_record(
+    request: HTTPRequest,
+    response: RecordedResponse | None,
+) -> dict[str, object]:
+    """Build a JSON-serializable record from an HTTP proxy request/response."""
     request_dict: dict[str, object] = {
         "method": request.method,
         "path": request.path,
@@ -382,10 +415,24 @@ def build_http_proxy_record(request: HTTPRequest) -> dict[str, object]:
         request_dict["target_port"] = request.target_uri.port
         request_dict["effective_path"] = request.effective_path
 
-    return {
+    record: dict[str, object] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "request": request_dict,
     }
+
+    if response:
+        response_dict: dict[str, object] = {
+            "status": response.status,
+            "reason": response.reason,
+            "body": response.body,
+        }
+        if response.headers:
+            response_dict["headers"] = dict(response.headers.items())
+        record["response"] = response_dict
+    else:
+        record["response"] = None
+
+    return record
 
 
 def build_record(
