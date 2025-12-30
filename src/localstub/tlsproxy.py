@@ -26,7 +26,6 @@ from localstub.http.request import (
     HTTPRequest,
     ParsedRequest,
 )
-from localstub.http.utils import headers_to_message
 from localstub.ca import TLSProxyCA
 from localstub.server import AsyncHTTPTestServer
 
@@ -562,28 +561,7 @@ class AsyncTLSInterceptProxy:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Build and record an HTTPRequest."""
-        headers = headers_to_message(parsed.headers)
-        body = (
-            parsed.body.decode("utf-8", errors="replace")
-            if parsed.body
-            else None
-        )
-        peer = writer.get_extra_info("peername")
-        client = (peer[0], peer[1]) if isinstance(peer, tuple) else None
-        path = (
-            parsed.url.decode("ascii", errors="replace")
-            if parsed.url
-            else None
-        )
-        request = HTTPRequest(
-            method=parsed.method,
-            path=path,
-            http_version=parsed.http_version,
-            headers=headers,
-            body=body,
-            wire_raw_bytes=wire_bytes,
-            client=client,
-        )
+        request = HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
         await self._recorded_requests.put(request)
 
     async def _send_and_close(

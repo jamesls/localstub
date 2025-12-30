@@ -1114,26 +1114,7 @@ class AsyncHTTPTestServer:
         writer: Writer,
     ) -> HTTPRequest:
         """Build HTTPRequest from parsed data."""
-        headers = headers_to_message(parsed.headers)
-        body_text = (
-            parsed.body.decode("utf-8", errors="replace")
-            if parsed.body
-            else None
-        )
-        client = self._extract_client_info(writer)
-        return HTTPRequest(
-            method=parsed.method,
-            path=(
-                parsed.url.decode("ascii", errors="replace")
-                if parsed.url
-                else None
-            ),
-            http_version=parsed.http_version,
-            headers=headers,
-            body=body_text,
-            wire_raw_bytes=wire_bytes,
-            client=client,
-        )
+        return HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
 
     def _build_recorded_response(
         self,

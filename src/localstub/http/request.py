@@ -38,6 +38,41 @@ class HTTPRequest:
     wire_raw_bytes: bytes | None = None
     client: tuple[str, int] | None = None
 
+    @classmethod
+    def from_parsed(
+        cls,
+        parsed: ParsedRequest,
+        wire_raw_bytes: bytes,
+        *,
+        writer: Writer | None = None,
+    ) -> HTTPRequest:
+        headers = headers_to_message(parsed.headers)
+        body_text = (
+            parsed.body.decode("utf-8", errors="replace")
+            if parsed.body
+            else None
+        )
+        path = (
+            parsed.url.decode("ascii", errors="replace")
+            if parsed.url
+            else None
+        )
+        client: tuple[str, int] | None = None
+        if writer is not None:
+            peer = writer.get_extra_info("peername")
+            if isinstance(peer, tuple) and len(peer) >= 2:
+                client = (peer[0], peer[1])
+
+        return cls(
+            method=parsed.method,
+            path=path,
+            http_version=parsed.http_version,
+            headers=headers,
+            body=body_text,
+            wire_raw_bytes=wire_raw_bytes,
+            client=client,
+        )
+
     @property
     def json_body(self) -> Any:
         if self.body is None or self.body == "":
@@ -397,31 +432,4 @@ class HTTPRequestReader:
         if parsed is None:
             return None
 
-        headers = headers_to_message(parsed.headers)
-        body_text = (
-            parsed.body.decode("utf-8", errors="replace")
-            if parsed.body
-            else None
-        )
-        client = self._extract_client_info(writer) if writer else None
-
-        return HTTPRequest(
-            method=parsed.method,
-            path=(
-                parsed.url.decode("ascii", errors="replace")
-                if parsed.url
-                else None
-            ),
-            http_version=parsed.http_version,
-            headers=headers,
-            body=body_text,
-            wire_raw_bytes=wire_bytes,
-            client=client,
-        )
-
-    def _extract_client_info(self, writer: Writer) -> tuple[str, int] | None:
-        """Extract client (host, port) from the writer's peername."""
-        peer = writer.get_extra_info("peername")
-        if isinstance(peer, tuple) and len(peer) >= 2:
-            return (peer[0], peer[1])
-        return None
+        return HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
