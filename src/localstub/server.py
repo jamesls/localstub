@@ -834,7 +834,7 @@ class AsyncHTTPTestServer:
                 method=request.method or "GET",
                 url=upstream_url,
                 headers=headers,
-                content=request.body.encode() if request.body else None,
+                content=request.body_bytes,
             )
 
             # Build response headers, excluding hop-by-hop
