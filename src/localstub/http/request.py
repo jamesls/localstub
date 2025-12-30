@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 from dataclasses import dataclass, field
@@ -6,6 +8,7 @@ from typing import Any, Protocol
 
 import httptools
 
+from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_message
 
 
@@ -40,6 +43,51 @@ class HTTPRequest:
         if self.body is None or self.body == "":
             return None
         return json.loads(self.body)
+
+    @property
+    def is_proxy_request(self) -> bool:
+        """Return True if this is a forward proxy request (absolute-form URI).
+
+        Forward proxy requests have the full URL in the request line,
+        e.g., GET http://example.com/path HTTP/1.1
+        """
+        if self.path is None:
+            return False
+        return self.path.startswith("http://") or self.path.startswith(
+            "https://"
+        )
+
+    @property
+    def target_uri(self) -> ParsedURI | None:
+        """Parse and return URI components if absolute-form, else None.
+
+        Returns:
+            ParsedURI with scheme, host, port, path for absolute-form URIs,
+            or None for origin-form URIs (e.g., "/path").
+        """
+        if self.path is None:
+            return None
+        return parse_absolute_uri(self.path)
+
+    @property
+    def effective_path(self) -> str:
+        """Return the path portion for routing.
+
+        For absolute-form URIs (e.g., "http://example.com/foo?bar=1"),
+        returns just the path and query string ("/foo?bar=1").
+
+        For origin-form URIs (e.g., "/foo"), returns the path as-is.
+
+        This is useful for route matching where you want
+        add_route("GET", "/foo", handler) to match both origin-form
+        and absolute-form requests.
+        """
+        if self.path is None:
+            return "/"
+        uri = self.target_uri
+        if uri is not None:
+            return uri.path
+        return self.path
 
 
 @dataclass
