@@ -9,6 +9,8 @@ from email.message import Message
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
 
+import httpx
+
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
@@ -399,9 +401,11 @@ class Router:
         fallback_handler: Handler | None,
         default_response: HTTPResponse,
     ) -> HTTPResponse:
+        # Use effective_path for route matching to support both origin-form
+        # ("/path") and absolute-form ("http://host/path") URIs
         key = (
             request.method.upper() if request.method else "",
-            request.path or "/",
+            request.effective_path,
         )
         handler = self._routes.get(key, fallback_handler)
 
@@ -434,6 +438,7 @@ class AsyncHTTPTestServer:
         handler: Handler | None = None,
         default_response: HTTPResponse | None = None,
         on_headers_received: OnHeadersReceived | None = None,
+        proxy_forwarder: httpx.AsyncClient | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -445,6 +450,7 @@ class AsyncHTTPTestServer:
         )
         self._router = Router()
         self._on_headers_received = on_headers_received
+        self._proxy_forwarder = proxy_forwarder
 
         # Response sequence tracking
         self._response_sequence: list[HTTPResponse] = []
@@ -750,9 +756,10 @@ class AsyncHTTPTestServer:
 
         Priority order:
         1. Response sequence (if set and not exhausted)
-        2. Router with method/path matching
-        3. Handler (if set)
-        4. Default response
+        2. Proxy forwarding (if proxy request and forwarder is set)
+        3. Router with method/path matching
+        4. Handler (if set)
+        5. Default response
         """
         # Check sequence first - consumes next response if available
         if self._response_sequence and self._response_sequence_index < len(
@@ -762,10 +769,75 @@ class AsyncHTTPTestServer:
             self._response_sequence_index += 1
             return response
 
+        # Forward proxy requests to upstream if forwarder is configured
+        if request.is_proxy_request and self._proxy_forwarder is not None:
+            return await self._forward_to_upstream(request)
+
         # Fall back to existing routing logic
         return await self._router.resolve(
             request, self._handler, self._default_response
         )
+
+    async def _forward_to_upstream(
+        self,
+        request: HTTPRequest,
+    ) -> HTTPResponse:
+        """Forward a proxy request to the upstream server."""
+        uri = request.target_uri
+        if uri is None:
+            return HTTPResponse(
+                status=400,
+                body=b"Bad Request: Not an absolute URI",
+            )
+
+        # Build the upstream URL (the full absolute URI from request.path)
+        upstream_url = request.path or "/"
+
+        # Build headers, excluding hop-by-hop headers
+        hop_by_hop = {
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        }
+        headers: dict[str, str] = {}
+        if request.headers:
+            for name, value in request.headers.items():
+                if name.lower() not in hop_by_hop:
+                    headers[name] = value
+
+        assert self._proxy_forwarder is not None
+        try:
+            upstream_response = await self._proxy_forwarder.request(
+                method=request.method or "GET",
+                url=upstream_url,
+                headers=headers,
+                content=request.body.encode() if request.body else None,
+            )
+
+            # Build response headers, excluding hop-by-hop
+            response_headers: dict[str, str] = {}
+            for name, value in upstream_response.headers.items():
+                if name.lower() not in hop_by_hop:
+                    response_headers[name] = value
+
+            return HTTPResponse(
+                status=upstream_response.status_code,
+                headers=response_headers,
+                body=upstream_response.content,
+            )
+
+        except httpx.RequestError as e:
+            LOG.warning("Upstream request failed: %s", e)
+            return HTTPResponse(
+                status=502,
+                body=f"Bad Gateway: {e}".encode(),
+            )
 
     async def _handle_client(
         self,
