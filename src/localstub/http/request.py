@@ -74,6 +74,23 @@ class HTTPRequest:
         )
 
     @property
+    def wire_body_bytes(self) -> bytes:
+        """Return request body bytes as they appeared on the wire.
+
+        For chunked uploads this includes the original chunk
+        framing and any trailer bytes.
+        """
+        body_fallback = self.body.encode() if self.body else b""
+        if self.wire_raw_bytes is None:
+            return body_fallback
+
+        header_end = self.wire_raw_bytes.find(b"\r\n\r\n")
+        if header_end == -1:
+            return body_fallback
+
+        return self.wire_raw_bytes[header_end + 4 :]
+
+    @property
     def json_body(self) -> Any:
         if self.body is None or self.body == "":
             return None
