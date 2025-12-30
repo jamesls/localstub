@@ -12,12 +12,15 @@ from typing import TextIO
 from rich.logging import RichHandler
 from rich.syntax import Syntax
 
+import httpx
+
 from localstub.ca import TLSProxyCA
 from localstub.config import load_config
 from localstub.console import console
 from localstub.http.request import HTTPRequest
+from localstub.http.response import RecordedResponse
 from localstub.server import AsyncHTTPTestServer
-from localstub.tlsproxy import AsyncTLSInterceptProxy, RecordedResponse
+from localstub.tlsproxy import AsyncTLSInterceptProxy
 
 DEFAULT_PORT = 8888
 
@@ -136,9 +139,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-m",
         "--mode",
-        choices=["forward", "intercept"],
+        choices=["forward", "intercept", "http-proxy"],
         default="forward",
-        help="Proxy mode: forward to upstream or intercept (default: forward)",
+        help=(
+            "Proxy mode: forward (TLS to upstream), intercept (TLS mock), "
+            "http-proxy (HTTP forward proxy) (default: forward)"
+        ),
     )
     parser.add_argument(
         "-f",
@@ -150,13 +156,80 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
 
 
 async def run_proxy(args: argparse.Namespace) -> None:
-    """Start and run the TLS proxy."""
+    """Start and run the proxy."""
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         handlers=[RichHandler(console=console, show_path=False)],
         format="%(message)s",
     )
 
+    if args.mode == "http-proxy":
+        await run_http_proxy(args)
+    else:
+        await run_tls_proxy(args)
+
+
+async def run_http_proxy(args: argparse.Namespace) -> None:
+    """Start and run the HTTP forward proxy."""
+    # Create forwarder if not in record-only mode (config file provided)
+    forwarder: httpx.AsyncClient | None = None
+    mode_label: str
+    if args.config_file:
+        # Record mode: no forwarder, use configured responses
+        mode_label = "record"
+    else:
+        # Forward mode: forward to upstream
+        forwarder = httpx.AsyncClient()
+        mode_label = "forward"
+
+    server = AsyncHTTPTestServer(
+        port=args.port,
+        proxy_forwarder=forwarder,
+    )
+
+    # Configure responses if config file provided
+    if args.config_file:
+        config = load_config(args.config_file)
+        if config.response_sequence:
+            server.set_response_sequence(config.response_sequence)
+        elif config.single_response:
+            server.set_default_response(config.single_response)
+
+    async with server:
+        console.print()
+        console.print(
+            f"[bold cyan]lstub[/] HTTP proxy listening on "
+            f"[bold]{server.host}:{server.port}[/]"
+        )
+        console.print(f"[dim]Mode:[/] {mode_label}")
+        console.print("[dim]Press Ctrl+C to stop[/]")
+        console.print()
+
+        shutdown_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
+            loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+        output_file: TextIO | None = None
+        if args.output:
+            output_file = open(args.output, "a")
+
+        try:
+            await process_http_proxy_traffic(
+                server, output_file, shutdown_event
+            )
+        finally:
+            if output_file:
+                output_file.close()
+            if forwarder:
+                await forwarder.aclose()
+
+
+async def run_tls_proxy(args: argparse.Namespace) -> None:
+    """Start and run the TLS proxy."""
     server: AsyncHTTPTestServer | None = None
     if args.mode == "intercept":
         server = AsyncHTTPTestServer()
@@ -268,6 +341,98 @@ async def process_traffic(
             record = build_record(request, response)
             output_file.write(json.dumps(record) + "\n")
             output_file.flush()
+
+
+async def process_http_proxy_traffic(
+    server: AsyncHTTPTestServer,
+    output_file: TextIO | None,
+    shutdown_event: asyncio.Event,
+    *,
+    response_timeout: float = 5.0,
+    response_max_timeouts: int = 3,
+) -> None:
+    """Poll for recorded requests/responses (HTTP forward proxy mode)."""
+    while not shutdown_event.is_set():
+        try:
+            request = await server.next_request(timeout=0.1)
+        except asyncio.TimeoutError:
+            continue
+
+        _print_http_block(
+            request.wire_raw_bytes or b"",
+            "REQUEST",
+            "green",
+        )
+
+        response: RecordedResponse | None = None
+        timeouts = 0
+        while not shutdown_event.is_set() and response is None:
+            try:
+                response = await server.next_response(timeout=response_timeout)
+            except asyncio.TimeoutError:
+                timeouts += 1
+                if timeouts >= response_max_timeouts:
+                    console.print(
+                        "[yellow]No response recorded; "
+                        "logging without response[/]"
+                    )
+                    break
+                continue
+
+        if shutdown_event.is_set() and response is None:
+            break
+
+        if response:
+            _print_http_block(
+                response.wire_raw_bytes,
+                "RESPONSE",
+                "blue",
+                status=response.status,
+            )
+
+        if output_file:
+            record = build_http_proxy_record(request, response)
+            output_file.write(json.dumps(record) + "\n")
+            output_file.flush()
+
+
+def build_http_proxy_record(
+    request: HTTPRequest,
+    response: RecordedResponse | None,
+) -> dict[str, object]:
+    """Build a JSON-serializable record from an HTTP proxy request/response."""
+    request_dict: dict[str, object] = {
+        "method": request.method,
+        "path": request.path,
+        "body": request.body,
+    }
+    if request.headers:
+        request_dict["headers"] = dict(request.headers.items())
+
+    # Add proxy-specific fields
+    if request.is_proxy_request and request.target_uri:
+        request_dict["target_host"] = request.target_uri.host
+        request_dict["target_port"] = request.target_uri.port
+        request_dict["effective_path"] = request.effective_path
+
+    record: dict[str, object] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "request": request_dict,
+    }
+
+    if response:
+        response_dict: dict[str, object] = {
+            "status": response.status,
+            "reason": response.reason,
+            "body": response.body,
+        }
+        if response.headers:
+            response_dict["headers"] = dict(response.headers.items())
+        record["response"] = response_dict
+    else:
+        record["response"] = None
+
+    return record
 
 
 def build_record(

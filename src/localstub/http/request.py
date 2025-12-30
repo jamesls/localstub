@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 from dataclasses import dataclass, field
@@ -6,6 +8,7 @@ from typing import Any, Protocol
 
 import httptools
 
+from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_message
 
 
@@ -20,6 +23,7 @@ class HTTPRequest:
     """Snapshot of a single HTTP request.
 
     `body` is decoded as UTF-8 (like the original code).
+    `body_bytes` is the parsed body bytes (may differ from wire framing).
     `wire_raw_bytes` is *exactly* what came off the wire, including:
       - request line
       - headers
@@ -32,14 +36,119 @@ class HTTPRequest:
     http_version: str | None = None
     headers: Message | None = None
     body: str | None = None
+    body_bytes: bytes | None = None
     wire_raw_bytes: bytes | None = None
     client: tuple[str, int] | None = None
+
+    @classmethod
+    def from_parsed(
+        cls,
+        parsed: ParsedRequest,
+        wire_raw_bytes: bytes,
+        *,
+        writer: Writer | None = None,
+    ) -> HTTPRequest:
+        headers = headers_to_message(parsed.headers)
+        body_bytes = parsed.body if parsed.body else None
+        body_text = (
+            parsed.body.decode("utf-8", errors="replace")
+            if parsed.body
+            else None
+        )
+        path = (
+            parsed.url.decode("ascii", errors="replace")
+            if parsed.url
+            else None
+        )
+        client: tuple[str, int] | None = None
+        if writer is not None:
+            peer = writer.get_extra_info("peername")
+            if isinstance(peer, tuple) and len(peer) >= 2:
+                client = (peer[0], peer[1])
+
+        return cls(
+            method=parsed.method,
+            path=path,
+            http_version=parsed.http_version,
+            headers=headers,
+            body=body_text,
+            body_bytes=body_bytes,
+            wire_raw_bytes=wire_raw_bytes,
+            client=client,
+        )
+
+    @property
+    def wire_body_bytes(self) -> bytes:
+        """Return request body bytes as they appeared on the wire.
+
+        For chunked uploads this includes the original chunk
+        framing and any trailer bytes.
+        """
+        if self.body_bytes is not None:
+            body_fallback = self.body_bytes
+        elif self.body:
+            body_fallback = self.body.encode()
+        else:
+            body_fallback = b""
+        if self.wire_raw_bytes is None:
+            return body_fallback
+
+        header_end = self.wire_raw_bytes.find(b"\r\n\r\n")
+        if header_end == -1:
+            return body_fallback
+
+        return self.wire_raw_bytes[header_end + 4 :]
 
     @property
     def json_body(self) -> Any:
         if self.body is None or self.body == "":
             return None
         return json.loads(self.body)
+
+    @property
+    def is_proxy_request(self) -> bool:
+        """Return True if this is a forward proxy request (absolute-form URI).
+
+        Forward proxy requests have the full URL in the request line,
+        e.g., GET http://example.com/path HTTP/1.1
+        """
+        if self.path is None:
+            return False
+        return self.path.startswith("http://") or self.path.startswith(
+            "https://"
+        )
+
+    @property
+    def target_uri(self) -> ParsedURI | None:
+        """Parse and return URI components if absolute-form, else None.
+
+        Returns:
+            ParsedURI with scheme, host, port, path for absolute-form URIs,
+            or None for origin-form URIs (e.g., "/path").
+        """
+        if self.path is None:
+            return None
+        return parse_absolute_uri(self.path)
+
+    @property
+    def effective_path(self) -> str:
+        """Return the path portion for routing.
+
+        For absolute-form URIs (e.g., "http://example.com/foo?bar=1"),
+        returns just the path and query string ("/foo?bar=1").
+
+        For origin-form URIs (e.g., "/foo"), returns the path as-is.
+
+        This is useful for route matching where you want
+        add_route("GET", "/foo", handler) to match both origin-form
+        and absolute-form requests.
+        """
+        if self.path is None:
+            return "/"
+        uri = self.target_uri
+        if uri is not None:
+            return uri.path
+        return self.path
 
 
 @dataclass
@@ -349,31 +458,4 @@ class HTTPRequestReader:
         if parsed is None:
             return None
 
-        headers = headers_to_message(parsed.headers)
-        body_text = (
-            parsed.body.decode("utf-8", errors="replace")
-            if parsed.body
-            else None
-        )
-        client = self._extract_client_info(writer) if writer else None
-
-        return HTTPRequest(
-            method=parsed.method,
-            path=(
-                parsed.url.decode("ascii", errors="replace")
-                if parsed.url
-                else None
-            ),
-            http_version=parsed.http_version,
-            headers=headers,
-            body=body_text,
-            wire_raw_bytes=wire_bytes,
-            client=client,
-        )
-
-    def _extract_client_info(self, writer: Writer) -> tuple[str, int] | None:
-        """Extract client (host, port) from the writer's peername."""
-        peer = writer.get_extra_info("peername")
-        if isinstance(peer, tuple) and len(peer) >= 2:
-            return (peer[0], peer[1])
-        return None
+        return HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
