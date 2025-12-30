@@ -19,6 +19,7 @@ from localstub.http.response import (
     AsyncMultiResponseParser,
     AsyncResponseParser,
     ParsedResponse,
+    RecordedResponse,
 )
 from localstub.http.request import (
     AsyncRequestParser,
@@ -960,15 +961,6 @@ class AsyncTLSInterceptProxy:
                     await writer.wait_closed()
                 except Exception:
                     pass
-
-
-@dataclass
-class RecordedResponse:
-    status: int
-    reason: str | None
-    headers: Message | None
-    body: str | None
-    wire_raw_bytes: bytes
 
 
 @dataclass

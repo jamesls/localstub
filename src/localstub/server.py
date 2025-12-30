@@ -16,6 +16,7 @@ from localstub.http.request import (
     HTTPRequest,
     ParsedRequest,
 )
+from localstub.http.response import RecordedResponse
 from localstub.http.utils import headers_to_message
 
 LOG = logging.getLogger(__name__)
@@ -464,6 +465,7 @@ class AsyncHTTPTestServer:
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
         self._request_queue: asyncio.Queue[HTTPRequest] = asyncio.Queue()
+        self._response_queue: asyncio.Queue[RecordedResponse] = asyncio.Queue()
 
         # Connection-level raw bytes tracking (keyed by client address)
         self._connection_raw_bytes_received: dict[
@@ -663,6 +665,7 @@ class AsyncHTTPTestServer:
         self.last_request = None
         self.requests = []
         self._request_queue = asyncio.Queue()
+        self._response_queue = asyncio.Queue()
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
         # Reset response sequence index to allow reuse
@@ -705,6 +708,16 @@ class AsyncHTTPTestServer:
             )
         self.last_request = req
         return req
+
+    async def next_response(
+        self, timeout: float | None = None
+    ) -> RecordedResponse:
+        """Await and return the next response sent by this server."""
+        if timeout is None:
+            return await self._response_queue.get()
+        return await asyncio.wait_for(
+            self._response_queue.get(), timeout=timeout
+        )
 
     async def handle_http_connection(
         self,
@@ -868,9 +881,15 @@ class AsyncHTTPTestServer:
                 await self._request_queue.put(request)
 
                 response = await self._get_response(request)
+                wire_offset = len(recording_writer.bytes_sent)
                 should_close = await self._write_response(
                     recording_writer, response, request
                 )
+                wire_bytes = recording_writer.bytes_sent[wire_offset:]
+
+                # Record response for async consumers
+                recorded = self._build_recorded_response(response, wire_bytes)
+                await self._response_queue.put(recorded)
 
                 # Keep a lightweight per-connection history for debugging
                 ctx.history.append((request, response))
@@ -973,6 +992,34 @@ class AsyncHTTPTestServer:
             body=body_text,
             wire_raw_bytes=wire_bytes,
             client=client,
+        )
+
+    def _build_recorded_response(
+        self,
+        response: HTTPResponse,
+        wire_bytes: bytes,
+    ) -> RecordedResponse:
+        """Build RecordedResponse from response and wire bytes."""
+        try:
+            reason = HTTPStatus(response.status).phrase
+        except ValueError:
+            reason = None
+
+        body = self._normalize_body(response.body)
+        body_text = body.decode("utf-8", errors="replace") if body else None
+
+        headers = headers_to_message(
+            [(k.encode(), v.encode()) for k, v in response.headers.items()]
+            if response.headers
+            else []
+        )
+
+        return RecordedResponse(
+            status=response.status,
+            reason=reason,
+            headers=headers,
+            body=body_text,
+            wire_raw_bytes=wire_bytes,
         )
 
     async def _write_interim_response(

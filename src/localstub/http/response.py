@@ -1,7 +1,19 @@
 import asyncio
 from dataclasses import dataclass, field
+from email.message import Message
 
 import httptools
+
+
+@dataclass
+class RecordedResponse:
+    """Captured HTTP response for recording/display purposes."""
+
+    status: int
+    reason: str | None
+    headers: Message | None
+    body: str | None
+    wire_raw_bytes: bytes
 
 
 @dataclass
