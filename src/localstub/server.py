@@ -11,12 +11,14 @@ from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
 
 import httpx
 
+from localstub.forward import Forwarder, ForwardResult
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
     ParsedRequest,
 )
 from localstub.http.response import RecordedResponse
+from localstub.http.uri import ParsedURI
 from localstub.http.utils import headers_to_message
 
 LOG = logging.getLogger(__name__)
@@ -440,6 +442,7 @@ class AsyncHTTPTestServer:
         default_response: HTTPResponse | None = None,
         on_headers_received: OnHeadersReceived | None = None,
         proxy_forwarder: httpx.AsyncClient | None = None,
+        raw_forwarder: Forwarder | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -452,6 +455,7 @@ class AsyncHTTPTestServer:
         self._router = Router()
         self._on_headers_received = on_headers_received
         self._proxy_forwarder = proxy_forwarder
+        self._raw_forwarder = raw_forwarder
 
         # Response sequence tracking
         self._response_sequence: list[HTTPResponse] = []
@@ -852,6 +856,110 @@ class AsyncHTTPTestServer:
                 body=f"Bad Gateway: {e}".encode(),
             )
 
+    @staticmethod
+    def _extract_request_body_wire_bytes(request: HTTPRequest) -> bytes:
+        if request.wire_raw_bytes is None:
+            return request.body.encode() if request.body else b""
+
+        header_end = request.wire_raw_bytes.find(b"\r\n\r\n")
+        if header_end == -1:
+            return request.body.encode() if request.body else b""
+
+        return request.wire_raw_bytes[header_end + 4 :]
+
+    def _build_origin_form_request(
+        self,
+        request: HTTPRequest,
+        uri: ParsedURI,
+    ) -> bytes:
+        """Convert absolute-form proxy request to origin-form for upstream.
+
+        Converts a request like "GET http://example.com/path HTTP/1.1"
+        to "GET /path HTTP/1.1" for sending to the upstream server.
+
+        Args:
+            request: The original HTTP request with absolute-form URI.
+            uri: Parsed URI components from the request.
+
+        Returns:
+            Wire bytes for the origin-form request.
+        """
+        path = request.effective_path or "/"
+        method = request.method or "GET"
+        version = request.http_version or "HTTP/1.1"
+
+        lines = [f"{method} {path} {version}"]
+
+        # Add headers, filtering proxy-specific hop-by-hop headers
+        hop_by_hop = {
+            "proxy-connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+        }
+        host_added = False
+        if request.headers:
+            for name, value in request.headers.items():
+                name_lower = name.lower()
+                if name_lower in hop_by_hop:
+                    continue
+                if name_lower == "host":
+                    # Ensure Host header matches target
+                    port_suffix = ""
+                    if uri.port and uri.port not in (80, 443):
+                        port_suffix = f":{uri.port}"
+                    lines.append(f"Host: {uri.host}{port_suffix}")
+                    host_added = True
+                else:
+                    lines.append(f"{name}: {value}")
+
+        if not host_added:
+            port_suffix = ""
+            if uri.port and uri.port not in (80, 443):
+                port_suffix = f":{uri.port}"
+            lines.append(f"Host: {uri.host}{port_suffix}")
+
+        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n\r\n"
+
+        body_bytes = self._extract_request_body_wire_bytes(request)
+        return header_bytes + body_bytes
+
+    async def _forward_proxy_raw(
+        self,
+        request: HTTPRequest,
+        writer: Writer,
+    ) -> ForwardResult | None:
+        """Forward a proxy request using raw sockets.
+
+        Uses the Forwarder to send the request to upstream and relay
+        the response directly to the client, preserving exact wire bytes
+        including Transfer-Encoding.
+
+        Args:
+            request: The HTTP request to forward.
+            writer: The writer to relay the response to.
+
+        Returns:
+            ForwardResult for recording, or None on failure.
+        """
+        if self._raw_forwarder is None:
+            return None
+
+        uri = request.target_uri
+        if uri is None:
+            return None
+
+        request_wire = self._build_origin_form_request(request, uri)
+        upstream_tls = uri.scheme == "https"
+
+        return await self._raw_forwarder.forward_and_relay(
+            host=uri.host,
+            port=uri.port,
+            request_wire_bytes=request_wire,
+            client_writer=cast(asyncio.StreamWriter, writer),
+            request_method=request.method,
+            upstream_tls=upstream_tls,
+        )
+
     async def _handle_client(
         self,
         reader: asyncio.StreamReader,
@@ -879,6 +987,39 @@ class AsyncHTTPTestServer:
                 self.last_request = request
                 self.requests.append(request)
                 await self._request_queue.put(request)
+
+                # Check for raw proxy forwarding
+                if (
+                    request.is_proxy_request
+                    and self._raw_forwarder is not None
+                ):
+                    wire_offset = len(recording_writer.bytes_sent)
+                    forward_result = await self._forward_proxy_raw(
+                        request, recording_writer
+                    )
+                    if forward_result is not None:
+                        # Build response and recorded response from result
+                        response = HTTPResponse(
+                            status=forward_result.status,
+                            headers=dict(forward_result.headers.items()),
+                            body=forward_result.body,
+                        )
+                        wire_bytes = recording_writer.bytes_sent[wire_offset:]
+                        recorded = RecordedResponse(
+                            status=forward_result.status,
+                            reason=forward_result.reason,
+                            headers=forward_result.headers,
+                            body=forward_result.body.decode(
+                                "utf-8", errors="replace"
+                            ),
+                            wire_raw_bytes=wire_bytes,
+                        )
+                        await self._response_queue.put(recorded)
+                        ctx.history.append((request, response))
+                        if self._should_close_connection(request):
+                            break
+                        continue
+                    # Fall through to normal handling if forwarding failed
 
                 response = await self._get_response(request)
                 wire_offset = len(recording_writer.bytes_sent)

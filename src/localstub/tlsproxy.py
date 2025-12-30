@@ -1,24 +1,24 @@
 from __future__ import annotations
 
-import inspect
-import ssl
 import asyncio
 import logging
+import ssl
 from asyncio import transports
-import gzip
-from dataclasses import dataclass
-from email.message import Message
-from typing import TYPE_CHECKING, Awaitable, Callable, Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 from rich.markup import escape as rich_escape
 
 if TYPE_CHECKING:
     from localstub.server import FaultStep
 
+from localstub.forward import (
+    ForwardError,
+    Forwarder,
+    ResponseTransformer,
+    TransformResult,
+    UpstreamResponse,
+)
 from localstub.http.response import (
-    AsyncMultiResponseParser,
-    AsyncResponseParser,
-    ParsedResponse,
     RecordedResponse,
 )
 from localstub.http.request import (
@@ -28,7 +28,7 @@ from localstub.http.request import (
 )
 from localstub.http.utils import headers_to_message
 from localstub.ca import TLSProxyCA
-from localstub.server import AsyncHTTPTestServer, HTTPResponse
+from localstub.server import AsyncHTTPTestServer
 
 
 LOG = logging.getLogger(__name__)
@@ -118,7 +118,8 @@ class AsyncTLSInterceptProxy:
         default_mode: str = "intercept",
         verify_upstream: bool = True,
         upstream_tls: bool = True,
-        response_transformer: "ResponseTransformer | None" = None,
+        response_transformer: ResponseTransformer | None = None,
+        forwarder: Forwarder | None = None,
     ) -> None:
         self._listen_host = listen_host
         self._listen_port = listen_port
@@ -126,9 +127,16 @@ class AsyncTLSInterceptProxy:
         self._ca = ca or TLSProxyCA()
         self._max_read = max_read
         self._default_mode = default_mode
-        self._verify_upstream = verify_upstream
         self._upstream_tls = upstream_tls
-        self._response_transformer = response_transformer
+        if forwarder is None:
+            forwarder = Forwarder(
+                max_read=max_read,
+                verify_upstream=verify_upstream,
+                response_transformer=response_transformer,
+                decompress_body=True,
+                wire_log=_wire_log,
+            )
+        self._forwarder = forwarder
 
         self._listener: asyncio.base_events.Server | None = None
         self._host: str | None = None
@@ -389,265 +397,6 @@ class AsyncTLSInterceptProxy:
         )
         return tls_reader, tls_writer
 
-    async def _read_upstream_response(
-        self,
-        reader: asyncio.StreamReader,
-        request_method: str | None = None,
-    ) -> RecordedResponse | None:
-        parser = AsyncResponseParser(max_read=self._max_read)
-        parsed, wire_bytes = await parser.parse(reader, request_method)
-
-        if parsed is None:
-            return None
-
-        headers = headers_to_message(parsed.headers)
-        body_bytes = self._maybe_decompress(headers, parsed.body)
-        body_text = body_bytes.decode("utf-8", errors="replace")
-
-        return RecordedResponse(
-            status=parsed.status_code or 0,
-            reason=(
-                parsed.status_text.decode("ascii", errors="replace")
-                if parsed.status_text
-                else None
-            ),
-            headers=headers,
-            body=body_text,
-            wire_raw_bytes=wire_bytes,
-        )
-
-    def _maybe_decompress(self, headers: Message, body: bytes) -> bytes:
-        content_encoding = headers.get("Content-Encoding", "").lower()
-        if "gzip" in content_encoding:
-            try:
-                return gzip.decompress(body)
-            except Exception:
-                return body
-        return body
-
-    def _rebuild_response_wire_bytes(
-        self,
-        parsed: ParsedResponse,
-        new_body: bytes,
-    ) -> bytes:
-        """Rebuild HTTP response with new body, using identity encoding.
-
-        Strips Transfer-Encoding and Content-Encoding headers since the
-        new body is sent in plain format with Content-Length.
-        """
-        version = parsed.http_version or "1.1"
-        status_code = parsed.status_code or 200
-        status_text = (
-            parsed.status_text.decode("ascii", errors="replace")
-            if parsed.status_text
-            else "OK"
-        )
-        lines = [f"HTTP/{version} {status_code} {status_text}"]
-
-        # Filter out Content-Length, Transfer-Encoding, Content-Encoding
-        # Then add new Content-Length
-        skip_headers = {
-            b"content-length",
-            b"transfer-encoding",
-            b"content-encoding",
-        }
-        for name, value in parsed.headers:
-            if name.lower() not in skip_headers:
-                lines.append(
-                    f"{name.decode('ascii', errors='replace')}: "
-                    f"{value.decode('ascii', errors='replace')}"
-                )
-
-        lines.append(f"Content-Length: {len(new_body)}")
-        lines.append("")  # Blank line before body
-
-        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n"
-        return header_bytes + new_body
-
-    def _build_override_wire_bytes(self, response: HTTPResponse) -> bytes:
-        """Build wire bytes from an HTTPResponse for full response override."""
-        try:
-            from http import HTTPStatus
-
-            reason = HTTPStatus(response.status).phrase
-        except ValueError:
-            reason = "UNKNOWN"
-
-        lines = [f"HTTP/1.1 {response.status} {reason}"]
-
-        body: bytes
-        if isinstance(response.body, str):
-            body = response.body.encode("utf-8")
-        elif response.body is None:
-            body = b""
-        else:
-            body = response.body
-
-        # Add headers, ensuring Content-Length
-        headers = dict(response.headers) if response.headers else {}
-        if "Content-Length" not in headers and "content-length" not in headers:
-            headers["Content-Length"] = str(len(body))
-
-        for name, value in headers.items():
-            lines.append(f"{name}: {value}")
-
-        lines.append("")
-        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n"
-        return header_bytes + body
-
-    def _build_wire_bytes_for_result(
-        self,
-        result: "TransformResult",
-        parsed: ParsedResponse,
-        original_wire_bytes: bytes,
-    ) -> bytes:
-        """Build wire bytes based on transformer result."""
-        if result.override_response is not None:
-            return self._build_override_wire_bytes(result.override_response)
-        if result.body is not None:
-            return self._rebuild_response_wire_bytes(parsed, result.body)
-        return original_wire_bytes
-
-    async def _apply_transformation_and_relay(
-        self,
-        parsed: ParsedResponse,
-        wire_bytes: bytes,
-        client_writer: asyncio.StreamWriter,
-        client_id: str,
-    ) -> RecordedResponse:
-        """Apply response transformation and relay to client.
-
-        Returns the original (untransformed) response for recording.
-        """
-        status = parsed.status_code or 0
-        headers = headers_to_message(parsed.headers)
-        body_bytes = self._maybe_decompress(headers, parsed.body)
-        reason = (
-            parsed.status_text.decode("ascii", errors="replace")
-            if parsed.status_text
-            else None
-        )
-
-        upstream = UpstreamResponse(
-            status=status,
-            reason=reason,
-            headers=headers,
-            body=body_bytes,
-            wire_raw_bytes=wire_bytes,
-        )
-
-        assert self._response_transformer is not None
-        result = self._response_transformer(upstream)
-        if inspect.isawaitable(result):
-            result = await result
-
-        if result.delay_before > 0:
-            await asyncio.sleep(result.delay_before)
-
-        wire_bytes_to_send = self._build_wire_bytes_for_result(
-            result, parsed, wire_bytes
-        )
-
-        if result.drop_after is not None:
-            partial = wire_bytes_to_send[: result.drop_after]
-            _wire_log(f"lstub --> {client_id}", partial)
-            client_writer.write(partial)
-            await client_writer.drain()
-            reason = f"drop_after={result.drop_after}"
-            _close_log(f"lstub --> {client_id}", reason)
-            client_writer.close()
-            try:
-                await client_writer.wait_closed()
-            except Exception:
-                pass
-        else:
-            _wire_log(f"lstub --> {client_id}", wire_bytes_to_send)
-            client_writer.write(wire_bytes_to_send)
-            await client_writer.drain()
-
-        body_text = body_bytes.decode("utf-8", errors="replace")
-        return RecordedResponse(
-            status=status,
-            reason=reason,
-            headers=headers,
-            body=body_text,
-            wire_raw_bytes=wire_bytes,
-        )
-
-    async def _read_and_relay_responses(
-        self,
-        upstream_reader: asyncio.StreamReader,
-        upstream_id: str,
-        client_writer: asyncio.StreamWriter,
-        client_id: str,
-        request_method: str | None,
-        *,
-        multi_parser: AsyncMultiResponseParser | None = None,
-    ) -> RecordedResponse | None:
-        """Read responses from upstream, relaying each to client.
-
-        Handles 1xx informational responses by relaying them and continuing
-        to read until a final (2xx+) response is received.
-
-        Uses a single parser instance to handle cases where multiple responses
-        (e.g., 100 Continue + 200 OK) arrive in a single buffer read. If
-        a parser is provided via ``multi_parser``, it will be reused so any
-        already-buffered upstream bytes are not lost.
-
-        If a response_transformer is configured, it will be applied to
-        final responses (status >= 200) before relaying to the client.
-
-        Returns the final response, or None if parsing failed.
-        """
-        if multi_parser is None:
-            multi_parser = AsyncMultiResponseParser(max_read=self._max_read)
-
-        while True:
-            parsed, wire_bytes = await multi_parser.next_response(
-                upstream_reader, request_method
-            )
-            if parsed is None:
-                return None
-
-            _wire_log(f"{upstream_id} --> lstub", wire_bytes)
-
-            status = parsed.status_code or 0
-
-            # Only transform final responses (not 1xx informational)
-            if self._response_transformer is not None and status >= 200:
-                return await self._apply_transformation_and_relay(
-                    parsed, wire_bytes, client_writer, client_id
-                )
-
-            # No transformation - relay original wire bytes
-            _wire_log(f"lstub --> {client_id}", wire_bytes)
-            client_writer.write(wire_bytes)
-            await client_writer.drain()
-
-            # Check if this is a final response (not 1xx informational)
-            if status >= 200:
-                headers = headers_to_message(parsed.headers)
-                body_bytes = self._maybe_decompress(headers, parsed.body)
-                body_text = body_bytes.decode("utf-8", errors="replace")
-                return RecordedResponse(
-                    status=status,
-                    reason=(
-                        parsed.status_text.decode("ascii", errors="replace")
-                        if parsed.status_text
-                        else None
-                    ),
-                    headers=headers,
-                    body=body_text,
-                    wire_raw_bytes=wire_bytes,
-                )
-
-            # For 1xx responses, log and continue reading for final response
-            LOG.debug(
-                "Received 1xx informational response (%d), "
-                "waiting for final response",
-                status,
-            )
-
     async def _forward(
         self,
         host: str,
@@ -658,7 +407,6 @@ class AsyncTLSInterceptProxy:
     ) -> None:
         upstream_id = f"{host}:{port}"
 
-        # Parse headers first to check for Expect: 100-continue.
         parser = AsyncRequestParser(max_read=self._max_read)
         parsed, header_wire, remaining = await parser.parse_headers(
             client_reader
@@ -679,8 +427,11 @@ class AsyncTLSInterceptProxy:
             b"100-continue" in expect_hdr.lower() and len(remaining) == 0
         )
 
-        # Connect to upstream.
-        upstream = await self._connect_upstream(host, port)
+        upstream = await self._forwarder.connect_upstream(
+            host,
+            port,
+            upstream_tls=self._upstream_tls,
+        )
         if upstream is None:
             # Connection failed - record what we have without blocking on the
             # body (e.g. Expect: 100-continue clients may not send it yet).
@@ -692,193 +443,117 @@ class AsyncTLSInterceptProxy:
             return
         upstream_reader, upstream_writer = upstream
 
-        response_parser: AsyncMultiResponseParser | None = None
-
-        # Forward request based on whether client is waiting for 100-continue.
-        if client_waiting:
-            response_parser = AsyncMultiResponseParser(max_read=self._max_read)
-            done = await self._forward_with_100_continue(
-                parser,
-                parsed,
-                header_wire,
-                remaining,
-                client_reader,
-                client_writer,
-                client_id,
-                upstream_reader,
-                upstream_writer,
-                upstream_id,
-                response_parser,
-            )
-            if done:
-                return
-        else:
-            ok = await self._forward_normal(
-                parser,
-                header_wire,
-                remaining,
-                client_reader,
-                client_writer,
-                client_id,
-                upstream_writer,
-                upstream_id,
-            )
-            if not ok:
-                return
-
-        # Read and relay responses.
-        final_response = await self._read_and_relay_responses(
-            upstream_reader,
-            upstream_id,
-            client_writer,
-            client_id,
-            parsed.method,
-            multi_parser=response_parser,
-        )
-        if final_response is None:
-            await self._send_and_close(
-                client_writer, b"HTTP/1.1 502 Bad Gateway", client_id
-            )
-            _close_log(f"{upstream_id} --> lstub", "failed to parse response")
-            upstream_writer.close()
-            return
-
-        await self._recorded_responses.put(final_response)
-        _close_log(f"{upstream_id} --> lstub", "response received")
-        upstream_writer.close()
-        _close_log(f"lstub --> {client_id}", "response relayed")
-        client_writer.close()
-
-    async def _connect_upstream(
-        self, host: str, port: int
-    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
-        """Connect to upstream server. Returns None on failure."""
-        ssl_param: ssl.SSLContext | None = None
-        server_hostname: str | None = None
-        if self._upstream_tls:
-            ctx = ssl.create_default_context()
-            if not self._verify_upstream:
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            ssl_param = ctx
-            server_hostname = host
         try:
-            return await asyncio.open_connection(
-                host, port, ssl=ssl_param, server_hostname=server_hostname
+            if client_waiting:
+                forwarded = await self._forwarder.forward_with_100_continue(
+                    parser=parser,
+                    parsed_headers=parsed,
+                    header_wire_bytes=header_wire,
+                    remaining_buffer=remaining,
+                    client_reader=client_reader,
+                    client_writer=client_writer,
+                    upstream_reader=upstream_reader,
+                    upstream_writer=upstream_writer,
+                    request_method=parsed.method,
+                    upstream_id=upstream_id,
+                    client_id=client_id,
+                )
+
+                await self._record_request(
+                    forwarded.parsed_request,
+                    forwarded.request_wire_bytes,
+                    client_writer,
+                )
+
+                if forwarded.error == ForwardError.REQUEST_PARSE_FAILED:
+                    await self._send_and_close(
+                        client_writer,
+                        b"HTTP/1.1 400 Bad Request",
+                        client_id,
+                    )
+                    return
+
+                if forwarded.response is None:
+                    await self._send_and_close(
+                        client_writer,
+                        b"HTTP/1.1 502 Bad Gateway",
+                        client_id,
+                    )
+                    _close_log(
+                        f"{upstream_id} --> lstub",
+                        "failed to parse response",
+                    )
+                    return
+
+                await self._recorded_responses.put(
+                    RecordedResponse(
+                        status=forwarded.response.status,
+                        reason=forwarded.response.reason,
+                        headers=forwarded.response.headers,
+                        body=forwarded.response.body.decode(
+                            "utf-8", errors="replace"
+                        ),
+                        wire_raw_bytes=forwarded.response.wire_bytes,
+                    )
+                )
+                _close_log(f"{upstream_id} --> lstub", "response received")
+                _close_log(f"lstub --> {client_id}", "response relayed")
+                client_writer.close()
+                return
+
+            final_parsed, full_wire = await parser.continue_parse_body(
+                client_reader, remaining
             )
-        except Exception:
-            return None
+            if final_parsed is None:
+                await self._send_and_close(
+                    client_writer,
+                    b"HTTP/1.1 400 Bad Request",
+                    client_id,
+                )
+                return
 
-    async def _forward_with_100_continue(
-        self,
-        parser: AsyncRequestParser,
-        parsed: ParsedRequest,
-        header_wire: bytes,
-        remaining: bytearray,
-        client_reader: asyncio.StreamReader,
-        client_writer: asyncio.StreamWriter,
-        client_id: str,
-        upstream_reader: asyncio.StreamReader,
-        upstream_writer: asyncio.StreamWriter,
-        upstream_id: str,
-        resp_parser: AsyncMultiResponseParser,
-    ) -> bool:
-        """Handle forwarding when client waits for 100-continue.
+            body_wire = full_wire[len(header_wire) :]
+            if body_wire:
+                _wire_log(f"lstub <-- {client_id}", body_wire)
 
-        Returns True if request is complete (caller should return),
-        False to continue with normal response handling.
-        """
-        # Forward headers first.
-        _wire_log(f"{upstream_id} <-- lstub", header_wire)
-        upstream_writer.write(header_wire)
-        await upstream_writer.drain()
-
-        # Get upstream's response (100 Continue or error).
-        interim, interim_wire = await resp_parser.next_response(
-            upstream_reader, parsed.method
-        )
-        if interim is None:
-            await self._send_and_close(
-                client_writer, b"HTTP/1.1 502 Bad Gateway", client_id
-            )
-            _close_log(f"{upstream_id} --> lstub", "failed to parse response")
-            upstream_writer.close()
-            return True
-
-        # Relay interim response to client.
-        _wire_log(f"{upstream_id} --> lstub", interim_wire)
-        _wire_log(f"lstub --> {client_id}", interim_wire)
-        client_writer.write(interim_wire)
-        await client_writer.drain()
-
-        if (interim.status_code or 0) >= 200:
-            # Final response (e.g., 417). Record and close.
-            await self._record_request(parsed, header_wire, client_writer)
-            await self._record_response_and_close(
-                interim,
-                interim_wire,
-                upstream_writer,
-                client_writer,
-                upstream_id,
-                client_id,
-            )
-            return True
-
-        # Got 1xx - now read body from client.
-        final_parsed, full_wire = await parser.continue_parse_body(
-            client_reader, remaining
-        )
-        if final_parsed is None:
-            await self._send_and_close(
-                client_writer, b"HTTP/1.1 400 Bad Request", client_id
-            )
-            upstream_writer.close()
-            return True
-
-        body_wire = full_wire[len(header_wire) :]
-        if body_wire:
-            _wire_log(f"lstub <-- {client_id}", body_wire)
-            _wire_log(f"{upstream_id} <-- lstub", body_wire)
-            upstream_writer.write(body_wire)
+            await self._record_request(final_parsed, full_wire, client_writer)
+            _wire_log(f"{upstream_id} <-- lstub", full_wire)
+            upstream_writer.write(full_wire)
             await upstream_writer.drain()
 
-        await self._record_request(final_parsed, full_wire, client_writer)
-        return False
-
-    async def _forward_normal(
-        self,
-        parser: AsyncRequestParser,
-        header_wire: bytes,
-        remaining: bytearray,
-        client_reader: asyncio.StreamReader,
-        client_writer: asyncio.StreamWriter,
-        client_id: str,
-        upstream_writer: asyncio.StreamWriter,
-        upstream_id: str,
-    ) -> bool:
-        """Normal forwarding: read full body, forward complete request.
-
-        Returns True on success, False on failure.
-        """
-        final_parsed, full_wire = await parser.continue_parse_body(
-            client_reader, remaining
-        )
-        if final_parsed is None:
-            await self._send_and_close(
-                client_writer, b"HTTP/1.1 400 Bad Request", client_id
+            final_response = await self._forwarder.read_and_relay_responses(
+                upstream_reader=upstream_reader,
+                client_writer=client_writer,
+                request_method=final_parsed.method,
+                upstream_id=upstream_id,
+                client_id=client_id,
             )
+            if final_response is None:
+                await self._send_and_close(
+                    client_writer,
+                    b"HTTP/1.1 502 Bad Gateway",
+                    client_id,
+                )
+                _close_log(
+                    f"{upstream_id} --> lstub",
+                    "failed to parse response",
+                )
+                return
+
+            await self._recorded_responses.put(
+                RecordedResponse(
+                    status=final_response.status,
+                    reason=final_response.reason,
+                    headers=final_response.headers,
+                    body=final_response.body.decode("utf-8", errors="replace"),
+                    wire_raw_bytes=final_response.wire_bytes,
+                )
+            )
+            _close_log(f"{upstream_id} --> lstub", "response received")
+            _close_log(f"lstub --> {client_id}", "response relayed")
+            client_writer.close()
+        finally:
             upstream_writer.close()
-            return False
-
-        body_wire = full_wire[len(header_wire) :]
-        if body_wire:
-            _wire_log(f"lstub <-- {client_id}", body_wire)
-
-        await self._record_request(final_parsed, full_wire, client_writer)
-        _wire_log(f"{upstream_id} <-- lstub", full_wire)
-        upstream_writer.write(full_wire)
-        await upstream_writer.drain()
-        return True
 
     async def _record_request(
         self,
@@ -911,36 +586,6 @@ class AsyncTLSInterceptProxy:
         )
         await self._recorded_requests.put(request)
 
-    async def _record_response_and_close(
-        self,
-        parsed: ParsedResponse,
-        wire_bytes: bytes,
-        upstream_writer: asyncio.StreamWriter,
-        client_writer: asyncio.StreamWriter,
-        upstream_id: str,
-        client_id: str,
-    ) -> None:
-        """Record response and close connections."""
-        headers = headers_to_message(parsed.headers)
-        body_bytes = self._maybe_decompress(headers, parsed.body)
-        reason = (
-            parsed.status_text.decode("ascii", errors="replace")
-            if parsed.status_text
-            else None
-        )
-        response = RecordedResponse(
-            status=parsed.status_code or 0,
-            reason=reason,
-            headers=headers,
-            body=body_bytes.decode("utf-8", errors="replace"),
-            wire_raw_bytes=wire_bytes,
-        )
-        await self._recorded_responses.put(response)
-        _close_log(f"{upstream_id} --> lstub", "response received")
-        upstream_writer.close()
-        _close_log(f"lstub --> {client_id}", "response relayed")
-        client_writer.close()
-
     async def _send_and_close(
         self,
         writer: asyncio.StreamWriter,
@@ -961,43 +606,6 @@ class AsyncTLSInterceptProxy:
                     await writer.wait_closed()
                 except Exception:
                     pass
-
-
-@dataclass
-class UpstreamResponse:
-    """Upstream response context provided to transformers.
-
-    Contains the parsed response data for inspection and transformation.
-    The transformer can inspect any of these to decide how to transform
-    the body.
-    """
-
-    status: int
-    reason: str | None
-    headers: Message | None
-    body: bytes  # Decompressed body (raw bytes, not str)
-    wire_raw_bytes: bytes  # Original wire format
-
-
-@dataclass
-class TransformResult:
-    """Result of transforming an upstream response.
-
-    The body field contains the new body bytes to send. When override_response
-    is set, it takes precedence and completely replaces the upstream response.
-    This is useful for fault injection scenarios like returning random errors.
-    """
-
-    body: bytes | None = None  # Transformed body (None = passthrough)
-    override_response: HTTPResponse | None = None  # Replace entire response
-    delay_before: float = 0.0  # Delay before sending
-    drop_after: int | None = None  # Drop connection after N bytes
-
-
-ResponseTransformer = Callable[
-    [UpstreamResponse],
-    TransformResult | Awaitable[TransformResult],
-]
 
 
 def fault_step_transformer(
