@@ -875,7 +875,11 @@ class AsyncHTTPTestServer:
         """
         path = request.effective_path or "/"
         method = request.method or "GET"
-        version = request.http_version or "HTTP/1.1"
+        version_value = request.http_version or "1.1"
+        if version_value.startswith("HTTP/"):
+            version = version_value
+        else:
+            version = f"HTTP/{version_value}"
 
         lines = [f"{method} {path} {version}"]
 
@@ -885,12 +889,14 @@ class AsyncHTTPTestServer:
             "proxy-authenticate",
             "proxy-authorization",
         }
+        connection_tokens = self._connection_tokens_from_headers(
+            request.headers
+        )
+        remove_headers = hop_by_hop | {"connection"} | connection_tokens
         host_added = False
         if request.headers:
             for name, value in request.headers.items():
                 name_lower = name.lower()
-                if name_lower in hop_by_hop:
-                    continue
                 if name_lower == "host":
                     # Ensure Host header matches target
                     port_suffix = ""
@@ -898,6 +904,8 @@ class AsyncHTTPTestServer:
                         port_suffix = f":{uri.port}"
                     lines.append(f"Host: {uri.host}{port_suffix}")
                     host_added = True
+                elif name_lower in remove_headers:
+                    continue
                 else:
                     lines.append(f"{name}: {value}")
 
@@ -1005,7 +1013,7 @@ class AsyncHTTPTestServer:
                         )
                         await self._response_queue.put(recorded)
                         ctx.history.append((request, response))
-                        if self._should_close_connection(request):
+                        if self._should_close_connection(request, response):
                             break
                         continue
                     # Fall through to normal handling if forwarding failed
@@ -1175,12 +1183,59 @@ class AsyncHTTPTestServer:
             return body_obj
         return str(body_obj).encode("utf-8")
 
-    def _should_close_connection(self, request: HTTPRequest) -> bool:
-        """Check if client requested connection close."""
-        if not request.headers:
-            return False
-        client_conn = request.headers.get("Connection", "").lower()
-        return "close" in client_conn
+    def _parse_connection_tokens(self, value: str) -> set[str]:
+        tokens: set[str] = set()
+        for raw_token in value.split(","):
+            token = raw_token.strip().lower()
+            if token:
+                tokens.add(token)
+        return tokens
+
+    def _connection_tokens_from_headers(
+        self,
+        headers: Message | None,
+    ) -> set[str]:
+        if headers is None:
+            return set()
+        tokens: set[str] = set()
+        for value in headers.get_all("Connection", []):
+            tokens.update(self._parse_connection_tokens(value))
+        return tokens
+
+    def _connection_tokens_from_response(
+        self,
+        response: HTTPResponse,
+    ) -> set[str]:
+        for name, value in response.headers.items():
+            if name.lower() == "connection":
+                return self._parse_connection_tokens(value)
+        return set()
+
+    def _is_http10(self, request: HTTPRequest) -> bool:
+        return request.http_version == "1.0"
+
+    def _is_http11(self, request: HTTPRequest) -> bool:
+        return request.http_version == "1.1"
+
+    def _should_close_connection(
+        self,
+        request: HTTPRequest,
+        response: HTTPResponse,
+    ) -> bool:
+        """Return True if the server should close after this response."""
+        request_tokens = self._connection_tokens_from_headers(request.headers)
+        response_tokens = self._connection_tokens_from_response(response)
+
+        if "close" in response_tokens:
+            return True
+
+        if self._is_http11(request):
+            return "close" in request_tokens
+
+        if self._is_http10(request):
+            return "keep-alive" not in request_tokens
+
+        return True
 
     def _build_response_headers(
         self,
@@ -1222,7 +1277,7 @@ class AsyncHTTPTestServer:
         writer.write(status_line.encode("ascii"))
 
         body = self._normalize_body(response.body)
-        should_close = self._should_close_connection(request)
+        should_close = self._should_close_connection(request, response)
         headers = self._build_response_headers(response, body, should_close)
 
         for name, value in headers.items():
