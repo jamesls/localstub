@@ -12,6 +12,66 @@ from localstub.forward import Forwarder
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
 
 
+def _parse_response_headers(header_bytes: bytes) -> dict[bytes, bytes]:
+    headers: dict[bytes, bytes] = {}
+    for line in header_bytes.split(b"\r\n")[1:]:
+        if not line:
+            break
+        name, separator, value = line.partition(b":")
+        if not separator:
+            continue
+        headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def _is_transfer_encoding_chunked(transfer_encoding: bytes) -> bool:
+    return any(
+        token.strip().lower() == b"chunked"
+        for token in transfer_encoding.split(b",")
+    )
+
+
+async def _read_chunked_body_bytes(reader: asyncio.StreamReader) -> bytes:
+    body_bytes = bytearray()
+
+    while True:
+        size_line = await reader.readuntil(b"\r\n")
+        body_bytes.extend(size_line)
+
+        size_value = size_line[:-2].split(b";", 1)[0].strip()
+        chunk_size = int(size_value, 16) if size_value else 0
+
+        if chunk_size == 0:
+            while True:
+                trailer_line = await reader.readuntil(b"\r\n")
+                body_bytes.extend(trailer_line)
+                if trailer_line == b"\r\n":
+                    return bytes(body_bytes)
+
+        data_with_crlf = await reader.readexactly(chunk_size + 2)
+        body_bytes.extend(data_with_crlf)
+
+
+async def _read_http_response_bytes(
+    reader: asyncio.StreamReader,
+    *,
+    timeout: float = 1.0,
+) -> bytes:
+    async with asyncio.timeout(timeout):
+        header_bytes = await reader.readuntil(b"\r\n\r\n")
+        headers = _parse_response_headers(header_bytes)
+
+        transfer_encoding = headers.get(b"transfer-encoding", b"")
+        if _is_transfer_encoding_chunked(transfer_encoding):
+            return header_bytes + await _read_chunked_body_bytes(reader)
+
+        content_length = headers.get(b"content-length")
+        if content_length is None:
+            return header_bytes + await reader.read()
+
+        return header_bytes + await reader.readexactly(int(content_length))
+
+
 @pytest_asyncio.fixture
 async def upstream_server() -> AsyncHTTPTestServer:
     """Create an upstream server that the proxy will forward to."""
@@ -43,7 +103,7 @@ class TestProxyRequestRecording:
                 await writer.drain()
 
                 # Read response
-                response = await reader.read(4096)
+                response = await _read_http_response_bytes(reader)
                 assert b"200 OK" in response
             finally:
                 writer.close()
@@ -77,7 +137,7 @@ class TestProxyRequestRecording:
                 writer.write(request)
                 await writer.drain()
 
-                response = await reader.read(4096)
+                response = await _read_http_response_bytes(reader)
                 assert b"200 OK" in response
                 assert b'"handler": "users"' in response
             finally:
@@ -111,7 +171,7 @@ class TestProxyForwarding:
                     writer.write(request)
                     await writer.drain()
 
-                    response = await reader.read(4096)
+                    response = await _read_http_response_bytes(reader)
                     assert b"200 OK" in response
                     assert b'"upstream": true' in response
                 finally:
@@ -177,7 +237,7 @@ class TestProxyForwarding:
                         writer.write(request)
                         await writer.drain()
 
-                        await reader.read(4096)
+                        await _read_http_response_bytes(reader)
                         await asyncio.wait_for(
                             request_received.wait(), timeout=1.0
                         )
@@ -208,7 +268,7 @@ class TestProxyForwarding:
                 writer.write(request)
                 await writer.drain()
 
-                response = await reader.read(4096)
+                response = await _read_http_response_bytes(reader)
                 assert b"200 OK" in response
                 assert b'"mocked": true' in response
             finally:
@@ -243,7 +303,7 @@ class TestProxyForwarding:
                         writer.write(request)
                         await writer.drain()
 
-                        response = await reader.read(4096)
+                        response = await _read_http_response_bytes(reader)
                         # Should get sequence response, not upstream
                         assert f'"sequence": {i}'.encode() in response
                     finally:
@@ -274,7 +334,7 @@ class TestProxyForwarding:
                     writer.write(request)
                     await writer.drain()
 
-                    response = await reader.read(4096)
+                    response = await _read_http_response_bytes(reader)
                     # Should get local response, not forwarded
                     assert b'"local": true' in response
                 finally:
@@ -327,7 +387,7 @@ class TestRawForwarding:
                     writer.write(request)
                     await writer.drain()
 
-                    await reader.read(4096)
+                    await _read_http_response_bytes(reader)
 
                     await asyncio.wait_for(
                         request_received.wait(), timeout=1.0
@@ -388,7 +448,7 @@ class TestRawForwarding:
                     writer.write(request)
                     await writer.drain()
 
-                    response = await reader.read(4096)
+                    response = await _read_http_response_bytes(reader)
 
                     # Verify Transfer-Encoding is preserved
                     assert b"Transfer-Encoding: chunked" in response
@@ -449,7 +509,7 @@ class TestRawForwarding:
                     writer.write(request)
                     await writer.drain()
 
-                    response = await reader.read(4096)
+                    response = await _read_http_response_bytes(reader)
 
                     # Verify Content-Length is preserved
                     assert b"Content-Length: 11" in response
@@ -504,7 +564,7 @@ class TestRawForwarding:
                     await writer.drain()
 
                     # Read response to complete the request
-                    await reader.read(4096)
+                    await _read_http_response_bytes(reader)
                 finally:
                     writer.close()
                     await writer.wait_closed()
