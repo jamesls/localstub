@@ -4,10 +4,20 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from email.message import Message
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable, Iterable, Optional, Protocol, cast
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Hashable,
+    Iterable,
+    Optional,
+    Protocol,
+    cast,
+)
 
 import httpx
 
@@ -20,6 +30,12 @@ from localstub.http.request import (
 from localstub.http.response import RecordedResponse
 from localstub.http.uri import ParsedURI
 from localstub.http.utils import headers_to_message
+from localstub.throttle import (
+    Clock,
+    RequestThrottler,
+    ThrottleDecision,
+    TokenBucketThrottler,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -80,6 +96,32 @@ class HTTPResponse:
 
 
 Handler = Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]
+
+ThrottleKeyFunc = Callable[[HTTPRequest], Hashable]
+ThrottleResponseFunc = Callable[[HTTPRequest, ThrottleDecision], HTTPResponse]
+ThrottleResponse = HTTPResponse | ThrottleResponseFunc
+
+
+def _default_throttle_key(_: HTTPRequest) -> str:
+    return "global"
+
+
+def _default_throttle_response(
+    _: HTTPRequest,
+    decision: ThrottleDecision,
+) -> HTTPResponse:
+    retry_after = max(1, math.ceil(decision.retry_after_seconds))
+    return HTTPResponse.text(
+        "Too Many Requests",
+        status=429,
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+@dataclass(frozen=True)
+class ThrottleConfig:
+    throttler: RequestThrottler
+    response: ThrottleResponseFunc
 
 
 @dataclass
@@ -466,6 +508,8 @@ class AsyncHTTPTestServer:
             ImmediateTransmission()
         )
 
+        self._throttle: ThrottleConfig | None = None
+
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
         self._request_queue: asyncio.Queue[HTTPRequest] = asyncio.Queue()
@@ -674,6 +718,66 @@ class AsyncHTTPTestServer:
         self._connection_raw_bytes_sent.clear()
         # Reset response sequence index to allow reuse
         self._response_sequence_index = 0
+        if self._throttle is not None:
+            self._throttle.throttler.reset()
+
+    def set_throttle(
+        self,
+        *,
+        rate_per_second: float,
+        key: ThrottleKeyFunc | None = None,
+        burst: float | None = None,
+        response: ThrottleResponse | None = None,
+        clock: Clock | None = None,
+    ) -> None:
+        """Enable request-rate throttling for this server.
+
+        This is request-per-second throttling enforced via a token bucket.
+        When throttled, the server returns the configured throttling response.
+
+        Args:
+            rate_per_second: Token bucket refill rate (requests per second).
+            key: Function mapping a request to a hashable throttle key.
+            burst: Max burst capacity for each key bucket (must be >= 1).
+            response: Static HTTPResponse or callable response builder used
+                when a request is throttled.
+            clock: Optional clock for deterministic testing.
+        """
+        key_fn = key or _default_throttle_key
+        throttler = TokenBucketThrottler(
+            rate_per_second=rate_per_second,
+            key=key_fn,
+            burst=burst,
+            clock=clock,
+        )
+        response_fn = self._normalize_throttle_response(response)
+        self._throttle = ThrottleConfig(
+            throttler=throttler,
+            response=response_fn,
+        )
+
+    def clear_throttle(self) -> None:
+        """Disable request-rate throttling."""
+        self._throttle = None
+
+    def _normalize_throttle_response(
+        self,
+        response: ThrottleResponse | None,
+    ) -> ThrottleResponseFunc:
+        if response is None:
+            return _default_throttle_response
+        if isinstance(response, HTTPResponse):
+
+            def static(
+                _: HTTPRequest,
+                __: ThrottleDecision,
+                *,
+                _response: HTTPResponse = response,
+            ) -> HTTPResponse:
+                return _response
+
+            return static
+        return response
 
     async def start(self) -> None:
         if self._server is not None:
@@ -957,6 +1061,67 @@ class AsyncHTTPTestServer:
             upstream_tls=upstream_tls,
         )
 
+    async def _maybe_throttle_request(
+        self,
+        request: HTTPRequest,
+        recording_writer: RecordingStreamWriter,
+        ctx: ConnectionContext,
+    ) -> bool | None:
+        throttle = self._throttle
+        if throttle is None:
+            return None
+
+        decision = throttle.throttler.check(request)
+        if decision.allowed:
+            return None
+
+        response = throttle.response(request, decision)
+        wire_offset = len(recording_writer.bytes_sent)
+        should_close = await self._write_response(
+            recording_writer,
+            response,
+            request,
+        )
+        wire_bytes = recording_writer.bytes_sent[wire_offset:]
+        recorded = self._build_recorded_response(response, wire_bytes)
+        await self._response_queue.put(recorded)
+        ctx.history.append((request, response))
+        return should_close
+
+    async def _maybe_forward_proxy_raw(
+        self,
+        request: HTTPRequest,
+        recording_writer: RecordingStreamWriter,
+        ctx: ConnectionContext,
+    ) -> bool | None:
+        if not request.is_proxy_request or self._raw_forwarder is None:
+            return None
+
+        wire_offset = len(recording_writer.bytes_sent)
+        forward_result = await self._forward_proxy_raw(
+            request,
+            recording_writer,
+        )
+        if forward_result is None:
+            return None
+
+        response = HTTPResponse(
+            status=forward_result.status,
+            headers=dict(forward_result.headers.items()),
+            body=forward_result.body,
+        )
+        wire_bytes = recording_writer.bytes_sent[wire_offset:]
+        recorded = RecordedResponse(
+            status=forward_result.status,
+            reason=forward_result.reason,
+            headers=forward_result.headers,
+            body=forward_result.body.decode("utf-8", errors="replace"),
+            wire_raw_bytes=wire_bytes,
+        )
+        await self._response_queue.put(recorded)
+        ctx.history.append((request, response))
+        return self._should_close_connection(request, response)
+
     async def _handle_client(
         self,
         reader: asyncio.StreamReader,
@@ -985,38 +1150,25 @@ class AsyncHTTPTestServer:
                 self.requests.append(request)
                 await self._request_queue.put(request)
 
-                # Check for raw proxy forwarding
-                if (
-                    request.is_proxy_request
-                    and self._raw_forwarder is not None
-                ):
-                    wire_offset = len(recording_writer.bytes_sent)
-                    forward_result = await self._forward_proxy_raw(
-                        request, recording_writer
-                    )
-                    if forward_result is not None:
-                        # Build response and recorded response from result
-                        response = HTTPResponse(
-                            status=forward_result.status,
-                            headers=dict(forward_result.headers.items()),
-                            body=forward_result.body,
-                        )
-                        wire_bytes = recording_writer.bytes_sent[wire_offset:]
-                        recorded = RecordedResponse(
-                            status=forward_result.status,
-                            reason=forward_result.reason,
-                            headers=forward_result.headers,
-                            body=forward_result.body.decode(
-                                "utf-8", errors="replace"
-                            ),
-                            wire_raw_bytes=wire_bytes,
-                        )
-                        await self._response_queue.put(recorded)
-                        ctx.history.append((request, response))
-                        if self._should_close_connection(request, response):
-                            break
-                        continue
-                    # Fall through to normal handling if forwarding failed
+                should_close = await self._maybe_throttle_request(
+                    request=request,
+                    recording_writer=recording_writer,
+                    ctx=ctx,
+                )
+                if should_close is not None:
+                    if should_close:
+                        break
+                    continue
+
+                should_close = await self._maybe_forward_proxy_raw(
+                    request=request,
+                    recording_writer=recording_writer,
+                    ctx=ctx,
+                )
+                if should_close is not None:
+                    if should_close:
+                        break
+                    continue
 
                 response = await self._get_response(request)
                 wire_offset = len(recording_writer.bytes_sent)
