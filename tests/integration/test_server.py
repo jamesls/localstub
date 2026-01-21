@@ -28,6 +28,17 @@ async def client():
         yield c
 
 
+class ManualClock:
+    def __init__(self, start: float = 0.0) -> None:
+        self._now: float = start
+
+    def now(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
 @pytest.mark.asyncio
 async def test_server_receives_request_and_returns_json_response(
     server, client
@@ -44,6 +55,47 @@ async def test_server_receives_request_and_returns_json_response(
     assert server.last_request.method == "GET"
     assert server.last_request.path == "/"
     assert len(server.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_server_throttles_requests_with_configured_response(
+    server, client
+):
+    clock = ManualClock()
+    server.set_json_response({"ok": True})
+    server.set_throttle(
+        rate_per_second=1.0,
+        key=lambda request: "global",
+        clock=clock,
+        response=HTTPResponse.json({"error": "throttled"}, status=429),
+    )
+
+    response1 = await client.get(server.url)
+    response2 = await client.get(server.url)
+
+    assert response1.status_code == 200
+    assert response1.json() == {"ok": True}
+    assert response2.status_code == 429
+    assert response2.json() == {"error": "throttled"}
+    assert len(server.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_server_throttle_key_isolated_per_path(server, client):
+    clock = ManualClock()
+    server.set_throttle(
+        rate_per_second=1.0,
+        key=lambda request: request.path or "",
+        clock=clock,
+    )
+
+    response1 = await client.get(f"{server.url}a")
+    response2 = await client.get(f"{server.url}b")
+    response3 = await client.get(f"{server.url}a")
+
+    assert response1.status_code == 200
+    assert response2.status_code == 200
+    assert response3.status_code == 429
 
 
 @pytest.mark.asyncio
