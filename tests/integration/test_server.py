@@ -5,6 +5,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from localstub.http.request import HTTPRequest
 from localstub.server import (
     AsyncHTTPTestServer,
     HTTPRequestHeaders,
@@ -1808,3 +1809,50 @@ async def test_on_headers_received_multiple_informational_responses():
         assert b"Content-Length" not in processing_headers
         assert b"HTTP/1.1 100 Continue" in conn_bytes
         assert b"HTTP/1.1 102 Processing" in conn_bytes
+
+
+@pytest.mark.asyncio
+async def test_get_request_timestamp(server, client):
+    server.set_json_response({"ok": True})
+    await client.get(server.url)
+    timestamp = server.get_request_timestamp(server.requests[0])
+    assert timestamp > 0
+
+
+@pytest.mark.asyncio
+async def test_get_request_timestamp_last_request(server, client):
+    server.set_json_response({"ok": True})
+    await client.get(server.url)
+    timestamp = server.get_request_timestamp(server.last_request)
+    assert timestamp > 0
+
+
+@pytest.mark.asyncio
+async def test_request_timestamps_with_manual_clock():
+    clock = ManualClock(start=1000.0)
+    async with AsyncHTTPTestServer(clock=clock) as server:
+        server.set_json_response({"ok": True})
+        async with httpx.AsyncClient() as client:
+            await client.get(server.url)
+            clock.advance(0.5)
+            await client.get(server.url)
+
+        assert server.get_request_timestamp(server.requests[0]) == 1000.0
+        assert server.get_request_timestamp(server.requests[1]) == 1000.5
+
+
+@pytest.mark.asyncio
+async def test_get_request_timestamp_not_found(server):
+    fake_request = HTTPRequest(method="GET", path="/fake")
+    with pytest.raises(ValueError, match="not found"):
+        server.get_request_timestamp(fake_request)
+
+
+@pytest.mark.asyncio
+async def test_clear_requests_clears_timestamps(server, client):
+    server.set_json_response({"ok": True})
+    await client.get(server.url)
+    request = server.requests[0]
+    server.clear_requests()
+    with pytest.raises(ValueError, match="not found"):
+        server.get_request_timestamp(request)
