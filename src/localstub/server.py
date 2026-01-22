@@ -32,6 +32,7 @@ from localstub.http.uri import ParsedURI
 from localstub.http.utils import headers_to_message
 from localstub.throttle import (
     Clock,
+    MonotonicClock,
     RequestThrottler,
     ThrottleDecision,
     TokenBucketThrottler,
@@ -485,6 +486,7 @@ class AsyncHTTPTestServer:
         on_headers_received: OnHeadersReceived | None = None,
         proxy_forwarder: httpx.AsyncClient | None = None,
         raw_forwarder: Forwarder | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -509,6 +511,9 @@ class AsyncHTTPTestServer:
         )
 
         self._throttle: ThrottleConfig | None = None
+
+        self._clock: Clock = clock or MonotonicClock()
+        self._request_timestamps: dict[int, float] = {}
 
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
@@ -687,6 +692,25 @@ class AsyncHTTPTestServer:
         buf = self._connection_raw_bytes_sent.get(client)
         return bytes(buf) if buf is not None else None
 
+    def get_request_timestamp(self, request: HTTPRequest) -> float:
+        """Get the reception timestamp for a request.
+
+        Args:
+            request: The HTTPRequest object to look up.
+
+        Returns:
+            Monotonic timestamp when the request was received.
+
+        Raises:
+            ValueError: If the request is not found.
+        """
+        try:
+            return self._request_timestamps[id(request)]
+        except KeyError:
+            raise ValueError(
+                "Request not found in recorded requests"
+            ) from None
+
     def clear_requests(self) -> None:
         """Clear all recorded request state.
 
@@ -712,6 +736,7 @@ class AsyncHTTPTestServer:
         """
         self.last_request = None
         self.requests = []
+        self._request_timestamps = {}
         self._request_queue = asyncio.Queue()
         self._response_queue = asyncio.Queue()
         self._connection_raw_bytes_received.clear()
@@ -1148,6 +1173,7 @@ class AsyncHTTPTestServer:
 
                 self.last_request = request
                 self.requests.append(request)
+                self._request_timestamps[id(request)] = self._clock.now()
                 await self._request_queue.put(request)
 
                 should_close = await self._maybe_throttle_request(
