@@ -1,124 +1,185 @@
 from __future__ import annotations
 
 import json
-import pytest
 from pathlib import Path
+from typing import Any
 
-from localstub.config import (
-    ResponseConfig,
-    load_config,
-    _parse_config,
-    _parse_response_spec,
-)
+import pytest
+
+from localstub.config import ResponseConfig, load_config
 from localstub.server import HTTPResponse
 
 
+def write_config_file(tmp_path: Path, data: dict[str, Any]) -> Path:
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(data), encoding="utf-8")
+    return config_file
+
+
 class TestParseResponseSpec:
-    def test_parse_json_response_with_body_and_status(self) -> None:
+    def test_parse_json_response_with_body_and_status(
+        self, tmp_path: Path
+    ) -> None:
         spec = {"type": "json", "body": {"key": "value"}, "status": 201}
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.status == 201
         assert response.headers["Content-Type"] == "application/json"
         assert json.loads(response.body) == {"key": "value"}
 
-    def test_parse_json_response_uses_defaults(self) -> None:
+    def test_parse_json_response_uses_defaults(self, tmp_path: Path) -> None:
         spec = {"body": {"data": 123}}
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.status == 200
         assert response.headers["Content-Type"] == "application/json"
 
-    def test_parse_json_response_with_custom_headers(self) -> None:
+    def test_parse_json_response_with_custom_headers(
+        self, tmp_path: Path
+    ) -> None:
         spec = {
             "type": "json",
             "body": {},
             "headers": {"X-Custom": "test"},
         }
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.headers["X-Custom"] == "test"
         assert response.headers["Content-Type"] == "application/json"
 
-    def test_parse_text_response_with_body(self) -> None:
+    def test_parse_text_response_with_body(self, tmp_path: Path) -> None:
         spec = {"type": "text", "body": "hello world", "status": 200}
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.status == 200
         assert response.headers["Content-Type"] == "text/plain; charset=utf-8"
         assert response.body == b"hello world"
 
-    def test_parse_text_response_with_none_body_returns_empty(self) -> None:
+    def test_parse_text_response_with_none_body_returns_empty(
+        self, tmp_path: Path
+    ) -> None:
         spec = {"type": "text"}
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.body == b""
 
-    def test_parse_text_response_converts_non_string_to_string(self) -> None:
+    def test_parse_text_response_converts_non_string_to_string(
+        self, tmp_path: Path
+    ) -> None:
         spec = {"type": "text", "body": 12345}
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.body == b"12345"
 
-    def test_parse_raw_response_with_utf8_body(self) -> None:
+    def test_parse_raw_response_with_utf8_body(self, tmp_path: Path) -> None:
         spec = {"type": "raw", "body": "raw data", "encoding": "utf-8"}
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.body == b"raw data"
 
-    def test_parse_raw_response_with_base64_body(self) -> None:
+    def test_parse_raw_response_with_base64_body(self, tmp_path: Path) -> None:
         # "hello" in base64
         spec = {"type": "raw", "body": "aGVsbG8=", "encoding": "base64"}
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.body == b"hello"
 
-    def test_parse_raw_response_with_none_body_returns_empty(self) -> None:
+    def test_parse_raw_response_with_none_body_returns_empty(
+        self, tmp_path: Path
+    ) -> None:
         spec = {"type": "raw"}
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.body == b""
 
-    def test_parse_raw_response_with_custom_headers(self) -> None:
+    def test_parse_raw_response_with_custom_headers(
+        self, tmp_path: Path
+    ) -> None:
         spec = {
             "type": "raw",
             "body": "data",
             "headers": {"Content-Type": "application/octet-stream"},
         }
-        response = _parse_response_spec(spec)
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
 
         assert response.headers["Content-Type"] == "application/octet-stream"
 
-    def test_parse_raw_response_base64_requires_string(self) -> None:
+    def test_parse_raw_response_base64_requires_string(
+        self, tmp_path: Path
+    ) -> None:
         spec = {"type": "raw", "body": 123, "encoding": "base64"}
+        config_file = write_config_file(tmp_path, {"response": spec})
 
         with pytest.raises(ValueError, match="base64 body must be a string"):
-            _parse_response_spec(spec)
+            load_config(config_file)
 
-    def test_parse_unknown_type_raises_error(self) -> None:
+    def test_parse_unknown_type_raises_error(self, tmp_path: Path) -> None:
         spec = {"type": "unknown", "body": "data"}
+        config_file = write_config_file(tmp_path, {"response": spec})
 
         with pytest.raises(ValueError, match="Unknown response type"):
-            _parse_response_spec(spec)
+            load_config(config_file)
 
 
 class TestParseConfig:
-    def test_parse_config_with_single_response(self) -> None:
+    def test_parse_config_with_single_response(self, tmp_path: Path) -> None:
         data = {"response": {"type": "json", "body": {"ok": True}}}
-        config = _parse_config(data)
+        config_file = write_config_file(tmp_path, data)
+        config = load_config(config_file)
 
         assert config.single_response is not None
         assert config.response_sequence is None
         assert config.single_response.status == 200
 
-    def test_parse_config_with_response_sequence(self) -> None:
+    def test_parse_config_with_response_sequence(self, tmp_path: Path) -> None:
         data = {
             "responses": [
                 {"type": "json", "body": {"error": "fail"}, "status": 500},
                 {"type": "json", "body": {"ok": True}, "status": 200},
             ]
         }
-        config = _parse_config(data)
+        config_file = write_config_file(tmp_path, data)
+        config = load_config(config_file)
 
         assert config.single_response is None
         assert config.response_sequence is not None
@@ -126,18 +187,20 @@ class TestParseConfig:
         assert config.response_sequence[0].status == 500
         assert config.response_sequence[1].status == 200
 
-    def test_parse_config_missing_keys_raises_error(self) -> None:
+    def test_parse_config_missing_keys_raises_error(
+        self, tmp_path: Path
+    ) -> None:
         data = {"invalid": "data"}
+        config_file = write_config_file(tmp_path, data)
 
         with pytest.raises(ValueError, match="must have either"):
-            _parse_config(data)
+            load_config(config_file)
 
 
 class TestLoadConfig:
     def test_load_config_from_valid_file(self, tmp_path: Path) -> None:
-        config_file = tmp_path / "config.json"
-        config_file.write_text(
-            json.dumps({"response": {"type": "text", "body": "test"}})
+        config_file = write_config_file(
+            tmp_path, {"response": {"type": "text", "body": "test"}}
         )
 
         config = load_config(config_file)
@@ -146,14 +209,14 @@ class TestLoadConfig:
         assert config.single_response.body == b"test"
 
     def test_load_config_from_sequence_file(self, tmp_path: Path) -> None:
-        config_file = tmp_path / "config.json"
-        config_file.write_text(
-            json.dumps({
+        config_file = write_config_file(
+            tmp_path,
+            {
                 "responses": [
                     {"status": 503},
                     {"status": 200, "body": {"success": True}},
                 ]
-            })
+            },
         )
 
         config = load_config(config_file)
