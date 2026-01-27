@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import signal
 from datetime import datetime, timezone
@@ -17,10 +16,12 @@ import httpx
 from localstub.ca import TLSProxyCA
 from localstub.config import load_config
 from localstub.console import console
+from localstub.http.exchange import RecordedExchange
 from localstub.http.request import HTTPRequest
 from localstub.http.response import RecordedResponse
 from localstub.server import AsyncHTTPTestServer
 from localstub.tlsproxy import AsyncTLSInterceptProxy
+from localstub.traffic_jsonl import JsonlTrafficWriter
 
 DEFAULT_PORT = 8888
 
@@ -299,6 +300,9 @@ async def process_traffic(
     awaiting ``next_response()`` as "no response" and log the request with
     ``response=None`` so traffic recording continues.
     """
+    jsonl: JsonlTrafficWriter | None = (
+        JsonlTrafficWriter(output_file) if output_file else None
+    )
     while not shutdown_event.is_set():
         try:
             request = await proxy.next_request(timeout=0.1)
@@ -311,6 +315,7 @@ async def process_traffic(
             "green",
         )
 
+        request_timestamp = datetime.now(timezone.utc)
         response: RecordedResponse | None = None
         timeouts = 0
         while not shutdown_event.is_set() and response is None:
@@ -337,10 +342,17 @@ async def process_traffic(
                 status=response.status,
             )
 
-        if output_file:
-            record = build_record(request, response)
-            output_file.write(json.dumps(record) + "\n")
-            output_file.flush()
+        if jsonl is not None:
+            response_timestamp = (
+                datetime.now(timezone.utc) if response is not None else None
+            )
+            exchange = RecordedExchange(
+                request=request,
+                response=response,
+                request_timestamp=request_timestamp,
+                response_timestamp=response_timestamp,
+            )
+            jsonl.write_exchange(exchange)
 
 
 async def process_http_proxy_traffic(
@@ -352,6 +364,9 @@ async def process_http_proxy_traffic(
     response_max_timeouts: int = 3,
 ) -> None:
     """Poll for recorded requests/responses (HTTP forward proxy mode)."""
+    jsonl: JsonlTrafficWriter | None = (
+        JsonlTrafficWriter(output_file) if output_file else None
+    )
     while not shutdown_event.is_set():
         try:
             request = await server.next_request(timeout=0.1)
@@ -390,79 +405,28 @@ async def process_http_proxy_traffic(
                 status=response.status,
             )
 
-        if output_file:
-            record = build_http_proxy_record(request, response)
-            output_file.write(json.dumps(record) + "\n")
-            output_file.flush()
+        if jsonl is not None:
+            exchange = _find_exchange(server, request, response)
+            if exchange is None:
+                exchange = RecordedExchange(
+                    request=request,
+                    response=response,
+                    request_timestamp=datetime.now(timezone.utc),
+                    response_timestamp=(
+                        datetime.now(timezone.utc)
+                        if response is not None
+                        else None
+                    ),
+                )
+            jsonl.write_exchange(exchange)
 
 
-def build_http_proxy_record(
+def _find_exchange(
+    server: AsyncHTTPTestServer,
     request: HTTPRequest,
     response: RecordedResponse | None,
-) -> dict[str, object]:
-    """Build a JSON-serializable record from an HTTP proxy request/response."""
-    request_dict: dict[str, object] = {
-        "method": request.method,
-        "path": request.path,
-        "body": request.body,
-    }
-    if request.headers:
-        request_dict["headers"] = dict(request.headers.items())
-
-    # Add proxy-specific fields
-    if request.is_proxy_request and request.target_uri:
-        request_dict["target_host"] = request.target_uri.host
-        request_dict["target_port"] = request.target_uri.port
-        request_dict["effective_path"] = request.effective_path
-
-    record: dict[str, object] = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "request": request_dict,
-    }
-
-    if response:
-        response_dict: dict[str, object] = {
-            "status": response.status,
-            "reason": response.reason,
-            "body": response.body,
-        }
-        if response.headers:
-            response_dict["headers"] = dict(response.headers.items())
-        record["response"] = response_dict
-    else:
-        record["response"] = None
-
-    return record
-
-
-def build_record(
-    request: HTTPRequest,
-    response: RecordedResponse | None,
-) -> dict[str, object]:
-    """Build a JSON-serializable record from request/response."""
-    request_dict: dict[str, object] = {
-        "method": request.method,
-        "path": request.path,
-        "body": request.body,
-    }
-    if request.headers:
-        request_dict["headers"] = dict(request.headers.items())
-
-    record: dict[str, object] = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "request": request_dict,
-    }
-
-    if response:
-        response_dict: dict[str, object] = {
-            "status": response.status,
-            "reason": response.reason,
-            "body": response.body,
-        }
-        if response.headers:
-            response_dict["headers"] = dict(response.headers.items())
-        record["response"] = response_dict
-    else:
-        record["response"] = None
-
-    return record
+) -> RecordedExchange | None:
+    for exchange in reversed(server.exchanges):
+        if exchange.request is request and exchange.response is response:
+            return exchange
+    return None
