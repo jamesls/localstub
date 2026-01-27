@@ -1,5 +1,6 @@
 import asyncio
 import time
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -40,6 +41,17 @@ class ManualClock:
         self._now += seconds
 
 
+class ManualTimestampProvider:
+    def __init__(self, timestamps: list[datetime]) -> None:
+        self._timestamps = timestamps
+        self._index = 0
+
+    def now(self) -> datetime:
+        ts = self._timestamps[self._index]
+        self._index += 1
+        return ts
+
+
 @pytest.mark.asyncio
 async def test_server_receives_request_and_returns_json_response(
     server, client
@@ -56,6 +68,15 @@ async def test_server_receives_request_and_returns_json_response(
     assert server.last_request.method == "GET"
     assert server.last_request.path == "/"
     assert len(server.requests) == 1
+    assert len(server.responses) == 1
+    assert server.last_response is server.responses[0]
+    assert len(server.exchanges) == 1
+    assert server.last_exchange is server.exchanges[0]
+    assert server.exchanges[0].request is server.requests[0]
+    assert server.exchanges[0].response is server.responses[0]
+    assert server.exchanges[0].request_timestamp.tzinfo is not None
+    assert server.exchanges[0].response_timestamp is not None
+    assert server.exchanges[0].response_timestamp.tzinfo is not None
 
 
 @pytest.mark.asyncio
@@ -216,15 +237,23 @@ async def test_clear_requests_resets_state(server, client):
 
     # Verify requests were recorded
     assert len(server.requests) == 2
+    assert len(server.responses) == 2
+    assert len(server.exchanges) == 2
     assert server.last_request is not None
     assert server.last_request.path == "/second"
+    assert server.last_response is not None
+    assert server.last_exchange is not None
 
     # Clear state
     server.clear_requests()
 
     # Verify state is cleared
     assert len(server.requests) == 0
+    assert len(server.responses) == 0
+    assert len(server.exchanges) == 0
     assert server.last_request is None
+    assert server.last_response is None
+    assert server.last_exchange is None
 
 
 @pytest.mark.asyncio
@@ -1809,6 +1838,29 @@ async def test_on_headers_received_multiple_informational_responses():
         assert b"Content-Length" not in processing_headers
         assert b"HTTP/1.1 100 Continue" in conn_bytes
         assert b"HTTP/1.1 102 Processing" in conn_bytes
+
+
+@pytest.mark.asyncio
+async def test_exchange_timestamps_use_timestamp_provider():
+    timestamps = [
+        datetime(2026, 1, 27, 12, 0, 0, tzinfo=timezone.utc),
+        datetime(2026, 1, 27, 12, 0, 1, tzinfo=timezone.utc),
+        datetime(2026, 1, 27, 12, 0, 2, tzinfo=timezone.utc),
+        datetime(2026, 1, 27, 12, 0, 3, tzinfo=timezone.utc),
+    ]
+    provider = ManualTimestampProvider(timestamps)
+
+    async with AsyncHTTPTestServer(timestamp_provider=provider) as server:
+        server.set_json_response({"ok": True})
+        async with httpx.AsyncClient() as client:
+            await client.get(server.url)
+            await client.get(server.url)
+
+    assert len(server.exchanges) == 2
+    assert server.exchanges[0].request_timestamp == timestamps[0]
+    assert server.exchanges[0].response_timestamp == timestamps[1]
+    assert server.exchanges[1].request_timestamp == timestamps[2]
+    assert server.exchanges[1].response_timestamp == timestamps[3]
 
 
 @pytest.mark.asyncio

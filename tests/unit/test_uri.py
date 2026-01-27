@@ -61,7 +61,7 @@ class TestParseAbsoluteUri:
         result = parse_absolute_uri("http://example.com/path")
         assert result is not None
         with pytest.raises(AttributeError):
-            result.scheme = "https"  # type: ignore[misc]
+            result.scheme = "https"
 
 
 class TestHTTPRequestProxyProperties:

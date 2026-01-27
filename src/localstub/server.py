@@ -6,6 +6,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from email.message import Message
 from http import HTTPStatus
 from typing import (
@@ -22,6 +23,7 @@ from typing import (
 import httpx
 
 from localstub.forward import Forwarder, ForwardResult
+from localstub.http.exchange import RecordedExchange
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
@@ -39,6 +41,15 @@ from localstub.throttle import (
 )
 
 LOG = logging.getLogger(__name__)
+
+
+class TimestampProvider(Protocol):
+    def now(self) -> datetime: ...
+
+
+class SystemTimestampProvider:
+    def now(self) -> datetime:
+        return datetime.now(timezone.utc)
 
 
 @dataclass
@@ -408,6 +419,13 @@ class FaultyTransmission(TransmissionStrategy):
             pass
 
 
+@dataclass(frozen=True)
+class _PreparedResponse:
+    response: HTTPResponse
+    recorded_response: RecordedResponse
+    should_close: bool
+
+
 @dataclass
 class ConnectionContext:
     """Per-connection tracking container.
@@ -487,6 +505,7 @@ class AsyncHTTPTestServer:
         proxy_forwarder: httpx.AsyncClient | None = None,
         raw_forwarder: Forwarder | None = None,
         clock: Clock | None = None,
+        timestamp_provider: TimestampProvider | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -514,11 +533,20 @@ class AsyncHTTPTestServer:
 
         self._clock: Clock = clock or MonotonicClock()
         self._request_timestamps: dict[int, float] = {}
+        self._timestamp_provider = (
+            timestamp_provider or SystemTimestampProvider()
+        )
 
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
         self._request_queue: asyncio.Queue[HTTPRequest] = asyncio.Queue()
         self._response_queue: asyncio.Queue[RecordedResponse] = asyncio.Queue()
+
+        self.last_response: RecordedResponse | None = None
+        self.responses: list[RecordedResponse] = []
+
+        self.last_exchange: RecordedExchange | None = None
+        self.exchanges: list[RecordedExchange] = []
 
         # Connection-level raw bytes tracking (keyed by client address)
         self._connection_raw_bytes_received: dict[
@@ -739,6 +767,10 @@ class AsyncHTTPTestServer:
         self._request_timestamps = {}
         self._request_queue = asyncio.Queue()
         self._response_queue = asyncio.Queue()
+        self.last_response = None
+        self.responses = []
+        self.last_exchange = None
+        self.exchanges = []
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
         # Reset response sequence index to allow reuse
@@ -847,10 +879,33 @@ class AsyncHTTPTestServer:
     ) -> RecordedResponse:
         """Await and return the next response sent by this server."""
         if timeout is None:
-            return await self._response_queue.get()
-        return await asyncio.wait_for(
-            self._response_queue.get(), timeout=timeout
+            response = await self._response_queue.get()
+        else:
+            response = await asyncio.wait_for(
+                self._response_queue.get(), timeout=timeout
+            )
+        self.last_response = response
+        return response
+
+    def _record_exchange(
+        self,
+        *,
+        request: HTTPRequest,
+        response: RecordedResponse | None,
+        request_timestamp: datetime,
+        response_timestamp: datetime | None,
+    ) -> None:
+        exchange = RecordedExchange(
+            request=request,
+            response=response,
+            request_timestamp=request_timestamp,
+            response_timestamp=response_timestamp,
         )
+        self.exchanges.append(exchange)
+        self.last_exchange = exchange
+        if response is not None:
+            self.responses.append(response)
+            self.last_response = response
 
     async def handle_http_connection(
         self,
@@ -1090,8 +1145,7 @@ class AsyncHTTPTestServer:
         self,
         request: HTTPRequest,
         recording_writer: RecordingStreamWriter,
-        ctx: ConnectionContext,
-    ) -> bool | None:
+    ) -> _PreparedResponse | None:
         throttle = self._throttle
         if throttle is None:
             return None
@@ -1109,16 +1163,17 @@ class AsyncHTTPTestServer:
         )
         wire_bytes = recording_writer.bytes_sent[wire_offset:]
         recorded = self._build_recorded_response(response, wire_bytes)
-        await self._response_queue.put(recorded)
-        ctx.history.append((request, response))
-        return should_close
+        return _PreparedResponse(
+            response=response,
+            recorded_response=recorded,
+            should_close=should_close,
+        )
 
     async def _maybe_forward_proxy_raw(
         self,
         request: HTTPRequest,
         recording_writer: RecordingStreamWriter,
-        ctx: ConnectionContext,
-    ) -> bool | None:
+    ) -> _PreparedResponse | None:
         if not request.is_proxy_request or self._raw_forwarder is None:
             return None
 
@@ -1143,9 +1198,74 @@ class AsyncHTTPTestServer:
             body=forward_result.body.decode("utf-8", errors="replace"),
             wire_raw_bytes=wire_bytes,
         )
-        await self._response_queue.put(recorded)
-        ctx.history.append((request, response))
-        return self._should_close_connection(request, response)
+        return _PreparedResponse(
+            response=response,
+            recorded_response=recorded,
+            should_close=self._should_close_connection(request, response),
+        )
+
+    async def _record_request(self, request: HTTPRequest) -> datetime:
+        self.last_request = request
+        self.requests.append(request)
+        self._request_timestamps[id(request)] = self._clock.now()
+        request_timestamp = self._timestamp_provider.now()
+        await self._request_queue.put(request)
+        return request_timestamp
+
+    async def _handle_request(
+        self,
+        *,
+        request: HTTPRequest,
+        request_timestamp: datetime,
+        recording_writer: RecordingStreamWriter,
+        ctx: ConnectionContext,
+    ) -> bool:
+        exchange_recorded = False
+        try:
+            prepared = await self._maybe_throttle_request(
+                request=request,
+                recording_writer=recording_writer,
+            )
+            if prepared is None:
+                prepared = await self._maybe_forward_proxy_raw(
+                    request=request,
+                    recording_writer=recording_writer,
+                )
+
+            if prepared is None:
+                response = await self._get_response(request)
+                wire_offset = len(recording_writer.bytes_sent)
+                should_close = await self._write_response(
+                    recording_writer, response, request
+                )
+                wire_bytes = recording_writer.bytes_sent[wire_offset:]
+                recorded = self._build_recorded_response(response, wire_bytes)
+                prepared = _PreparedResponse(
+                    response=response,
+                    recorded_response=recorded,
+                    should_close=should_close,
+                )
+
+            response_timestamp = self._timestamp_provider.now()
+            self._record_exchange(
+                request=request,
+                response=prepared.recorded_response,
+                request_timestamp=request_timestamp,
+                response_timestamp=response_timestamp,
+            )
+            exchange_recorded = True
+            await self._response_queue.put(prepared.recorded_response)
+            ctx.history.append((request, prepared.response))
+            return prepared.should_close
+        except Exception:
+            if not exchange_recorded:
+                self._record_exchange(
+                    request=request,
+                    response=None,
+                    request_timestamp=request_timestamp,
+                    response_timestamp=None,
+                )
+            raise
 
     async def _handle_client(
         self,
@@ -1162,7 +1282,6 @@ class AsyncHTTPTestServer:
             raw_received_total=conn_recv,
             raw_sent_total=conn_sent,
         )
-
         try:
             while True:
                 request = await self._read_request(
@@ -1170,45 +1289,13 @@ class AsyncHTTPTestServer:
                 )
                 if request is None:
                     break
-
-                self.last_request = request
-                self.requests.append(request)
-                self._request_timestamps[id(request)] = self._clock.now()
-                await self._request_queue.put(request)
-
-                should_close = await self._maybe_throttle_request(
+                request_timestamp = await self._record_request(request)
+                should_close = await self._handle_request(
                     request=request,
+                    request_timestamp=request_timestamp,
                     recording_writer=recording_writer,
                     ctx=ctx,
                 )
-                if should_close is not None:
-                    if should_close:
-                        break
-                    continue
-
-                should_close = await self._maybe_forward_proxy_raw(
-                    request=request,
-                    recording_writer=recording_writer,
-                    ctx=ctx,
-                )
-                if should_close is not None:
-                    if should_close:
-                        break
-                    continue
-
-                response = await self._get_response(request)
-                wire_offset = len(recording_writer.bytes_sent)
-                should_close = await self._write_response(
-                    recording_writer, response, request
-                )
-                wire_bytes = recording_writer.bytes_sent[wire_offset:]
-
-                # Record response for async consumers
-                recorded = self._build_recorded_response(response, wire_bytes)
-                await self._response_queue.put(recorded)
-
-                # Keep a lightweight per-connection history for debugging
-                ctx.history.append((request, response))
 
                 if should_close:
                     break

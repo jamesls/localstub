@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import base64
 import asyncio
 import io
-import pytest
+import json
+from datetime import datetime, timezone
 from email.message import Message
 from pathlib import Path
 
+import httpx
+import pytest
+
 from localstub.cli import (
     DEFAULT_PORT,
-    build_record,
     parse_args,
+    process_http_proxy_traffic,
     process_traffic,
 )
-from localstub.server import HTTPRequest
+from localstub.http.request import HTTPRequest
+from localstub.server import AsyncHTTPTestServer, HTTPResponse
 from localstub.tlsproxy import RecordedResponse
 
 
@@ -90,116 +96,17 @@ class TestParseArgs:
         assert args.config_file == Path("/tmp/stub.json")
 
 
-class TestBuildRecord:
-    def test_build_record_with_request_only_sets_response_to_none(
-        self,
-    ) -> None:
-        headers = Message()
-        headers["Host"] = "example.com"
-        request = HTTPRequest(
-            method="GET",
-            path="/test",
-            headers=headers,
-            body="",
-            wire_raw_bytes=b"GET /test HTTP/1.1\r\n\r\n",
-            client=("127.0.0.1", 12345),
-        )
-        record = build_record(request, None)
-
-        assert "timestamp" in record
-        assert record["request"]["method"] == "GET"
-        assert record["request"]["path"] == "/test"
-        assert record["request"]["headers"] == {"Host": "example.com"}
-        assert record["response"] is None
-
-    def test_build_record_with_request_and_response_includes_both(
-        self,
-    ) -> None:
-        req_headers = Message()
-        req_headers["Host"] = "example.com"
-        request = HTTPRequest(
-            method="POST",
-            path="/api",
-            headers=req_headers,
-            body='{"key": "value"}',
-            wire_raw_bytes=b"POST /api HTTP/1.1\r\n\r\n",
-            client=("127.0.0.1", 12345),
-        )
-
-        resp_headers = Message()
-        resp_headers["Content-Type"] = "application/json"
-        response = RecordedResponse(
-            status=200,
-            reason="OK",
-            headers=resp_headers,
-            body='{"result": "success"}',
-            wire_raw_bytes=b"HTTP/1.1 200 OK\r\n\r\n",
-        )
-
-        record = build_record(request, response)
-
-        assert "timestamp" in record
-        assert record["request"]["method"] == "POST"
-        assert record["request"]["path"] == "/api"
-        assert record["request"]["body"] == '{"key": "value"}'
-        assert record["response"]["status"] == 200
-        assert record["response"]["reason"] == "OK"
-        assert record["response"]["body"] == '{"result": "success"}'
-        assert record["response"]["headers"] == {
-            "Content-Type": "application/json"
-        }
-
-    def test_build_record_with_none_headers_omits_headers_key(self) -> None:
-        request = HTTPRequest(
-            method="GET",
-            path="/",
-            headers=None,
-            body="",
-            wire_raw_bytes=b"GET / HTTP/1.1\r\n\r\n",
-            client=("127.0.0.1", 12345),
-        )
-        record = build_record(request, None)
-
-        assert record["request"]["method"] == "GET"
-        assert "headers" not in record["request"]
-
-    def test_build_record_with_response_none_headers_omits_headers_key(
-        self,
-    ) -> None:
-        req_headers = Message()
-        request = HTTPRequest(
-            method="GET",
-            path="/",
-            headers=req_headers,
-            body="",
-            wire_raw_bytes=b"GET / HTTP/1.1\r\n\r\n",
-            client=("127.0.0.1", 12345),
-        )
-        response = RecordedResponse(
-            status=204,
-            reason="No Content",
-            headers=None,
-            body=None,
-            wire_raw_bytes=b"HTTP/1.1 204 No Content\r\n\r\n",
-        )
-
-        record = build_record(request, response)
-
-        assert record["response"]["status"] == 204
-        assert "headers" not in record["response"]
-
-
 class TestProcessTrafficNoResponse:
     @pytest.mark.asyncio
     async def test_logs_request_when_no_recorded_response(self) -> None:
         # Prepare a single recorded request that will have no corresponding
         # recorded response from the proxy.
-        req_headers = Message()
-        req_headers["Host"] = "example.com"
+        headers = Message()
+        headers["Host"] = "example.com"
         request = HTTPRequest(
             method="GET",
             path="/no-upstream",
-            headers=req_headers,
+            headers=headers,
             body="",
             wire_raw_bytes=b"GET /no-upstream HTTP/1.1\r\n\r\n",
             client=("127.0.0.1", 55555),
@@ -211,7 +118,7 @@ class TestProcessTrafficNoResponse:
 
             async def next_request(
                 self, timeout: float | None = None
-            ) -> HTTPRequest:  # type: ignore[override]
+            ) -> HTTPRequest:
                 if not self._given:
                     self._given = True
                     return request
@@ -219,7 +126,7 @@ class TestProcessTrafficNoResponse:
                 await asyncio.sleep(0)
                 raise asyncio.TimeoutError()
 
-            async def next_response(  # type: ignore[override]
+            async def next_response(
                 self, timeout: float | None = None
             ) -> RecordedResponse:
                 # Never produce a response; always time out quickly
@@ -234,7 +141,7 @@ class TestProcessTrafficNoResponse:
         # timeouts so the test completes quickly.
         task = asyncio.create_task(
             process_traffic(
-                proxy,  # type: ignore[arg-type]
+                proxy,
                 out,
                 shutdown,
                 response_timeout=0.01,
@@ -251,6 +158,69 @@ class TestProcessTrafficNoResponse:
         lines = [line for line in out.getvalue().splitlines() if line.strip()]
         assert len(lines) == 1
 
-        record = __import__("json").loads(lines[0])
+        record = json.loads(lines[0])
         assert record["request"]["path"] == "/no-upstream"
+        assert record["response_timestamp"] is None
+        assert record["response"] is None
+        assert record["request"]["headers"] == {"Host": "example.com"}
+        assert record["request"]["client"] == {
+            "host": "127.0.0.1",
+            "port": 55555,
+        }
+        assert (
+            base64.b64decode(record["request"]["raw_wire_bytes"])
+            == b"GET /no-upstream HTTP/1.1\r\n\r\n"
+        )
+
+
+class TestProcessHttpProxyTrafficNoResponse:
+    @pytest.mark.asyncio
+    async def test_uses_recorded_timestamp_when_response_missing(
+        self,
+    ) -> None:
+        fixed_timestamp = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+        class _FixedTimestampProvider:
+            def __init__(self, ts: datetime) -> None:
+                self._ts = ts
+
+            def now(self) -> datetime:
+                return self._ts
+
+        def _boom_handler(_: HTTPRequest) -> HTTPResponse:
+            raise RuntimeError("boom")
+
+        out = io.StringIO()
+        shutdown = asyncio.Event()
+
+        async with AsyncHTTPTestServer(
+            timestamp_provider=_FixedTimestampProvider(fixed_timestamp),
+        ) as server:
+            server.handler = _boom_handler
+
+            task = asyncio.create_task(
+                process_http_proxy_traffic(
+                    server,
+                    out,
+                    shutdown,
+                    response_timeout=0.01,
+                    response_max_timeouts=2,
+                )
+            )
+
+            async with httpx.AsyncClient(timeout=0.2) as client:
+                with pytest.raises(httpx.HTTPError):
+                    await client.get(f"{server.url}boom")
+
+            await asyncio.sleep(0.05)
+            shutdown.set()
+            await asyncio.wait_for(task, timeout=1.0)
+
+        lines = [line for line in out.getvalue().splitlines() if line.strip()]
+        assert len(lines) == 1
+
+        record = json.loads(lines[0])
+        assert record["request"]["path"] == "/boom"
+        assert record["timestamp"] == fixed_timestamp.isoformat()
+        assert record["response_timestamp"] is None
         assert record["response"] is None
