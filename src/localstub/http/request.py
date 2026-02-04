@@ -31,13 +31,13 @@ class HTTPRequest:
       - body bytes (including chunk framing for chunked requests)
     """
 
-    method: str | None = None
-    path: str | None = None
-    http_version: str | None = None
-    headers: Message | None = None
-    body: str | None = None
-    body_bytes: bytes | None = None
-    wire_raw_bytes: bytes | None = None
+    method: str
+    path: str
+    http_version: str
+    headers: Message = field(default_factory=Message)
+    body: str = ""
+    body_bytes: bytes = b""
+    wire_raw_bytes: bytes = b""
     client: tuple[str, int] | None = None
 
     @classmethod
@@ -49,16 +49,12 @@ class HTTPRequest:
         writer: Writer | None = None,
     ) -> HTTPRequest:
         headers = headers_to_message(parsed.headers)
-        body_bytes = parsed.body if parsed.body else None
-        body_text = (
-            parsed.body.decode("utf-8", errors="replace")
-            if parsed.body
-            else None
-        )
+        body_bytes = parsed.body
+        body_text = body_bytes.decode("utf-8", errors="replace")
         path = (
             parsed.url.decode("ascii", errors="replace")
-            if parsed.url
-            else None
+            if parsed.url is not None
+            else ""
         )
         client: tuple[str, int] | None = None
         if writer is not None:
@@ -67,9 +63,9 @@ class HTTPRequest:
                 client = (peer[0], peer[1])
 
         return cls(
-            method=parsed.method,
+            method=parsed.method or "",
             path=path,
-            http_version=parsed.http_version,
+            http_version=parsed.http_version or "",
             headers=headers,
             body=body_text,
             body_bytes=body_bytes,
@@ -84,15 +80,12 @@ class HTTPRequest:
         For chunked uploads this includes the original chunk
         framing and any trailer bytes.
         """
-        if self.body_bytes is not None:
+        if self.body_bytes:
             body_fallback = self.body_bytes
         elif self.body:
             body_fallback = self.body.encode()
         else:
             body_fallback = b""
-        if self.wire_raw_bytes is None:
-            return body_fallback
-
         header_end = self.wire_raw_bytes.find(b"\r\n\r\n")
         if header_end == -1:
             return body_fallback
@@ -101,7 +94,7 @@ class HTTPRequest:
 
     @property
     def json_body(self) -> Any:
-        if self.body is None or self.body == "":
+        if self.body == "":
             return None
         return json.loads(self.body)
 
@@ -112,8 +105,6 @@ class HTTPRequest:
         Forward proxy requests have the full URL in the request line,
         e.g., GET http://example.com/path HTTP/1.1
         """
-        if self.path is None:
-            return False
         return self.path.startswith("http://") or self.path.startswith(
             "https://"
         )
@@ -126,8 +117,6 @@ class HTTPRequest:
             ParsedURI with scheme, host, port, path for absolute-form URIs,
             or None for origin-form URIs (e.g., "/path").
         """
-        if self.path is None:
-            return None
         return parse_absolute_uri(self.path)
 
     @property
@@ -143,7 +132,7 @@ class HTTPRequest:
         add_route("GET", "/foo", handler) to match both origin-form
         and absolute-form requests.
         """
-        if self.path is None:
+        if not self.path:
             return "/"
         uri = self.target_uri
         if uri is not None:

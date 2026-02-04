@@ -279,7 +279,7 @@ async def test_forward_returns_502_on_connect_fail_with_expect_100_continue():
     assert recorded_request.path == "/unreachable-continue"
     assert recorded_request.headers is not None
     assert recorded_request.headers["expect"] == "100-continue"
-    assert recorded_request.body is None
+    assert recorded_request.body == ""
 
     # No upstream response should be recorded.
     with pytest.raises(asyncio.TimeoutError):
@@ -1409,7 +1409,7 @@ async def test_forward_preserves_final_response_when_100_and_200_coalesce():
         recorded_request = await proxy.next_request(timeout=1.0)
         assert recorded_request.method == "PUT"
         assert recorded_request.path == "/coalesced"
-        assert recorded_request.body is None
+        assert recorded_request.body == ""
 
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.status == 200

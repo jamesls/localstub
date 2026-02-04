@@ -56,7 +56,7 @@ class SystemTimestampProvider:
 class HTTPResponse:
     status: int = 200
     headers: dict[str, str] = field(default_factory=dict)
-    body: bytes | str | None = b""
+    body: bytes | str = b""
 
     @classmethod
     def json(
@@ -1018,7 +1018,7 @@ class AsyncHTTPTestServer:
                 method=request.method or "GET",
                 url=upstream_url,
                 headers=headers,
-                content=request.body_bytes,
+                content=request.body_bytes or None,
             )
 
             # Build response headers, excluding hop-by-hop

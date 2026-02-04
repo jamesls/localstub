@@ -1895,7 +1895,7 @@ async def test_request_timestamps_with_manual_clock():
 
 @pytest.mark.asyncio
 async def test_get_request_timestamp_not_found(server):
-    fake_request = HTTPRequest(method="GET", path="/fake")
+    fake_request = HTTPRequest(method="GET", path="/fake", http_version="1.1")
     with pytest.raises(ValueError, match="not found"):
         server.get_request_timestamp(fake_request)
 

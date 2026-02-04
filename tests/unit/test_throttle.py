@@ -90,7 +90,7 @@ def test_token_bucket_throttler_default_burst_for_low_rate_is_one():
     assert throttler.burst == 1.0
     assert throttler.rate_per_second == 0.5
 
-    req = HTTPRequest(method="GET", path="/")
+    req = HTTPRequest(method="GET", path="/", http_version="1.1")
     assert throttler.check(req).allowed is True
 
     decision = throttler.check(req)
@@ -131,10 +131,22 @@ def test_token_bucket_throttler_isolated_per_key():
         clock=clock,
     )
 
-    assert throttler.check(HTTPRequest(path="/a")).allowed is True
-    assert throttler.check(HTTPRequest(path="/b")).allowed is True
+    assert (
+        throttler.check(
+            HTTPRequest(method="GET", path="/a", http_version="1.1")
+        ).allowed
+        is True
+    )
+    assert (
+        throttler.check(
+            HTTPRequest(method="GET", path="/b", http_version="1.1")
+        ).allowed
+        is True
+    )
 
-    decision = throttler.check(HTTPRequest(path="/a"))
+    decision = throttler.check(
+        HTTPRequest(method="GET", path="/a", http_version="1.1")
+    )
     assert decision.allowed is False
     assert decision.retry_after_seconds == pytest.approx(1.0)
 
@@ -148,7 +160,7 @@ def test_token_bucket_throttler_reset_clears_state():
         clock=clock,
     )
 
-    req = HTTPRequest(path="/")
+    req = HTTPRequest(method="GET", path="/", http_version="1.1")
     assert throttler.check(req).allowed is True
     assert throttler.check(req).allowed is False
 

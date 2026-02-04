@@ -49,10 +49,8 @@ def _headers_json(
 
 
 def _request_body_json(request: HTTPRequest) -> str | None:
-    if request.body_bytes is not None:
+    if request.body_bytes:
         return _safe_utf8_decode(request.body_bytes)
-    if request.body is None:
-        return ""
     return request.body
 
 

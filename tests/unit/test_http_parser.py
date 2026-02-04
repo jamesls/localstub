@@ -1063,15 +1063,25 @@ class TestHTTPRequestReader:
 
 class TestHTTPRequest:
     def test_json_body_returns_none_for_empty_body(self):
-        request = HTTPRequest(body=None)
+        request = HTTPRequest(method="GET", path="/", http_version="1.1")
         assert request.json_body is None
 
     def test_json_body_returns_none_for_empty_string(self):
-        request = HTTPRequest(body="")
+        request = HTTPRequest(
+            method="GET",
+            path="/",
+            http_version="1.1",
+            body="",
+        )
         assert request.json_body is None
 
     def test_json_body_parses_json(self):
-        request = HTTPRequest(body='{"key": "value"}')
+        request = HTTPRequest(
+            method="GET",
+            path="/",
+            http_version="1.1",
+            body='{"key": "value"}',
+        )
         assert request.json_body == {"key": "value"}
 
 

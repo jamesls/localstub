@@ -106,6 +106,7 @@ class TestProcessTrafficNoResponse:
         request = HTTPRequest(
             method="GET",
             path="/no-upstream",
+            http_version="1.1",
             headers=headers,
             body="",
             wire_raw_bytes=b"GET /no-upstream HTTP/1.1\r\n\r\n",
