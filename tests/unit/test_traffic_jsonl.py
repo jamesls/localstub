@@ -25,6 +25,7 @@ def test_exchange_to_json_obj_encodes_wire_bytes_and_timestamps() -> None:
     request = HTTPRequest(
         method="GET",
         path="/example",
+        http_version="1.1",
         headers=req_headers,
         body="",
         body_bytes=b"",
@@ -83,8 +84,9 @@ def test_exchange_to_json_obj_handles_decode_errors() -> None:
     request = HTTPRequest(
         method="POST",
         path="/binary",
-        headers=None,
-        body=None,
+        http_version="1.1",
+        headers=Message(),
+        body="",
         body_bytes=b"\xff",
         wire_raw_bytes=b"POST /binary HTTP/1.1\r\n\r\n\xff",
         client=None,
@@ -114,7 +116,8 @@ def test_exchange_to_json_obj_includes_proxy_fields() -> None:
     request = HTTPRequest(
         method="GET",
         path="http://example.com/foo?bar=1",
-        headers=None,
+        http_version="1.1",
+        headers=Message(),
         body="",
         body_bytes=b"",
         wire_raw_bytes=b"",
@@ -138,10 +141,11 @@ def test_jsonl_writer_writes_single_line() -> None:
     request = HTTPRequest(
         method="GET",
         path="/",
-        headers=None,
+        http_version="1.1",
+        headers=Message(),
         body="",
         body_bytes=b"",
-        wire_raw_bytes=None,
+        wire_raw_bytes=b"",
         client=None,
     )
     exchange = RecordedExchange(
@@ -164,13 +168,13 @@ def test_jsonl_writer_writes_single_line() -> None:
 def test_dump_server_traffic_jsonl_supports_start_end(tmp_path) -> None:
     server = AsyncHTTPTestServer()
     exchange1 = RecordedExchange(
-        request=HTTPRequest(method="GET", path="/a"),
+        request=HTTPRequest(method="GET", path="/a", http_version="1.1"),
         response=None,
         request_timestamp=datetime(2026, 1, 27, tzinfo=timezone.utc),
         response_timestamp=None,
     )
     exchange2 = RecordedExchange(
-        request=HTTPRequest(method="GET", path="/b"),
+        request=HTTPRequest(method="GET", path="/b", http_version="1.1"),
         response=None,
         request_timestamp=datetime(2026, 1, 27, tzinfo=timezone.utc),
         response_timestamp=None,

@@ -20,17 +20,22 @@ from localstub.server import (
 
 
 def test_http_request_json_body_with_none_body():
-    request = HTTPRequest(body=None)
+    request = HTTPRequest(method="GET", path="/", http_version="1.1")
     assert request.json_body is None
 
 
 def test_http_request_json_body_with_empty_string():
-    request = HTTPRequest(body="")
+    request = HTTPRequest(method="GET", path="/", http_version="1.1", body="")
     assert request.json_body is None
 
 
 def test_http_request_json_body_with_valid_json():
-    request = HTTPRequest(body='{"key": "value"}')
+    request = HTTPRequest(
+        method="GET",
+        path="/",
+        http_version="1.1",
+        body='{"key": "value"}',
+    )
     assert request.json_body == {"key": "value"}
 
 

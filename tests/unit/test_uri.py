@@ -68,23 +68,35 @@ class TestHTTPRequestProxyProperties:
     """Tests for HTTPRequest proxy-related properties."""
 
     def test_is_proxy_request_true_for_http(self) -> None:
-        request = HTTPRequest(path="http://example.com/path")
+        request = HTTPRequest(
+            method="GET",
+            path="http://example.com/path",
+            http_version="1.1",
+        )
         assert request.is_proxy_request is True
 
     def test_is_proxy_request_true_for_https(self) -> None:
-        request = HTTPRequest(path="https://example.com/path")
+        request = HTTPRequest(
+            method="GET",
+            path="https://example.com/path",
+            http_version="1.1",
+        )
         assert request.is_proxy_request is True
 
     def test_is_proxy_request_false_for_origin_form(self) -> None:
-        request = HTTPRequest(path="/path")
+        request = HTTPRequest(method="GET", path="/path", http_version="1.1")
         assert request.is_proxy_request is False
 
     def test_is_proxy_request_false_for_none_path(self) -> None:
-        request = HTTPRequest(path=None)
+        request = HTTPRequest(method="GET", path="", http_version="1.1")
         assert request.is_proxy_request is False
 
     def test_target_uri_returns_parsed_for_absolute(self) -> None:
-        request = HTTPRequest(path="http://example.com:8080/api?key=val")
+        request = HTTPRequest(
+            method="GET",
+            path="http://example.com:8080/api?key=val",
+            http_version="1.1",
+        )
         uri = request.target_uri
         assert uri is not None
         assert uri.scheme == "http"
@@ -93,21 +105,29 @@ class TestHTTPRequestProxyProperties:
         assert uri.path == "/api?key=val"
 
     def test_target_uri_returns_none_for_origin_form(self) -> None:
-        request = HTTPRequest(path="/path")
+        request = HTTPRequest(method="GET", path="/path", http_version="1.1")
         assert request.target_uri is None
 
     def test_target_uri_returns_none_for_none_path(self) -> None:
-        request = HTTPRequest(path=None)
+        request = HTTPRequest(method="GET", path="", http_version="1.1")
         assert request.target_uri is None
 
     def test_effective_path_extracts_path_from_absolute(self) -> None:
-        request = HTTPRequest(path="http://example.com/api/users?limit=10")
+        request = HTTPRequest(
+            method="GET",
+            path="http://example.com/api/users?limit=10",
+            http_version="1.1",
+        )
         assert request.effective_path == "/api/users?limit=10"
 
     def test_effective_path_returns_path_for_origin_form(self) -> None:
-        request = HTTPRequest(path="/api/users")
+        request = HTTPRequest(
+            method="GET",
+            path="/api/users",
+            http_version="1.1",
+        )
         assert request.effective_path == "/api/users"
 
     def test_effective_path_returns_slash_for_none(self) -> None:
-        request = HTTPRequest(path=None)
+        request = HTTPRequest(method="GET", path="", http_version="1.1")
         assert request.effective_path == "/"
