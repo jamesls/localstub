@@ -5,7 +5,6 @@ import asyncio
 import io
 import json
 from datetime import datetime, timezone
-from email.message import Message
 from pathlib import Path
 
 import httpx
@@ -17,6 +16,7 @@ from localstub.cli import (
     process_http_proxy_traffic,
     process_traffic,
 )
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
 from localstub.tlsproxy import RecordedResponse
@@ -101,8 +101,7 @@ class TestProcessTrafficNoResponse:
     async def test_logs_request_when_no_recorded_response(self) -> None:
         # Prepare a single recorded request that will have no corresponding
         # recorded response from the proxy.
-        headers = Message()
-        headers["Host"] = "example.com"
+        headers = Headers.from_items([("Host", "example.com")])
         request = HTTPRequest(
             method="GET",
             path="/no-upstream",

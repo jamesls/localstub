@@ -8,6 +8,7 @@ from email.message import Message
 
 import pytest
 
+from localstub.http.headers import Headers
 from localstub.http.exchange import RecordedExchange
 from localstub.http.request import HTTPRequest
 from localstub.http.response import RecordedResponse
@@ -20,8 +21,7 @@ from localstub.traffic_jsonl import (
 
 
 def test_exchange_to_json_obj_encodes_wire_bytes_and_timestamps() -> None:
-    req_headers = Message()
-    req_headers["Host"] = "example.com"
+    req_headers = Headers.from_items([("Host", "example.com")])
     request = HTTPRequest(
         method="GET",
         path="/example",
@@ -85,7 +85,7 @@ def test_exchange_to_json_obj_handles_decode_errors() -> None:
         method="POST",
         path="/binary",
         http_version="1.1",
-        headers=Message(),
+        headers=Headers.empty(),
         body="",
         body_bytes=b"\xff",
         wire_raw_bytes=b"POST /binary HTTP/1.1\r\n\r\n\xff",
@@ -117,7 +117,7 @@ def test_exchange_to_json_obj_includes_proxy_fields() -> None:
         method="GET",
         path="http://example.com/foo?bar=1",
         http_version="1.1",
-        headers=Message(),
+        headers=Headers.empty(),
         body="",
         body_bytes=b"",
         wire_raw_bytes=b"",
@@ -142,7 +142,7 @@ def test_jsonl_writer_writes_single_line() -> None:
         method="GET",
         path="/",
         http_version="1.1",
-        headers=Message(),
+        headers=Headers.empty(),
         body="",
         body_bytes=b"",
         wire_raw_bytes=b"",

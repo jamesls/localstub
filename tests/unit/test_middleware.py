@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.message import Message
 
 import pytest
 
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest, HTTPRequestHeaders
 from localstub.http.response import RecordedResponse
 from localstub.http.responsespec import HTTPResponse
@@ -96,6 +96,32 @@ async def test_compose_responder_ctx_override_rewrites_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_responder_context_clone_request_patches_request() -> None:
+    async def mw(ctx: ResponderContext, call_next) -> HTTPResponse:
+        ctx2 = ctx.clone_request(
+            headers={"X-Request-Id": "test-123"},
+            body_bytes=b"corrupt",
+        )
+        assert "X-Request-Id" not in ctx.request.headers
+        return await call_next(ctx=ctx2)
+
+    async def terminal(ctx: ResponderContext) -> HTTPResponse:
+        rid = ctx.request.headers["X-Request-Id"]
+        return HTTPResponse.text(f"{rid}:{ctx.request.body}")
+
+    app = compose_responder([mw], terminal)
+    ctx = ResponderContext(
+        request=HTTPRequest(method="POST", path="/", http_version="1.1"),
+        connection=ConnectionMeta(client=None),
+        services=_services(),
+    )
+
+    result = await app(ctx)
+    assert isinstance(result, HTTPResponse)
+    assert result.body == b"test-123:corrupt"
+
+
+@pytest.mark.asyncio
 async def test_compose_responder_call_next_twice_raises() -> None:
     async def mw(ctx: ResponderContext, call_next) -> HTTPResponse:
         await call_next()
@@ -181,7 +207,7 @@ async def test_compose_headers_short_circuit() -> None:
             method="GET",
             path="/",
             http_version="1.1",
-            headers=Message(),
+            headers=Headers.empty(),
             wire_raw_bytes=b"GET / HTTP/1.1\r\n\r\n",
         ),
         connection=ConnectionMeta(client=None),

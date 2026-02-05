@@ -5,7 +5,6 @@ import inspect
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from email.message import Message
 from http import HTTPStatus
 from typing import (
     Any,
@@ -31,7 +30,7 @@ from localstub.http.request import (
 )
 from localstub.http.response import RecordedResponse
 from localstub.http.responsespec import HTTPResponse
-from localstub.http.utils import headers_to_message
+from localstub.http.utils import headers_to_headers, headers_to_message
 from localstub.middleware import (
     ConnectionMeta,
     ForwardProxyResponse,
@@ -1090,7 +1089,7 @@ class AsyncHTTPTestServer:
         if parsed is None:
             return None
 
-        headers_msg = headers_to_message(parsed.headers)
+        headers_msg = headers_to_headers(parsed.headers)
         partial = HTTPRequestHeaders(
             method=parsed.method,
             path=(
@@ -1205,60 +1204,6 @@ class AsyncHTTPTestServer:
         if isinstance(body_obj, bytes):
             return body_obj
         return str(body_obj).encode("utf-8")
-
-    def _parse_connection_tokens(self, value: str) -> set[str]:
-        tokens: set[str] = set()
-        for raw_token in value.split(","):
-            token = raw_token.strip().lower()
-            if token:
-                tokens.add(token)
-        return tokens
-
-    def _connection_tokens_from_headers(
-        self,
-        headers: Message | None,
-    ) -> set[str]:
-        if headers is None:
-            return set()
-        tokens: set[str] = set()
-        for value in headers.get_all("Connection", []):
-            tokens.update(self._parse_connection_tokens(value))
-        return tokens
-
-    def _connection_tokens_from_response(
-        self,
-        response: HTTPResponse,
-    ) -> set[str]:
-        for name, value in response.headers.items():
-            if name.lower() == "connection":
-                return self._parse_connection_tokens(value)
-        return set()
-
-    def _is_http10(self, request: HTTPRequest) -> bool:
-        return request.http_version == "1.0"
-
-    def _is_http11(self, request: HTTPRequest) -> bool:
-        return request.http_version == "1.1"
-
-    def _should_close_connection(
-        self,
-        request: HTTPRequest,
-        response: HTTPResponse,
-    ) -> bool:
-        """Return True if the server should close after this response."""
-        request_tokens = self._connection_tokens_from_headers(request.headers)
-        response_tokens = self._connection_tokens_from_response(response)
-
-        if "close" in response_tokens:
-            return True
-
-        if self._is_http11(request):
-            return "close" in request_tokens
-
-        if self._is_http10(request):
-            return "keep-alive" not in request_tokens
-
-        return True
 
     def _build_response_headers(
         self,

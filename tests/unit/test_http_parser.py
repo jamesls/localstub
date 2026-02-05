@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from email.message import Message
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from localstub.http.headers import Headers
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
@@ -1087,8 +1087,7 @@ class TestHTTPRequest:
         assert request.json_body == {"key": "value"}
 
     def test_headers_are_immutable(self) -> None:
-        headers = Message()
-        headers["X-Test"] = "a"
+        headers = Headers.from_items([("X-Test", "a")])
         request = HTTPRequest(
             method="GET",
             path="/",
@@ -1098,31 +1097,21 @@ class TestHTTPRequest:
 
         assert request.headers["X-Test"] == "a"
 
-        with pytest.raises(TypeError, match="immutable"):
+        with pytest.raises(TypeError):
             request.headers["X-Test"] = "b"
-        with pytest.raises(TypeError, match="immutable"):
+        with pytest.raises(TypeError):
             del request.headers["X-Test"]
-        with pytest.raises(TypeError, match="immutable"):
-            request.headers.add_header("X-Other", "c")
-        with pytest.raises(TypeError, match="immutable"):
-            request.headers.replace_header("X-Test", "b")
-        with pytest.raises(TypeError, match="immutable"):
-            request.headers.set_raw("X-Test", "b")
 
-    def test_with_headers_freezes_copy(self) -> None:
-        base = HTTPRequest(method="GET", path="/", http_version="1.1")
-        headers = Message()
-        headers["X-Test"] = "a"
+    def test_patch_set_overrides_without_mutating_original(self) -> None:
+        headers = Headers.from_items([("X-Test", "a")])
+        patched = headers.patch_set({"X-Test": "b", "X-Other": "c"})
 
-        rewritten = base.with_headers(headers)
-        headers["X-Other"] = "b"
-
-        assert rewritten.headers["X-Test"] == "a"
-        assert "X-Other" not in rewritten.headers
+        assert headers["X-Test"] == "a"
+        assert patched["X-Test"] == "b"
+        assert patched["X-Other"] == "c"
 
     def test_partial_headers_are_immutable(self) -> None:
-        headers = Message()
-        headers["Host"] = "example.com"
+        headers = Headers.from_items([("Host", "example.com")])
 
         partial = HTTPRequestHeaders(
             method="GET",
@@ -1133,7 +1122,7 @@ class TestHTTPRequest:
         )
 
         assert partial.headers["Host"] == "example.com"
-        with pytest.raises(TypeError, match="immutable"):
+        with pytest.raises(TypeError):
             partial.headers["Host"] = "other.example.com"
 
 

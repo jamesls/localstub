@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Protocol, TypeAlias, cast
@@ -45,6 +45,52 @@ class ResponderContext:
 
     def with_request(self, request: HTTPRequest) -> ResponderContext:
         return replace(self, request=request)
+
+    def clone_request(
+        self,
+        *,
+        method: str | None = None,
+        path: str | None = None,
+        http_version: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        body_bytes: bytes | None = None,
+    ) -> ResponderContext:
+        if (
+            method is None
+            and path is None
+            and http_version is None
+            and not headers
+            and body_bytes is None
+        ):
+            return self
+
+        request = self.request
+
+        next_headers = (
+            request.headers
+            if not headers
+            else request.headers.patch_set(headers)
+        )
+
+        if body_bytes is None:
+            next_body_bytes = request.body_bytes
+            next_body = request.body
+        else:
+            next_body_bytes = body_bytes
+            next_body = body_bytes.decode("utf-8", errors="replace")
+
+        next_request = replace(
+            request,
+            method=request.method if method is None else method,
+            path=request.path if path is None else path,
+            http_version=(
+                request.http_version if http_version is None else http_version
+            ),
+            headers=next_headers,
+            body=next_body,
+            body_bytes=next_body_bytes,
+        )
+        return replace(self, request=next_request)
 
 
 @dataclass(frozen=True)
