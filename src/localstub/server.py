@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
-import math
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime
 from email.message import Message
 from http import HTTPStatus
 from typing import (
@@ -22,92 +20,55 @@ from typing import (
 
 import httpx
 
-from localstub.forward import Forwarder, ForwardResult
+from localstub.forward import Forwarder
+from localstub.http.connection import should_close_connection
 from localstub.http.exchange import RecordedExchange
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
+    HTTPRequestHeaders,
     ParsedRequest,
 )
 from localstub.http.response import RecordedResponse
-from localstub.http.uri import ParsedURI
+from localstub.http.responsespec import HTTPResponse
 from localstub.http.utils import headers_to_message
+from localstub.middleware import (
+    ConnectionInfo,
+    ConnectionMeta,
+    HeaderContext,
+    HeaderMiddleware,
+    ResponderContext,
+    ResponderMiddleware,
+    ResponseSpec,
+    SenderContext,
+    SenderMiddleware,
+    SendResult,
+    ServerServices,
+    SystemTimestampProvider,
+    TimestampProvider,
+    compose_headers,
+    compose_responder,
+    compose_sender,
+)
+from localstub.middleware.builtins import (
+    HandlerMiddleware,
+    HttpxForwardProxyMiddleware,
+    RawForwardProxyMiddleware,
+    RawForwardProxySender,
+    ResponseSequenceMiddleware,
+    RouterMiddleware,
+    ThrottleMiddleware,
+    default_throttle_response,
+)
+from localstub.router import ResponderHandler, Router
 from localstub.throttle import (
     Clock,
     MonotonicClock,
-    RequestThrottler,
     ThrottleDecision,
     TokenBucketThrottler,
 )
 
 LOG = logging.getLogger(__name__)
-
-
-class TimestampProvider(Protocol):
-    def now(self) -> datetime: ...
-
-
-class SystemTimestampProvider:
-    def now(self) -> datetime:
-        return datetime.now(timezone.utc)
-
-
-@dataclass
-class HTTPResponse:
-    status: int = 200
-    headers: dict[str, str] = field(default_factory=dict)
-    body: bytes | str = b""
-
-    @classmethod
-    def json(
-        cls,
-        obj: Any,
-        *,
-        status: int = 200,
-        headers: Optional[dict[str, str]] = None,
-    ) -> HTTPResponse:
-        text = json.dumps(obj)
-        body = text.encode("utf-8")
-        base_headers = {
-            "Content-Type": "application/json",
-            "Content-Length": str(len(body)),
-        }
-        if headers:
-            base_headers.update(headers)
-        return cls(status=status, headers=base_headers, body=body)
-
-    @classmethod
-    def text(
-        cls,
-        text: str,
-        *,
-        status: int = 200,
-        headers: Optional[dict[str, str]] = None,
-    ) -> HTTPResponse:
-        body = text.encode("utf-8")
-        base_headers = {
-            "Content-Type": "text/plain; charset=utf-8",
-            "Content-Length": str(len(body)),
-        }
-        if headers:
-            base_headers.update(headers)
-        return cls(status=status, headers=base_headers, body=body)
-
-    @classmethod
-    def raw(
-        cls,
-        data: bytes,
-        *,
-        status: int = 200,
-        headers: Optional[dict[str, str]] = None,
-    ) -> HTTPResponse:
-        base_headers = {"Content-Length": str(len(data))}
-        if headers:
-            base_headers.update(headers)
-        return cls(status=status, headers=base_headers, body=data)
-
-
-Handler = Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]
 
 ThrottleKeyFunc = Callable[[HTTPRequest], Hashable]
 ThrottleResponseFunc = Callable[[HTTPRequest, ThrottleDecision], HTTPResponse]
@@ -118,42 +79,8 @@ def _default_throttle_key(_: HTTPRequest) -> str:
     return "global"
 
 
-def _default_throttle_response(
-    _: HTTPRequest,
-    decision: ThrottleDecision,
-) -> HTTPResponse:
-    retry_after = max(1, math.ceil(decision.retry_after_seconds))
-    return HTTPResponse.text(
-        "Too Many Requests",
-        status=429,
-        headers={"Retry-After": str(retry_after)},
-    )
-
-
-@dataclass(frozen=True)
-class ThrottleConfig:
-    throttler: RequestThrottler
-    response: ThrottleResponseFunc
-
-
-@dataclass
-class HTTPRequestHeaders:
-    """Partial request available after headers are parsed, before body.
-
-    This is provided to the on_headers_received callback, allowing inspection
-    of request headers before the body is read. Useful for implementing
-    HTTP 100-continue or early rejection based on headers.
-    """
-
-    method: str | None
-    path: str | None
-    http_version: str | None
-    headers: Message
-    wire_raw_bytes: bytes
-
-
 # Callback to send a response to client during header processing
-SendResponse = Callable[["HTTPResponse"], Awaitable[None]]
+SendResponse = Callable[[HTTPResponse], Awaitable[None]]
 
 # Lifecycle hook called after headers are received, before body is read.
 # Return True to continue reading body, False to stop.
@@ -419,71 +346,6 @@ class FaultyTransmission(TransmissionStrategy):
             pass
 
 
-@dataclass(frozen=True)
-class _PreparedResponse:
-    response: HTTPResponse
-    recorded_response: RecordedResponse
-    should_close: bool
-
-
-@dataclass
-class ConnectionContext:
-    """Per-connection tracking container.
-
-    Minimal adapter that holds references to the connection-level wire buffers
-    maintained by the server. Tests do not access this class; it is internal
-    and used only to clarify responsibilities.
-    """
-
-    reader: asyncio.StreamReader
-    writer: Writer
-    client: tuple[str, int] | None
-    raw_received_total: bytearray | None
-    raw_sent_total: bytearray | None
-    history: list[tuple[HTTPRequest, HTTPResponse]] = field(
-        default_factory=list
-    )
-
-
-class Router:
-    """Small router wrapper with optional method/path routes.
-
-    MVP behavior: if no explicit route matches, falls back to the server's
-    `handler` callable. If that is also absent, returns the configured
-    default response.
-    """
-
-    def __init__(self) -> None:
-        self._routes: dict[tuple[str, str], Handler] = {}
-
-    def add_route(self, method: str, path: str, handler: Handler) -> None:
-        self._routes[(method.upper(), path)] = handler
-
-    async def resolve(
-        self,
-        request: HTTPRequest,
-        fallback_handler: Handler | None,
-        default_response: HTTPResponse,
-    ) -> HTTPResponse:
-        # Use effective_path for route matching to support both origin-form
-        # ("/path") and absolute-form ("http://host/path") URIs
-        key = (
-            request.method.upper() if request.method else "",
-            request.effective_path,
-        )
-        handler = self._routes.get(key, fallback_handler)
-
-        if handler is None:
-            return default_response
-
-        result = handler(request)
-        if isinstance(result, HTTPResponse):
-            return result
-        if inspect.isawaitable(result):
-            return await cast(Awaitable[HTTPResponse], result)
-        raise TypeError("Handler returned unsupported type")
-
-
 class AsyncHTTPTestServer:
     """Small asyncio HTTP server used for testing SDK clients.
 
@@ -492,14 +354,14 @@ class AsyncHTTPTestServer:
       * records last_request (HTTPRequest) and a list of all requests
       * `wire_raw_bytes` contains the *exact* bytes received, including
         chunked / aws-chunked framing and trailers.
-      * configurable static response, or plug in your own handler(request).
+      * configurable static response, or plug in responder middleware.
     """
 
     def __init__(
         self,
         host: str = "127.0.0.1",
         port: int = 0,
-        handler: Handler | None = None,
+        handler: ResponderHandler | None = None,
         default_response: HTTPResponse | None = None,
         on_headers_received: OnHeadersReceived | None = None,
         proxy_forwarder: httpx.AsyncClient | None = None,
@@ -511,31 +373,53 @@ class AsyncHTTPTestServer:
         self._port = port
         self._server: asyncio.base_events.Server | None = None
 
-        self._handler: Handler | None = handler
+        self._handler: ResponderHandler | None = handler
         self._default_response: HTTPResponse = (
             default_response or HTTPResponse.json({})
         )
-        self._router = Router()
+        self.router = Router()
         self._on_headers_received = on_headers_received
         self._proxy_forwarder = proxy_forwarder
         self._raw_forwarder = raw_forwarder
 
-        # Response sequence tracking
-        self._response_sequence: list[HTTPResponse] = []
-        self._response_sequence_index: int = 0
+        self._throttle_middleware: ThrottleMiddleware | None = None
+        self._response_sequence_middleware: (
+            ResponseSequenceMiddleware | None
+        ) = None
+        self._raw_forward_proxy_middleware: (
+            RawForwardProxyMiddleware | None
+        ) = (
+            RawForwardProxyMiddleware(raw_forwarder)
+            if raw_forwarder is not None
+            else None
+        )
+        self._httpx_forward_proxy_middleware: (
+            HttpxForwardProxyMiddleware | None
+        ) = (
+            HttpxForwardProxyMiddleware(proxy_forwarder)
+            if proxy_forwarder is not None
+            else None
+        )
+        self._raw_forward_proxy_sender = RawForwardProxySender()
 
-        # Transmission strategy for controlling how body bytes are sent
+        self.responder_middlewares: list[ResponderMiddleware] = []
+        self.sender_middlewares: list[SenderMiddleware] = []
+        self.header_middlewares: list[HeaderMiddleware] = []
+
         self._transmission_strategy: TransmissionStrategy = (
             ImmediateTransmission()
         )
 
-        self._throttle: ThrottleConfig | None = None
-
         self._clock: Clock = clock or MonotonicClock()
-        self._request_timestamps: dict[int, float] = {}
         self._timestamp_provider = (
             timestamp_provider or SystemTimestampProvider()
         )
+        self._services = ServerServices(
+            clock=self._clock,
+            timestamp_provider=self._timestamp_provider,
+        )
+
+        self._request_timestamps: dict[int, float] = {}
 
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
@@ -564,15 +448,37 @@ class AsyncHTTPTestServer:
         return f"http://{self.host}:{self.port}/"
 
     @property
-    def handler(self) -> Handler | None:
+    def handler(self) -> ResponderHandler | None:
         return self._handler
 
     @handler.setter
-    def handler(self, value: Handler | None) -> None:
+    def handler(self, value: ResponderHandler | None) -> None:
         self._handler = value
 
-    def add_route(self, method: str, path: str, handler: Handler) -> None:
-        self._router.add_route(method, path, handler)
+    @property
+    def default_response(self) -> HTTPResponse:
+        return self._default_response
+
+    @default_response.setter
+    def default_response(self, response: HTTPResponse) -> None:
+        self._default_response = response
+
+    def add_route(
+        self,
+        method: str,
+        path: str,
+        handler: ResponderHandler,
+    ) -> None:
+        self.router.add(method, path, handler)
+
+    def use(self, middleware: ResponderMiddleware) -> None:
+        self.responder_middlewares.append(middleware)
+
+    def use_sender(self, middleware: SenderMiddleware) -> None:
+        self.sender_middlewares.append(middleware)
+
+    def use_headers(self, middleware: HeaderMiddleware) -> None:
+        self.header_middlewares.append(middleware)
 
     def set_request_headers_handler(
         self,
@@ -597,9 +503,7 @@ class AsyncHTTPTestServer:
         self._default_response = HTTPResponse.json(
             obj, status=status, headers=headers
         )
-        # Clear any response sequence (last one wins)
-        self._response_sequence = []
-        self._response_sequence_index = 0
+        self._response_sequence_middleware = None
 
     def set_text_response(
         self,
@@ -613,9 +517,7 @@ class AsyncHTTPTestServer:
             status=status,
             headers=headers,
         )
-        # Clear any response sequence (last one wins)
-        self._response_sequence = []
-        self._response_sequence_index = 0
+        self._response_sequence_middleware = None
 
     def set_raw_response(
         self,
@@ -629,9 +531,7 @@ class AsyncHTTPTestServer:
             status=status,
             headers=headers,
         )
-        # Clear any response sequence (last one wins)
-        self._response_sequence = []
-        self._response_sequence_index = 0
+        self._response_sequence_middleware = None
 
     def set_default_response(self, response: HTTPResponse) -> None:
         """Configure a static response returned for every request.
@@ -643,9 +543,7 @@ class AsyncHTTPTestServer:
             response: HTTPResponse object to return for all requests
         """
         self._default_response = response
-        # Clear any response sequence (last one wins)
-        self._response_sequence = []
-        self._response_sequence_index = 0
+        self._response_sequence_middleware = None
 
     def set_response_sequence(self, responses: list[HTTPResponse]) -> None:
         """Configure a sequence of responses to return in order.
@@ -666,8 +564,9 @@ class AsyncHTTPTestServer:
         Args:
             responses: List of HTTPResponse objects to return in sequence
         """
-        self._response_sequence = responses
-        self._response_sequence_index = 0
+        self._response_sequence_middleware = ResponseSequenceMiddleware(
+            responses
+        )
         # Clear default response (last one wins)
         self._default_response = HTTPResponse.json({})
 
@@ -773,10 +672,10 @@ class AsyncHTTPTestServer:
         self.exchanges = []
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
-        # Reset response sequence index to allow reuse
-        self._response_sequence_index = 0
-        if self._throttle is not None:
-            self._throttle.throttler.reset()
+        if self._response_sequence_middleware is not None:
+            self._response_sequence_middleware.reset()
+        if self._throttle_middleware is not None:
+            self._throttle_middleware.reset()
 
     def set_throttle(
         self,
@@ -808,21 +707,21 @@ class AsyncHTTPTestServer:
             clock=clock,
         )
         response_fn = self._normalize_throttle_response(response)
-        self._throttle = ThrottleConfig(
+        self._throttle_middleware = ThrottleMiddleware(
             throttler=throttler,
             response=response_fn,
         )
 
     def clear_throttle(self) -> None:
         """Disable request-rate throttling."""
-        self._throttle = None
+        self._throttle_middleware = None
 
     def _normalize_throttle_response(
         self,
         response: ThrottleResponse | None,
     ) -> ThrottleResponseFunc:
         if response is None:
-            return _default_throttle_response
+            return default_throttle_response
         if isinstance(response, HTTPResponse):
 
             def static(
@@ -952,311 +851,147 @@ class AsyncHTTPTestServer:
             self._connection_raw_bytes_sent[client],
         )
 
-    async def _get_response(self, request: HTTPRequest) -> HTTPResponse:
-        """Get response via sequence, router, handler, or default.
-
-        Priority order:
-        1. Response sequence (if set and not exhausted)
-        2. Proxy forwarding (if proxy request and forwarder is set)
-        3. Router with method/path matching
-        4. Handler (if set)
-        5. Default response
-        """
-        # Check sequence first - consumes next response if available
-        if self._response_sequence and self._response_sequence_index < len(
-            self._response_sequence
-        ):
-            response = self._response_sequence[self._response_sequence_index]
-            self._response_sequence_index += 1
-            return response
-
-        # Forward proxy requests to upstream if forwarder is configured
-        if request.is_proxy_request and self._proxy_forwarder is not None:
-            return await self._forward_to_upstream(request)
-
-        # Fall back to existing routing logic
-        return await self._router.resolve(
-            request, self._handler, self._default_response
-        )
-
-    async def _forward_to_upstream(
+    def _build_responder(
         self,
-        request: HTTPRequest,
-    ) -> HTTPResponse:
-        """Forward a proxy request to the upstream server."""
-        uri = request.target_uri
-        if uri is None:
-            return HTTPResponse(
-                status=400,
-                body=b"Bad Request: Not an absolute URI",
-            )
+    ) -> Callable[[ResponderContext], Awaitable[ResponseSpec]]:
+        builtins: list[ResponderMiddleware] = []
+        if self._throttle_middleware is not None:
+            builtins.append(self._throttle_middleware)
+        if self._response_sequence_middleware is not None:
+            builtins.append(self._response_sequence_middleware)
+        if self._raw_forward_proxy_middleware is not None:
+            builtins.append(self._raw_forward_proxy_middleware)
+        if self._httpx_forward_proxy_middleware is not None:
+            builtins.append(self._httpx_forward_proxy_middleware)
+        builtins.append(RouterMiddleware(self.router))
+        builtins.append(HandlerMiddleware(lambda: self._handler))
 
-        # Build the upstream URL (the full absolute URI from request.path)
-        upstream_url = request.path or "/"
+        middlewares = [*self.responder_middlewares, *builtins]
 
-        # Build headers, excluding hop-by-hop headers
-        hop_by_hop = {
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "proxy-connection",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-        }
-        headers: dict[str, str] = {}
-        if request.headers:
-            for name, value in request.headers.items():
-                if name.lower() not in hop_by_hop:
-                    headers[name] = value
+        def terminal(_: ResponderContext) -> ResponseSpec:
+            return self._default_response
 
-        assert self._proxy_forwarder is not None
-        try:
-            upstream_response = await self._proxy_forwarder.request(
-                method=request.method or "GET",
-                url=upstream_url,
-                headers=headers,
-                content=request.body_bytes or None,
-            )
+        return compose_responder(middlewares, terminal)
 
-            # Build response headers, excluding hop-by-hop
-            response_headers: dict[str, str] = {}
-            for name, value in upstream_response.headers.items():
-                if name.lower() not in hop_by_hop:
-                    response_headers[name] = value
-
-            return HTTPResponse(
-                status=upstream_response.status_code,
-                headers=response_headers,
-                body=upstream_response.content,
-            )
-
-        except httpx.RequestError as e:
-            LOG.warning("Upstream request failed: %s", e)
-            return HTTPResponse(
-                status=502,
-                body=f"Bad Gateway: {e}".encode(),
-            )
-
-    def _build_origin_form_request(
+    def _build_sender(
         self,
-        request: HTTPRequest,
-        uri: ParsedURI,
-    ) -> bytes:
-        """Convert absolute-form proxy request to origin-form for upstream.
+    ) -> Callable[[SenderContext, ResponseSpec], Awaitable[SendResult]]:
+        middlewares = [
+            *self.sender_middlewares,
+            self._raw_forward_proxy_sender,
+        ]
 
-        Converts a request like "GET http://example.com/path HTTP/1.1"
-        to "GET /path HTTP/1.1" for sending to the upstream server.
+        async def terminal(
+            ctx: SenderContext,
+            response: ResponseSpec,
+        ) -> SendResult:
+            if not isinstance(response, HTTPResponse):
+                raise TypeError(
+                    f"Unhandled response spec: {type(response).__name__}"
+                )
+            writer = ctx.conn.writer
+            wire_offset = len(writer.bytes_sent)
+            should_close = await self._write_response(
+                writer,
+                response,
+                ctx.request,
+            )
+            wire_bytes = writer.bytes_sent[wire_offset:]
+            recorded = self._build_recorded_response(response, wire_bytes)
+            return SendResult(recorded=recorded, should_close=should_close)
 
-        Args:
-            request: The original HTTP request with absolute-form URI.
-            uri: Parsed URI components from the request.
+        return compose_sender(middlewares, terminal)
 
-        Returns:
-            Wire bytes for the origin-form request.
-        """
-        path = request.effective_path or "/"
-        method = request.method or "GET"
-        version_value = request.http_version or "1.1"
-        if version_value.startswith("HTTP/"):
-            version = version_value
-        else:
-            version = f"HTTP/{version_value}"
+    def _build_header(
+        self,
+    ) -> Callable[[HeaderContext], Awaitable[bool]]:
+        middlewares: list[HeaderMiddleware] = []
+        on_headers_received_handler = self._on_headers_received
+        if on_headers_received_handler is not None:
 
-        lines = [f"{method} {path} {version}"]
-
-        # Add headers, filtering proxy-specific hop-by-hop headers
-        hop_by_hop = {
-            "proxy-connection",
-            "proxy-authenticate",
-            "proxy-authorization",
-        }
-        connection_tokens = self._connection_tokens_from_headers(
-            request.headers
-        )
-        remove_headers = hop_by_hop | {"connection"} | connection_tokens
-        host_added = False
-        if request.headers:
-            for name, value in request.headers.items():
-                name_lower = name.lower()
-                if name_lower == "host":
-                    # Ensure Host header matches target
-                    port_suffix = ""
-                    if uri.port and uri.port not in (80, 443):
-                        port_suffix = f":{uri.port}"
-                    lines.append(f"Host: {uri.host}{port_suffix}")
-                    host_added = True
-                elif name_lower in remove_headers:
-                    continue
+            async def on_headers_received(
+                ctx: HeaderContext,
+                call_next: Any,
+            ) -> bool:
+                result = on_headers_received_handler(ctx.headers, ctx.send)
+                if inspect.isawaitable(result):
+                    should_continue = await cast(Awaitable[bool], result)
                 else:
-                    lines.append(f"{name}: {value}")
+                    should_continue = cast(bool, result)
+                if not should_continue:
+                    return False
+                return await call_next()
 
-        if not host_added:
-            port_suffix = ""
-            if uri.port and uri.port not in (80, 443):
-                port_suffix = f":{uri.port}"
-            lines.append(f"Host: {uri.host}{port_suffix}")
+            middlewares.append(on_headers_received)
 
-        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n\r\n"
+        middlewares.extend(self.header_middlewares)
 
-        body_bytes = request.wire_body_bytes
-        return header_bytes + body_bytes
+        async def terminal(_: HeaderContext) -> bool:
+            return True
 
-    async def _forward_proxy_raw(
+        return compose_headers(middlewares, terminal)
+
+    async def _record_request(
         self,
         request: HTTPRequest,
-        writer: Writer,
-    ) -> ForwardResult | None:
-        """Forward a proxy request using raw sockets.
-
-        Uses the Forwarder to send the request to upstream and relay
-        the response directly to the client, preserving exact wire bytes
-        including Transfer-Encoding.
-
-        Args:
-            request: The HTTP request to forward.
-            writer: The writer to relay the response to.
-
-        Returns:
-            ForwardResult for recording, or None on failure.
-        """
-        if self._raw_forwarder is None:
-            return None
-
-        uri = request.target_uri
-        if uri is None:
-            return None
-
-        request_wire = self._build_origin_form_request(request, uri)
-        upstream_tls = uri.scheme == "https"
-
-        return await self._raw_forwarder.forward_and_relay(
-            host=uri.host,
-            port=uri.port,
-            request_wire_bytes=request_wire,
-            client_writer=cast(asyncio.StreamWriter, writer),
-            request_method=request.method,
-            upstream_tls=upstream_tls,
-        )
-
-    async def _maybe_throttle_request(
-        self,
-        request: HTTPRequest,
-        recording_writer: RecordingStreamWriter,
-    ) -> _PreparedResponse | None:
-        throttle = self._throttle
-        if throttle is None:
-            return None
-
-        decision = throttle.throttler.check(request)
-        if decision.allowed:
-            return None
-
-        response = throttle.response(request, decision)
-        wire_offset = len(recording_writer.bytes_sent)
-        should_close = await self._write_response(
-            recording_writer,
-            response,
-            request,
-        )
-        wire_bytes = recording_writer.bytes_sent[wire_offset:]
-        recorded = self._build_recorded_response(response, wire_bytes)
-        return _PreparedResponse(
-            response=response,
-            recorded_response=recorded,
-            should_close=should_close,
-        )
-
-    async def _maybe_forward_proxy_raw(
-        self,
-        request: HTTPRequest,
-        recording_writer: RecordingStreamWriter,
-    ) -> _PreparedResponse | None:
-        if not request.is_proxy_request or self._raw_forwarder is None:
-            return None
-
-        wire_offset = len(recording_writer.bytes_sent)
-        forward_result = await self._forward_proxy_raw(
-            request,
-            recording_writer,
-        )
-        if forward_result is None:
-            return None
-
-        response = HTTPResponse(
-            status=forward_result.status,
-            headers=dict(forward_result.headers.items()),
-            body=forward_result.body,
-        )
-        wire_bytes = recording_writer.bytes_sent[wire_offset:]
-        recorded = RecordedResponse(
-            status=forward_result.status,
-            reason=forward_result.reason,
-            headers=forward_result.headers,
-            body=forward_result.body.decode("utf-8", errors="replace"),
-            wire_raw_bytes=wire_bytes,
-        )
-        return _PreparedResponse(
-            response=response,
-            recorded_response=recorded,
-            should_close=self._should_close_connection(request, response),
-        )
-
-    async def _record_request(self, request: HTTPRequest) -> datetime:
+    ) -> tuple[datetime, float]:
+        received_monotonic = self._clock.now()
         self.last_request = request
         self.requests.append(request)
-        self._request_timestamps[id(request)] = self._clock.now()
+        self._request_timestamps[id(request)] = received_monotonic
         request_timestamp = self._timestamp_provider.now()
         await self._request_queue.put(request)
-        return request_timestamp
+        return request_timestamp, received_monotonic
 
     async def _handle_request(
         self,
         *,
         request: HTTPRequest,
         request_timestamp: datetime,
+        received_monotonic: float,
+        state: dict[str, Any],
+        reader: asyncio.StreamReader,
         recording_writer: RecordingStreamWriter,
-        ctx: ConnectionContext,
+        conn_recv: bytearray | None,
+        conn_sent: bytearray | None,
     ) -> bool:
         exchange_recorded = False
+        responder = self._build_responder()
+        sender = self._build_sender()
         try:
-            prepared = await self._maybe_throttle_request(
+            responder_ctx = ResponderContext(
                 request=request,
-                recording_writer=recording_writer,
+                connection=ConnectionMeta(client=request.client),
+                services=self._services,
+                state=state,
+                received_monotonic=received_monotonic,
             )
-            if prepared is None:
-                prepared = await self._maybe_forward_proxy_raw(
-                    request=request,
-                    recording_writer=recording_writer,
-                )
+            response_spec = await responder(responder_ctx)
 
-            if prepared is None:
-                response = await self._get_response(request)
-                wire_offset = len(recording_writer.bytes_sent)
-                should_close = await self._write_response(
-                    recording_writer, response, request
-                )
-                wire_bytes = recording_writer.bytes_sent[wire_offset:]
-                recorded = self._build_recorded_response(response, wire_bytes)
-                prepared = _PreparedResponse(
-                    response=response,
-                    recorded_response=recorded,
-                    should_close=should_close,
-                )
+            sender_ctx = SenderContext(
+                request=request,
+                conn=ConnectionInfo(
+                    reader=reader,
+                    writer=recording_writer,
+                    client=request.client,
+                    raw_received_total=conn_recv,
+                    raw_sent_total=conn_sent,
+                ),
+                services=self._services,
+                state=state,
+            )
+            send_result = await sender(sender_ctx, response_spec)
 
             response_timestamp = self._timestamp_provider.now()
             self._record_exchange(
                 request=request,
-                response=prepared.recorded_response,
+                response=send_result.recorded,
                 request_timestamp=request_timestamp,
                 response_timestamp=response_timestamp,
             )
             exchange_recorded = True
-            await self._response_queue.put(prepared.recorded_response)
-            ctx.history.append((request, prepared.response))
-            return prepared.should_close
+            await self._response_queue.put(send_result.recorded)
+            return send_result.should_close
         except Exception:
             if not exchange_recorded:
                 self._record_exchange(
@@ -1275,26 +1010,31 @@ class AsyncHTTPTestServer:
         client = self._extract_client_info(writer)
         conn_recv, conn_sent = self._init_connection_tracking(client)
         recording_writer = RecordingStreamWriter(writer, conn_sent)
-        ctx = ConnectionContext(
-            reader=reader,
-            writer=recording_writer,
-            client=client,
-            raw_received_total=conn_recv,
-            raw_sent_total=conn_sent,
-        )
         try:
             while True:
-                request = await self._read_request(
-                    reader, recording_writer, conn_recv
+                request_result = await self._read_request(
+                    reader,
+                    recording_writer,
+                    client=client,
+                    connection_wire=conn_recv,
                 )
-                if request is None:
+                if request_result is None:
                     break
-                request_timestamp = await self._record_request(request)
+
+                request, state = request_result
+                (
+                    request_timestamp,
+                    received_monotonic,
+                ) = await self._record_request(request)
                 should_close = await self._handle_request(
                     request=request,
                     request_timestamp=request_timestamp,
+                    received_monotonic=received_monotonic,
+                    state=state,
                     recording_writer=recording_writer,
-                    ctx=ctx,
+                    reader=reader,
+                    conn_recv=conn_recv,
+                    conn_sent=conn_sent,
                 )
 
                 if should_close:
@@ -1313,26 +1053,25 @@ class AsyncHTTPTestServer:
         self,
         reader: asyncio.StreamReader,
         writer: Writer,
+        *,
+        client: tuple[str, int] | None,
         connection_wire: bytearray | None = None,
-    ) -> HTTPRequest | None:
+    ) -> tuple[HTTPRequest, dict[str, Any]] | None:
+        state: dict[str, Any] = {}
         parser = AsyncRequestParser()
 
-        # If no on_headers_received hook, use atomic parsing (unchanged)
-        if self._on_headers_received is None:
+        if not self.header_middlewares and self._on_headers_received is None:
             parsed, wire_bytes = await parser.parse(reader, connection_wire)
             if parsed is None:
                 return None
-            return self._build_request(parsed, wire_bytes, writer)
+            return self._build_request(parsed, wire_bytes, writer), state
 
-        # Two-phase parsing with on_headers_received hook
-        # Phase 1: Parse headers only
         parsed, header_wire, remaining = await parser.parse_headers(
             reader, connection_wire
         )
         if parsed is None:
             return None
 
-        # Build partial request for the hook
         headers_msg = headers_to_message(parsed.headers)
         partial = HTTPRequestHeaders(
             method=parsed.method,
@@ -1346,28 +1085,29 @@ class AsyncHTTPTestServer:
             wire_raw_bytes=header_wire,
         )
 
-        # Create the send callback
         async def send_response(response: HTTPResponse) -> None:
             await self._write_interim_response(writer, response)
 
-        # Call the hook
-        result = self._on_headers_received(partial, send_response)
-        if inspect.isawaitable(result):
-            should_continue = await result
-        else:
-            should_continue = cast(bool, result)
+        header_ctx = HeaderContext(
+            headers=partial,
+            connection=ConnectionMeta(client=client),
+            services=self._services,
+            send=send_response,
+            state=state,
+        )
+        header_app = self._build_header()
+        should_continue = await header_app(header_ctx)
 
         if not should_continue:
             return None
 
-        # Phase 2: Parse body
         parsed, wire_bytes = await parser.continue_parse_body(
             reader, remaining, connection_wire
         )
         if parsed is None:
             return None
 
-        return self._build_request(parsed, wire_bytes, writer)
+        return self._build_request(parsed, wire_bytes, writer), state
 
     def _build_request(
         self,
@@ -1542,7 +1282,10 @@ class AsyncHTTPTestServer:
         writer.write(status_line.encode("ascii"))
 
         body = self._normalize_body(response.body)
-        should_close = self._should_close_connection(request, response)
+        should_close = should_close_connection(
+            request,
+            response_headers=response.headers,
+        )
         headers = self._build_response_headers(response, body, should_close)
 
         for name, value in headers.items():
