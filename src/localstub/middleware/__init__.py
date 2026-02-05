@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .core import (
-    ConnectionInfo,
     ConnectionMeta,
     ForwardProxyResponse,
     HeaderContext,
@@ -25,7 +24,6 @@ from .core import (
 )
 
 __all__ = [
-    'ConnectionInfo',
     'ConnectionMeta',
     'ForwardProxyResponse',
     'HeaderContext',

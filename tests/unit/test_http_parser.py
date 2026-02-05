@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from email.message import Message
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
+    HTTPRequestHeaders,
     HTTPRequestReader,
     ParsedRequest,
     RequestProtocol,
@@ -1083,6 +1085,56 @@ class TestHTTPRequest:
             body='{"key": "value"}',
         )
         assert request.json_body == {"key": "value"}
+
+    def test_headers_are_immutable(self) -> None:
+        headers = Message()
+        headers["X-Test"] = "a"
+        request = HTTPRequest(
+            method="GET",
+            path="/",
+            http_version="1.1",
+            headers=headers,
+        )
+
+        assert request.headers["X-Test"] == "a"
+
+        with pytest.raises(TypeError, match="immutable"):
+            request.headers["X-Test"] = "b"
+        with pytest.raises(TypeError, match="immutable"):
+            del request.headers["X-Test"]
+        with pytest.raises(TypeError, match="immutable"):
+            request.headers.add_header("X-Other", "c")
+        with pytest.raises(TypeError, match="immutable"):
+            request.headers.replace_header("X-Test", "b")
+        with pytest.raises(TypeError, match="immutable"):
+            request.headers.set_raw("X-Test", "b")
+
+    def test_with_headers_freezes_copy(self) -> None:
+        base = HTTPRequest(method="GET", path="/", http_version="1.1")
+        headers = Message()
+        headers["X-Test"] = "a"
+
+        rewritten = base.with_headers(headers)
+        headers["X-Other"] = "b"
+
+        assert rewritten.headers["X-Test"] == "a"
+        assert "X-Other" not in rewritten.headers
+
+    def test_partial_headers_are_immutable(self) -> None:
+        headers = Message()
+        headers["Host"] = "example.com"
+
+        partial = HTTPRequestHeaders(
+            method="GET",
+            path="/",
+            http_version="1.1",
+            headers=headers,
+            wire_raw_bytes=(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+        )
+
+        assert partial.headers["Host"] == "example.com"
+        with pytest.raises(TypeError, match="immutable"):
+            partial.headers["Host"] = "other.example.com"
 
 
 def _create_mock_reader(data_chunks: list[bytes]) -> asyncio.StreamReader:

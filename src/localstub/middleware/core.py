@@ -48,18 +48,9 @@ class ResponderContext:
 
 
 @dataclass(frozen=True)
-class ConnectionInfo:
-    reader: Any
-    writer: Any
-    client: tuple[str, int] | None
-    raw_received_total: bytearray | None
-    raw_sent_total: bytearray | None
-
-
-@dataclass(frozen=True)
 class SenderContext:
     request: HTTPRequest
-    conn: ConnectionInfo
+    connection: ConnectionMeta
     services: ServerServices
     state: dict[str, Any] = field(default_factory=dict)
 
