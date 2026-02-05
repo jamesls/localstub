@@ -8,6 +8,7 @@ from email.message import Message
 from pathlib import Path
 from typing import Literal, TextIO
 
+from localstub.http.headers import Headers
 from localstub.http.exchange import RecordedExchange
 from localstub.http.request import HTTPRequest
 from localstub.http.response import RecordedResponse
@@ -41,7 +42,7 @@ def _request_client_json(
 
 
 def _headers_json(
-    headers: Message | Mapping[str, str] | None,
+    headers: Headers | Message | Mapping[str, str] | None,
 ) -> dict[str, str]:
     if headers is None:
         return {}

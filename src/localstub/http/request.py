@@ -3,17 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field, replace
-from email.message import Message
 from typing import Any, Protocol
 
 import httptools
 
+from localstub.http.headers import Headers
 from localstub.http.uri import ParsedURI, parse_absolute_uri
-from localstub.http.utils import (
-    FrozenMessage,
-    freeze_message,
-    headers_to_message,
-)
+from localstub.http.utils import headers_to_headers
 
 
 class Writer(Protocol):
@@ -38,18 +34,11 @@ class HTTPRequest:
     method: str
     path: str
     http_version: str
-    headers: Message = field(default_factory=FrozenMessage)
+    headers: Headers = field(default_factory=Headers.empty)
     body: str = ""
     body_bytes: bytes = b""
     wire_raw_bytes: bytes = b""
     client: tuple[str, int] | None = None
-
-    def __post_init__(self) -> None:
-        # This looks weird but it is what the python dataclass docs suggest
-        # if you want to assign an attribute wiht a frozen dataclass during
-        # initialization, see:
-        # https://docs.python.org/3/library/dataclasses.html#frozen-instances
-        object.__setattr__(self, "headers", freeze_message(self.headers))
 
     @classmethod
     def from_parsed(
@@ -59,7 +48,7 @@ class HTTPRequest:
         *,
         writer: Writer | None = None,
     ) -> HTTPRequest:
-        headers = headers_to_message(parsed.headers)
+        headers = headers_to_headers(parsed.headers)
         body_bytes = parsed.body
         body_text = body_bytes.decode("utf-8", errors="replace")
         path = (
@@ -90,8 +79,8 @@ class HTTPRequest:
     def with_method(self, method: str) -> HTTPRequest:
         return replace(self, method=method)
 
-    def with_headers(self, headers: Message) -> HTTPRequest:
-        return replace(self, headers=freeze_message(headers))
+    def with_headers(self, headers: Headers) -> HTTPRequest:
+        return replace(self, headers=headers)
 
     @property
     def wire_body_bytes(self) -> bytes:
@@ -167,11 +156,8 @@ class HTTPRequestHeaders:
     method: str | None
     path: str | None
     http_version: str | None
-    headers: Message
+    headers: Headers
     wire_raw_bytes: bytes
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "headers", freeze_message(self.headers))
 
 
 @dataclass

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import logging
-from email.message import Message
 from typing import cast
 
 import httpx
 
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.uri import ParsedURI
@@ -22,7 +22,7 @@ def _parse_connection_tokens(value: str) -> set[str]:
     return tokens
 
 
-def connection_tokens_from_headers(headers: Message | None) -> set[str]:
+def connection_tokens_from_headers(headers: Headers | None) -> set[str]:
     if headers is None:
         return set()
     tokens: set[str] = set()

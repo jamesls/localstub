@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from email.message import Message
 
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest
 
 
@@ -14,7 +15,9 @@ def _parse_connection_tokens(value: str) -> set[str]:
     return tokens
 
 
-def _connection_tokens_from_message(headers: Message | None) -> set[str]:
+def _connection_tokens_from_headers(
+    headers: Headers | Message | None,
+) -> set[str]:
     if headers is None:
         return set()
     tokens: set[str] = set()
@@ -41,16 +44,16 @@ def _is_http11(request: HTTPRequest) -> bool:
 def should_close_connection(
     request: HTTPRequest,
     *,
-    response_headers: Message | dict[str, str] | None,
+    response_headers: Headers | Message | dict[str, str] | None,
 ) -> bool:
-    request_tokens = _connection_tokens_from_message(request.headers)
+    request_tokens = _connection_tokens_from_headers(request.headers)
 
     if response_headers is None:
         response_tokens = set()
-    elif isinstance(response_headers, Message):
-        response_tokens = _connection_tokens_from_message(response_headers)
-    else:
+    elif isinstance(response_headers, dict):
         response_tokens = _connection_tokens_from_dict(response_headers)
+    else:
+        response_tokens = _connection_tokens_from_headers(response_headers)
 
     if "close" in response_tokens:
         return True
