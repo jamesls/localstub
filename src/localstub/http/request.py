@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from email.message import Message
 from typing import Any, Protocol
 
@@ -18,7 +18,7 @@ class Writer(Protocol):
     def get_extra_info(self, name: str, default: Any | None = None) -> Any: ...
 
 
-@dataclass
+@dataclass(frozen=True)
 class HTTPRequest:
     """Snapshot of a single HTTP request.
 
@@ -72,6 +72,15 @@ class HTTPRequest:
             wire_raw_bytes=wire_raw_bytes,
             client=client,
         )
+
+    def with_path(self, path: str) -> HTTPRequest:
+        return replace(self, path=path)
+
+    def with_method(self, method: str) -> HTTPRequest:
+        return replace(self, method=method)
+
+    def with_headers(self, headers: Message) -> HTTPRequest:
+        return replace(self, headers=headers)
 
     @property
     def wire_body_bytes(self) -> bytes:
@@ -138,6 +147,17 @@ class HTTPRequest:
         if uri is not None:
             return uri.path
         return self.path
+
+
+@dataclass(frozen=True)
+class HTTPRequestHeaders:
+    """Partial request available after headers are parsed, before body."""
+
+    method: str | None
+    path: str | None
+    http_version: str | None
+    headers: Message
+    wire_raw_bytes: bytes
 
 
 @dataclass
