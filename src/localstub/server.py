@@ -33,8 +33,8 @@ from localstub.http.response import RecordedResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.utils import headers_to_message
 from localstub.middleware import (
-    ConnectionInfo,
     ConnectionMeta,
+    ForwardProxyResponse,
     HeaderContext,
     HeaderMiddleware,
     ResponderContext,
@@ -54,7 +54,6 @@ from localstub.middleware.builtins import (
     HandlerMiddleware,
     HttpxForwardProxyMiddleware,
     RawForwardProxyMiddleware,
-    RawForwardProxySender,
     ResponseSequenceMiddleware,
     RouterMiddleware,
     ThrottleMiddleware,
@@ -400,7 +399,6 @@ class AsyncHTTPTestServer:
             if proxy_forwarder is not None
             else None
         )
-        self._raw_forward_proxy_sender = RawForwardProxySender()
 
         self.responder_middlewares: list[ResponderMiddleware] = []
         self.sender_middlewares: list[SenderMiddleware] = []
@@ -875,21 +873,53 @@ class AsyncHTTPTestServer:
 
     def _build_sender(
         self,
+        recording_writer: RecordingStreamWriter,
     ) -> Callable[[SenderContext, ResponseSpec], Awaitable[SendResult]]:
-        middlewares = [
-            *self.sender_middlewares,
-            self._raw_forward_proxy_sender,
-        ]
+        middlewares = [*self.sender_middlewares]
 
         async def terminal(
             ctx: SenderContext,
             response: ResponseSpec,
         ) -> SendResult:
+            writer = recording_writer
+
+            if isinstance(response, ForwardProxyResponse):
+                wire_offset = len(writer.bytes_sent)
+                result = await response.forwarder.forward_and_relay(
+                    host=response.host,
+                    port=response.port,
+                    request_wire_bytes=response.request_wire_bytes,
+                    client_writer=cast(Any, writer),
+                    request_method=response.request_method,
+                    upstream_tls=response.upstream_tls,
+                )
+                wire_bytes = writer.bytes_sent[wire_offset:]
+                if result is None:
+                    return await terminal(
+                        ctx,
+                        HTTPResponse.text("Bad Gateway", status=502),
+                    )
+
+                recorded = RecordedResponse(
+                    status=result.status,
+                    reason=result.reason,
+                    headers=result.headers,
+                    body=result.body.decode("utf-8", errors="replace"),
+                    wire_raw_bytes=wire_bytes,
+                )
+                return SendResult(
+                    recorded=recorded,
+                    should_close=should_close_connection(
+                        ctx.request,
+                        response_headers=result.headers,
+                    ),
+                )
+
             if not isinstance(response, HTTPResponse):
                 raise TypeError(
                     f"Unhandled response spec: {type(response).__name__}"
                 )
-            writer = ctx.conn.writer
+
             wire_offset = len(writer.bytes_sent)
             should_close = await self._write_response(
                 writer,
@@ -950,14 +980,11 @@ class AsyncHTTPTestServer:
         request_timestamp: datetime,
         received_monotonic: float,
         state: dict[str, Any],
-        reader: asyncio.StreamReader,
         recording_writer: RecordingStreamWriter,
-        conn_recv: bytearray | None,
-        conn_sent: bytearray | None,
     ) -> bool:
         exchange_recorded = False
         responder = self._build_responder()
-        sender = self._build_sender()
+        sender = self._build_sender(recording_writer)
         try:
             responder_ctx = ResponderContext(
                 request=request,
@@ -970,13 +997,7 @@ class AsyncHTTPTestServer:
 
             sender_ctx = SenderContext(
                 request=request,
-                conn=ConnectionInfo(
-                    reader=reader,
-                    writer=recording_writer,
-                    client=request.client,
-                    raw_received_total=conn_recv,
-                    raw_sent_total=conn_sent,
-                ),
+                connection=ConnectionMeta(client=request.client),
                 services=self._services,
                 state=state,
             )
@@ -1032,9 +1053,6 @@ class AsyncHTTPTestServer:
                     received_monotonic=received_monotonic,
                     state=state,
                     recording_writer=recording_writer,
-                    reader=reader,
-                    conn_recv=conn_recv,
-                    conn_sent=conn_sent,
                 )
 
                 if should_close:

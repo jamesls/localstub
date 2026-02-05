@@ -4,24 +4,19 @@ import inspect
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 import httpx
 
 from localstub.forward import Forwarder
-from localstub.http.connection import should_close_connection
 from localstub.http.proxy import build_origin_form_request, forward_via_httpx
 from localstub.http.request import HTTPRequest
-from localstub.http.response import RecordedResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.middleware.core import (
     ForwardProxyResponse,
     ResponderContext,
     ResponderNext,
     ResponseSpec,
-    SenderContext,
-    SenderNext,
-    SendResult,
 )
 from localstub.router import ResponderHandler, Router
 from localstub.throttle import RequestThrottler, ThrottleDecision
@@ -152,47 +147,3 @@ class HandlerMiddleware:
         if inspect.isawaitable(result):
             return await cast(Awaitable[ResponseSpec], result)
         return cast(ResponseSpec, result)
-
-
-@dataclass
-class RawForwardProxySender:
-    async def __call__(
-        self,
-        ctx: SenderContext,
-        response: ResponseSpec,
-        call_next: SenderNext,
-    ) -> SendResult:
-        if not isinstance(response, ForwardProxyResponse):
-            return await call_next(response)
-
-        writer = ctx.conn.writer
-        wire_offset = len(writer.bytes_sent)
-        result = await response.forwarder.forward_and_relay(
-            host=response.host,
-            port=response.port,
-            request_wire_bytes=response.request_wire_bytes,
-            client_writer=cast(Any, writer),
-            request_method=response.request_method,
-            upstream_tls=response.upstream_tls,
-        )
-        wire_bytes = writer.bytes_sent[wire_offset:]
-
-        if result is None:
-            return await call_next(
-                HTTPResponse.text("Bad Gateway", status=502),
-            )
-
-        recorded = RecordedResponse(
-            status=result.status,
-            reason=result.reason,
-            headers=result.headers,
-            body=result.body.decode("utf-8", errors="replace"),
-            wire_raw_bytes=wire_bytes,
-        )
-        return SendResult(
-            recorded=recorded,
-            should_close=should_close_connection(
-                ctx.request,
-                response_headers=result.headers,
-            ),
-        )

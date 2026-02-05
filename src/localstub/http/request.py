@@ -9,7 +9,11 @@ from typing import Any, Protocol
 import httptools
 
 from localstub.http.uri import ParsedURI, parse_absolute_uri
-from localstub.http.utils import headers_to_message
+from localstub.http.utils import (
+    FrozenMessage,
+    freeze_message,
+    headers_to_message,
+)
 
 
 class Writer(Protocol):
@@ -34,11 +38,18 @@ class HTTPRequest:
     method: str
     path: str
     http_version: str
-    headers: Message = field(default_factory=Message)
+    headers: Message = field(default_factory=FrozenMessage)
     body: str = ""
     body_bytes: bytes = b""
     wire_raw_bytes: bytes = b""
     client: tuple[str, int] | None = None
+
+    def __post_init__(self) -> None:
+        # This looks weird but it is what the python dataclass docs suggest
+        # if you want to assign an attribute wiht a frozen dataclass during
+        # initialization, see:
+        # https://docs.python.org/3/library/dataclasses.html#frozen-instances
+        object.__setattr__(self, "headers", freeze_message(self.headers))
 
     @classmethod
     def from_parsed(
@@ -80,7 +91,7 @@ class HTTPRequest:
         return replace(self, method=method)
 
     def with_headers(self, headers: Message) -> HTTPRequest:
-        return replace(self, headers=headers)
+        return replace(self, headers=freeze_message(headers))
 
     @property
     def wire_body_bytes(self) -> bytes:
@@ -158,6 +169,9 @@ class HTTPRequestHeaders:
     http_version: str | None
     headers: Message
     wire_raw_bytes: bytes
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headers", freeze_message(self.headers))
 
 
 @dataclass

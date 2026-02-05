@@ -10,7 +10,6 @@ from localstub.http.request import HTTPRequest, HTTPRequestHeaders
 from localstub.http.response import RecordedResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.middleware import (
-    ConnectionInfo,
     ConnectionMeta,
     HeaderContext,
     ResponderContext,
@@ -144,13 +143,7 @@ async def test_compose_sender_call_next_twice_raises() -> None:
 
     ctx = SenderContext(
         request=HTTPRequest(method="GET", path="/", http_version="1.1"),
-        conn=ConnectionInfo(
-            reader=None,
-            writer=None,
-            client=None,
-            raw_received_total=None,
-            raw_sent_total=None,
-        ),
+        connection=ConnectionMeta(client=None),
         services=_services(),
     )
 
