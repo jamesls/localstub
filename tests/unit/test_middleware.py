@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 import pytest
@@ -12,6 +12,7 @@ from localstub.http.responsespec import HTTPResponse
 from localstub.middleware import (
     ConnectionMeta,
     HeaderContext,
+    ResponseSpec,
     ResponderContext,
     SenderContext,
     SendResult,
@@ -96,6 +97,35 @@ async def test_compose_responder_ctx_override_rewrites_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_responder_ctx_override_persists_across_chain() -> None:
+    seen_paths: list[str] = []
+
+    async def rewrite(ctx: ResponderContext, call_next) -> HTTPResponse:
+        rewritten = ctx.request.with_path("/rewritten")
+        return await call_next(ctx=ctx.with_request(rewritten))
+
+    async def observe(ctx: ResponderContext, call_next) -> HTTPResponse:
+        seen_paths.append(ctx.request.path)
+        return await call_next()
+
+    async def terminal(ctx: ResponderContext) -> HTTPResponse:
+        seen_paths.append(ctx.request.path)
+        return HTTPResponse.text(ctx.request.path)
+
+    app = compose_responder([rewrite, observe], terminal)
+    ctx = ResponderContext(
+        request=HTTPRequest(method="GET", path="/orig", http_version="1.1"),
+        connection=ConnectionMeta(client=None),
+        services=_services(),
+    )
+
+    result = await app(ctx)
+    assert isinstance(result, HTTPResponse)
+    assert result.body == b"/rewritten"
+    assert seen_paths == ["/rewritten", "/rewritten"]
+
+
+@pytest.mark.asyncio
 async def test_responder_context_clone_request_patches_request() -> None:
     async def mw(ctx: ResponderContext, call_next) -> HTTPResponse:
         ctx2 = ctx.clone_request(
@@ -145,6 +175,55 @@ async def test_compose_responder_call_next_twice_raises() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sender_ctx_override_persists_across_chain() -> None:
+    seen_paths: list[str] = []
+
+    async def rewrite(
+        ctx: SenderContext,
+        response: ResponseSpec,
+        call_next,
+    ) -> SendResult:
+        next_ctx = replace(ctx, request=ctx.request.with_path("/rewritten"))
+        return await call_next(response, ctx=next_ctx)
+
+    async def observe(
+        ctx: SenderContext,
+        response: ResponseSpec,
+        call_next,
+    ) -> SendResult:
+        seen_paths.append(ctx.request.path)
+        return await call_next(response)
+
+    async def terminal(
+        ctx: SenderContext,
+        response: ResponseSpec,
+    ) -> SendResult:
+        _ = response
+        seen_paths.append(ctx.request.path)
+        return SendResult(
+            recorded=RecordedResponse(
+                status=200,
+                reason="OK",
+                headers=None,
+                body=None,
+                wire_raw_bytes=b"",
+            ),
+            should_close=False,
+        )
+
+    app = compose_sender([rewrite, observe], terminal)
+    ctx = SenderContext(
+        request=HTTPRequest(method="GET", path="/orig", http_version="1.1"),
+        connection=ConnectionMeta(client=None),
+        services=_services(),
+    )
+
+    result = await app(ctx, HTTPResponse.text("ok"))
+    assert not result.should_close
+    assert seen_paths == ["/rewritten", "/rewritten"]
+
+
+@pytest.mark.asyncio
 async def test_compose_sender_call_next_twice_raises() -> None:
     async def mw(ctx: SenderContext, response, call_next) -> SendResult:
         _ = ctx
@@ -177,6 +256,45 @@ async def test_compose_sender_call_next_twice_raises() -> None:
         RuntimeError, match="call_next\\(\\) called multiple times"
     ):
         await app(ctx, HTTPResponse.text("ok"))
+
+
+@pytest.mark.asyncio
+async def test_headers_ctx_override_persists_across_chain() -> None:
+    seen_paths: list[str | None] = []
+
+    async def rewrite(ctx: HeaderContext, call_next) -> bool:
+        next_headers = replace(ctx.headers, path="/rewritten")
+        return await call_next(ctx=replace(ctx, headers=next_headers))
+
+    async def observe(ctx: HeaderContext, call_next) -> bool:
+        seen_paths.append(ctx.headers.path)
+        return await call_next()
+
+    async def terminal(ctx: HeaderContext) -> bool:
+        seen_paths.append(ctx.headers.path)
+        return True
+
+    app = compose_headers([rewrite, observe], terminal)
+
+    async def send(_: HTTPResponse) -> None:
+        pass
+
+    ctx = HeaderContext(
+        headers=HTTPRequestHeaders(
+            method="GET",
+            path="/orig",
+            http_version="1.1",
+            headers=Headers.empty(),
+            wire_raw_bytes=b"GET /orig HTTP/1.1\r\n\r\n",
+        ),
+        connection=ConnectionMeta(client=None),
+        services=_services(),
+        send=send,
+    )
+
+    should_continue = await app(ctx)
+    assert should_continue
+    assert seen_paths == ["/rewritten", "/rewritten"]
 
 
 @pytest.mark.asyncio
