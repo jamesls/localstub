@@ -149,17 +149,15 @@ def compose_responder(
 
         async def dispatch(
             i: int,
-            *,
-            ctx_override: ResponderContext | None,
+            current_ctx: ResponderContext,
         ) -> ResponseSpec:
             nonlocal index
             if i <= index:
                 raise RuntimeError("call_next() called multiple times")
             index = i
 
-            next_ctx = ctx if ctx_override is None else ctx_override
             if i >= len(middlewares):
-                return await _maybe_await(terminal(next_ctx))
+                return await _maybe_await(terminal(current_ctx))
 
             mw = middlewares[i]
 
@@ -167,11 +165,12 @@ def compose_responder(
                 *,
                 ctx: ResponderContext | None = None,
             ) -> ResponseSpec:
-                return await dispatch(i + 1, ctx_override=ctx)
+                next_ctx = current_ctx if ctx is None else ctx
+                return await dispatch(i + 1, next_ctx)
 
-            return await _maybe_await(mw(next_ctx, call_next))
+            return await _maybe_await(mw(current_ctx, call_next))
 
-        return await dispatch(0, ctx_override=None)
+        return await dispatch(0, ctx)
 
     return app
 
@@ -209,17 +208,15 @@ def compose_sender(
         async def dispatch(
             i: int,
             resp: ResponseSpec,
-            *,
-            ctx_override: SenderContext | None,
+            current_ctx: SenderContext,
         ) -> SendResult:
             nonlocal index
             if i <= index:
                 raise RuntimeError("call_next() called multiple times")
             index = i
 
-            next_ctx = ctx if ctx_override is None else ctx_override
             if i >= len(middlewares):
-                return await _maybe_await(terminal(next_ctx, resp))
+                return await _maybe_await(terminal(current_ctx, resp))
 
             mw = middlewares[i]
 
@@ -228,11 +225,12 @@ def compose_sender(
                 *,
                 ctx: SenderContext | None = None,
             ) -> SendResult:
-                return await dispatch(i + 1, response, ctx_override=ctx)
+                next_ctx = current_ctx if ctx is None else ctx
+                return await dispatch(i + 1, response, next_ctx)
 
-            return await _maybe_await(mw(next_ctx, resp, call_next))
+            return await _maybe_await(mw(current_ctx, resp, call_next))
 
-        return await dispatch(0, response, ctx_override=None)
+        return await dispatch(0, response, ctx)
 
     return app
 
@@ -272,17 +270,15 @@ def compose_headers(
 
         async def dispatch(
             i: int,
-            *,
-            ctx_override: HeaderContext | None,
+            current_ctx: HeaderContext,
         ) -> bool:
             nonlocal index
             if i <= index:
                 raise RuntimeError("call_next() called multiple times")
             index = i
 
-            next_ctx = ctx if ctx_override is None else ctx_override
             if i >= len(middlewares):
-                return cast(bool, await _maybe_await(terminal(next_ctx)))
+                return cast(bool, await _maybe_await(terminal(current_ctx)))
 
             mw = middlewares[i]
 
@@ -290,10 +286,11 @@ def compose_headers(
                 *,
                 ctx: HeaderContext | None = None,
             ) -> bool:
-                return await dispatch(i + 1, ctx_override=ctx)
+                next_ctx = current_ctx if ctx is None else ctx
+                return await dispatch(i + 1, next_ctx)
 
-            return cast(bool, await _maybe_await(mw(next_ctx, call_next)))
+            return cast(bool, await _maybe_await(mw(current_ctx, call_next)))
 
-        return await dispatch(0, ctx_override=None)
+        return await dispatch(0, ctx)
 
     return app
