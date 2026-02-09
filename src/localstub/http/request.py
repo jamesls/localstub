@@ -468,3 +468,31 @@ class HTTPRequestReader:
             return None
 
         return HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
+
+
+def parsed_body_bytes_from_wire_raw_bytes(
+    wire_raw_bytes: bytes,
+) -> bytes | None:
+    """Parse wire request bytes and return the decoded body bytes.
+
+    This returns the body bytes as produced by the HTTP parser. For chunked
+    uploads, this is the de-chunked body (it does not include chunk framing
+    or trailer bytes).
+
+    Returns None if the wire bytes cannot be parsed as a complete request.
+    """
+    if not wire_raw_bytes:
+        return None
+
+    protocol = RequestProtocol()
+    parser = httptools.HttpRequestParser(protocol)
+    protocol.set_parser(parser)
+    try:
+        parser.feed_data(wire_raw_bytes)
+    except httptools.HttpParserError:
+        return None
+
+    if not protocol.result.is_complete:
+        return None
+
+    return protocol.result.body

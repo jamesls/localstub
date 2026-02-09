@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 
 from localstub.forward import Forwarder
+from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
 
 
@@ -401,6 +402,68 @@ class TestRawForwarding:
 
         assert b"Transfer-Encoding: chunked" in captured_headers
         assert captured_body.startswith(b"5\r\n")
+
+    @pytest.mark.asyncio
+    async def test_rejects_body_rewrites(self) -> None:
+        request_received = asyncio.Event()
+
+        async def upstream_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            request_received.set()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        addr = upstream.sockets[0].getsockname()
+        upstream_host, upstream_port = addr[0], addr[1]
+
+        try:
+            forwarder = Forwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+
+                async def rewrite_body(
+                    ctx: ResponderContext,
+                    call_next: ResponderNext,
+                ) -> ResponseSpec:
+                    ctx2 = ctx.clone_request(body_bytes=b"HELLO")
+                    return await call_next(ctx=ctx2)
+
+                proxy.responder_middlewares.append(rewrite_body)
+
+                reader, writer = await asyncio.open_connection(
+                    proxy.host, proxy.port
+                )
+                try:
+                    request = (
+                        f"POST http://{upstream_host}:{upstream_port}"
+                        "/upload HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Content-Length: 5\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        "hello"
+                    ).encode()
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await _read_http_response_bytes(reader)
+                    assert b"500 Internal Server Error" in response
+                    assert (
+                        b"Raw proxy forwarding does not support request "
+                        b"body rewrites."
+                    ) in response
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert not request_received.is_set()
 
     @pytest.mark.asyncio
     async def test_preserves_chunked_transfer_encoding(self) -> None:
