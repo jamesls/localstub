@@ -21,7 +21,7 @@ from localstub.http.request import HTTPRequest
 from localstub.http.response import RecordedResponse
 from localstub.server import AsyncHTTPTestServer
 from localstub.tlsproxy import AsyncTLSInterceptProxy
-from localstub.traffic_jsonl import JsonlTrafficWriter
+from localstub.traffic_jsonl import JSONLTrafficWriter
 
 DEFAULT_PORT = 8888
 
@@ -300,8 +300,8 @@ async def process_traffic(
     awaiting ``next_response()`` as "no response" and log the request with
     ``response=None`` so traffic recording continues.
     """
-    jsonl: JsonlTrafficWriter | None = (
-        JsonlTrafficWriter(output_file) if output_file else None
+    jsonl: JSONLTrafficWriter | None = (
+        JSONLTrafficWriter(output_file) if output_file else None
     )
     while not shutdown_event.is_set():
         try:
@@ -364,8 +364,8 @@ async def process_http_proxy_traffic(
     response_max_timeouts: int = 3,
 ) -> None:
     """Poll for recorded requests/responses (HTTP forward proxy mode)."""
-    jsonl: JsonlTrafficWriter | None = (
-        JsonlTrafficWriter(output_file) if output_file else None
+    jsonl: JSONLTrafficWriter | None = (
+        JSONLTrafficWriter(output_file) if output_file else None
     )
     while not shutdown_event.is_set():
         try:

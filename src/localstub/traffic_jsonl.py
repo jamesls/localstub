@@ -109,7 +109,7 @@ def exchange_to_json_obj(exchange: RecordedExchange) -> dict[str, object]:
     }
 
 
-class JsonlTrafficWriter:
+class JSONLTrafficWriter:
     def __init__(self, fp: TextIO, *, flush_each: bool = True) -> None:
         self._fp = fp
         self._flush_each = flush_each
@@ -138,12 +138,12 @@ def dump_server_traffic_jsonl(
 
     if isinstance(output, Path):
         with output.open(mode, encoding="utf-8") as fp:
-            writer = JsonlTrafficWriter(fp)
+            writer = JSONLTrafficWriter(fp)
             for exchange in exchanges:
                 writer.write_exchange(exchange)
         return len(exchanges)
 
-    writer = JsonlTrafficWriter(output)
+    writer = JSONLTrafficWriter(output)
     for exchange in exchanges:
         writer.write_exchange(exchange)
     return len(exchanges)
