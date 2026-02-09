@@ -13,7 +13,7 @@ from localstub.http.request import HTTPRequest
 from localstub.http.response import RecordedResponse
 from localstub.server import AsyncHTTPTestServer
 from localstub.traffic_jsonl import (
-    JsonlTrafficWriter,
+    JSONLTrafficWriter,
     dump_server_traffic_jsonl,
     exchange_to_json_obj,
 )
@@ -156,7 +156,7 @@ def test_jsonl_writer_writes_single_line() -> None:
     )
 
     out = io.StringIO()
-    writer = JsonlTrafficWriter(out)
+    writer = JSONLTrafficWriter(out)
     writer.write_exchange(exchange)
 
     lines = [line for line in out.getvalue().splitlines() if line.strip()]
