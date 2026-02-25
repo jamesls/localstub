@@ -36,5 +36,9 @@ class Router:
             return None
         result = handler(ctx)
         if inspect.isawaitable(result):
-            return await cast(Awaitable[ResponseSpec], result)
-        return cast(ResponseSpec, result)
+            resolved = await cast(Awaitable[ResponseSpec | None], result)
+        else:
+            resolved = cast(ResponseSpec | None, result)
+        if resolved is None:
+            raise TypeError("Unhandled response spec: NoneType")
+        return resolved
