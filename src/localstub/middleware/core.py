@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -10,6 +9,7 @@ from localstub.forward import Forwarder
 from localstub.http.request import HTTPRequest, HTTPRequestHeaders
 from localstub.http.response import RecordedResponse
 from localstub.http.responsespec import HTTPResponse
+from localstub.http.utils import maybe_await
 from localstub.throttle import Clock, MonotonicClock
 
 
@@ -114,16 +114,6 @@ class ForwardProxyResponse:
 ResponseSpec: TypeAlias = HTTPResponse | ForwardProxyResponse
 
 
-def _maybe_await(value: Any) -> Awaitable[Any]:
-    if inspect.isawaitable(value):
-        return cast(Awaitable[Any], value)
-
-    async def done() -> Any:
-        return value
-
-    return done()
-
-
 class ResponderNext(Protocol):
     def __call__(
         self,
@@ -157,7 +147,7 @@ def compose_responder(
             index = i
 
             if i >= len(middlewares):
-                return await _maybe_await(terminal(current_ctx))
+                return await maybe_await(terminal(current_ctx))
 
             mw = middlewares[i]
 
@@ -168,7 +158,7 @@ def compose_responder(
                 next_ctx = current_ctx if ctx is None else ctx
                 return await dispatch(i + 1, next_ctx)
 
-            return await _maybe_await(mw(current_ctx, call_next))
+            return await maybe_await(mw(current_ctx, call_next))
 
         return await dispatch(0, ctx)
 
@@ -216,7 +206,7 @@ def compose_sender(
             index = i
 
             if i >= len(middlewares):
-                return await _maybe_await(terminal(current_ctx, resp))
+                return await maybe_await(terminal(current_ctx, resp))
 
             mw = middlewares[i]
 
@@ -228,7 +218,7 @@ def compose_sender(
                 next_ctx = current_ctx if ctx is None else ctx
                 return await dispatch(i + 1, response, next_ctx)
 
-            return await _maybe_await(mw(current_ctx, resp, call_next))
+            return await maybe_await(mw(current_ctx, resp, call_next))
 
         return await dispatch(0, response, ctx)
 
@@ -278,7 +268,7 @@ def compose_headers(
             index = i
 
             if i >= len(middlewares):
-                return cast(bool, await _maybe_await(terminal(current_ctx)))
+                return cast(bool, await maybe_await(terminal(current_ctx)))
 
             mw = middlewares[i]
 
@@ -289,7 +279,7 @@ def compose_headers(
                 next_ctx = current_ctx if ctx is None else ctx
                 return await dispatch(i + 1, next_ctx)
 
-            return cast(bool, await _maybe_await(mw(current_ctx, call_next)))
+            return cast(bool, await maybe_await(mw(current_ctx, call_next)))
 
         return await dispatch(0, ctx)
 

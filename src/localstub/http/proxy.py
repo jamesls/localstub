@@ -5,30 +5,12 @@ from typing import cast
 
 import httpx
 
-from localstub.http.headers import Headers
+from localstub.http.connection import connection_tokens_from_headers
 from localstub.http.request import HTTPRequest
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.uri import ParsedURI
 
 LOG = logging.getLogger(__name__)
-
-
-def _parse_connection_tokens(value: str) -> set[str]:
-    tokens: set[str] = set()
-    for raw_token in value.split(","):
-        token = raw_token.strip().lower()
-        if token:
-            tokens.add(token)
-    return tokens
-
-
-def connection_tokens_from_headers(headers: Headers | None) -> set[str]:
-    if headers is None:
-        return set()
-    tokens: set[str] = set()
-    for value in headers.get_all("Connection", []):
-        tokens.update(_parse_connection_tokens(value))
-    return tokens
 
 
 def build_origin_form_request(request: HTTPRequest, uri: ParsedURI) -> bytes:

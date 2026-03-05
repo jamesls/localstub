@@ -6,7 +6,8 @@ import logging
 import signal
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from collections.abc import Callable
+from typing import Protocol, TextIO
 
 from rich.logging import RichHandler
 from rich.syntax import Syntax
@@ -285,6 +286,120 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
                 output_file.close()
 
 
+class _TrafficSource(Protocol):
+    """Shared interface for TLS proxy and HTTP server."""
+
+    async def next_request(
+        self, timeout: float | None = None
+    ) -> HTTPRequest: ...
+
+    async def next_response(
+        self, timeout: float | None = None
+    ) -> RecordedResponse: ...
+
+
+ExchangeLookup = Callable[
+    [HTTPRequest, RecordedResponse | None],
+    RecordedExchange | None,
+]
+
+
+async def _await_response(
+    source: _TrafficSource,
+    shutdown_event: asyncio.Event,
+    *,
+    timeout: float = 5.0,
+    max_timeouts: int = 3,
+) -> RecordedResponse | None:
+    """Poll *source* for the next response."""
+    response: RecordedResponse | None = None
+    timeouts = 0
+    while not shutdown_event.is_set() and response is None:
+        try:
+            response = await source.next_response(
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            timeouts += 1
+            if timeouts >= max_timeouts:
+                console.print(
+                    "[yellow]No response recorded; logging without response[/]"
+                )
+                break
+            continue
+    return response
+
+
+async def _process_traffic(
+    source: _TrafficSource,
+    output_file: TextIO | None,
+    shutdown_event: asyncio.Event,
+    *,
+    exchange_lookup: ExchangeLookup | None = None,
+    response_timeout: float = 5.0,
+    response_max_timeouts: int = 3,
+    timestamp_provider: Callable[[], datetime] | None = None,
+) -> None:
+    """Poll *source* for request/response pairs.
+
+    Works for both the TLS intercept proxy and the HTTP forward
+    proxy server.
+    """
+    jsonl: JSONLTrafficWriter | None = (
+        JSONLTrafficWriter(output_file) if output_file else None
+    )
+
+    def now() -> datetime:
+        if timestamp_provider is None:
+            return datetime.now(timezone.utc)
+        return timestamp_provider()
+
+    while not shutdown_event.is_set():
+        try:
+            request = await source.next_request(timeout=0.1)
+        except asyncio.TimeoutError:
+            continue
+        request_timestamp = now()
+
+        _print_http_block(
+            request.wire_raw_bytes or b"",
+            "REQUEST",
+            "green",
+        )
+
+        response = await _await_response(
+            source,
+            shutdown_event,
+            timeout=response_timeout,
+            max_timeouts=response_max_timeouts,
+        )
+        response_timestamp = now() if response is not None else None
+
+        if shutdown_event.is_set() and response is None:
+            break
+
+        if response:
+            _print_http_block(
+                response.wire_raw_bytes,
+                "RESPONSE",
+                "blue",
+                status=response.status,
+            )
+
+        if jsonl is not None:
+            exchange: RecordedExchange | None = None
+            if exchange_lookup is not None:
+                exchange = exchange_lookup(request, response)
+            if exchange is None:
+                exchange = RecordedExchange(
+                    request=request,
+                    response=response,
+                    request_timestamp=request_timestamp,
+                    response_timestamp=response_timestamp,
+                )
+            jsonl.write_exchange(exchange)
+
+
 async def process_traffic(
     proxy: AsyncTLSInterceptProxy,
     output_file: TextIO | None,
@@ -292,133 +407,17 @@ async def process_traffic(
     *,
     response_timeout: float = 5.0,
     response_max_timeouts: int = 3,
+    timestamp_provider: Callable[[], datetime] | None = None,
 ) -> None:
-    """Poll for recorded requests/responses and output them.
-
-    If the TLS proxy cannot obtain an upstream response it will not enqueue
-    a ``RecordedResponse``. In that case we treat repeated timeouts while
-    awaiting ``next_response()`` as "no response" and log the request with
-    ``response=None`` so traffic recording continues.
-    """
-    jsonl: JSONLTrafficWriter | None = (
-        JSONLTrafficWriter(output_file) if output_file else None
+    """Poll TLS proxy for recorded requests/responses."""
+    await _process_traffic(
+        proxy,
+        output_file,
+        shutdown_event,
+        response_timeout=response_timeout,
+        response_max_timeouts=response_max_timeouts,
+        timestamp_provider=timestamp_provider,
     )
-    while not shutdown_event.is_set():
-        try:
-            request = await proxy.next_request(timeout=0.1)
-        except asyncio.TimeoutError:
-            continue
-
-        _print_http_block(
-            request.wire_raw_bytes or b"",
-            "REQUEST",
-            "green",
-        )
-
-        request_timestamp = datetime.now(timezone.utc)
-        response: RecordedResponse | None = None
-        timeouts = 0
-        while not shutdown_event.is_set() and response is None:
-            try:
-                response = await proxy.next_response(timeout=response_timeout)
-            except asyncio.TimeoutError:
-                timeouts += 1
-                if timeouts >= response_max_timeouts:
-                    console.print(
-                        "[yellow]No upstream response recorded; "
-                        "logging without response[/]"
-                    )
-                    break
-                continue
-
-        if shutdown_event.is_set() and response is None:
-            break
-
-        if response:
-            _print_http_block(
-                response.wire_raw_bytes,
-                "RESPONSE",
-                "blue",
-                status=response.status,
-            )
-
-        if jsonl is not None:
-            response_timestamp = (
-                datetime.now(timezone.utc) if response is not None else None
-            )
-            exchange = RecordedExchange(
-                request=request,
-                response=response,
-                request_timestamp=request_timestamp,
-                response_timestamp=response_timestamp,
-            )
-            jsonl.write_exchange(exchange)
-
-
-async def process_http_proxy_traffic(
-    server: AsyncHTTPTestServer,
-    output_file: TextIO | None,
-    shutdown_event: asyncio.Event,
-    *,
-    response_timeout: float = 5.0,
-    response_max_timeouts: int = 3,
-) -> None:
-    """Poll for recorded requests/responses (HTTP forward proxy mode)."""
-    jsonl: JSONLTrafficWriter | None = (
-        JSONLTrafficWriter(output_file) if output_file else None
-    )
-    while not shutdown_event.is_set():
-        try:
-            request = await server.next_request(timeout=0.1)
-        except asyncio.TimeoutError:
-            continue
-
-        _print_http_block(
-            request.wire_raw_bytes or b"",
-            "REQUEST",
-            "green",
-        )
-
-        response: RecordedResponse | None = None
-        timeouts = 0
-        while not shutdown_event.is_set() and response is None:
-            try:
-                response = await server.next_response(timeout=response_timeout)
-            except asyncio.TimeoutError:
-                timeouts += 1
-                if timeouts >= response_max_timeouts:
-                    console.print(
-                        "[yellow]No response recorded; "
-                        "logging without response[/]"
-                    )
-                    break
-                continue
-
-        if shutdown_event.is_set() and response is None:
-            break
-
-        if response:
-            _print_http_block(
-                response.wire_raw_bytes,
-                "RESPONSE",
-                "blue",
-                status=response.status,
-            )
-
-        if jsonl is not None:
-            exchange = _find_exchange(server, request, response)
-            if exchange is None:
-                exchange = RecordedExchange(
-                    request=request,
-                    response=response,
-                    request_timestamp=datetime.now(timezone.utc),
-                    response_timestamp=(
-                        datetime.now(timezone.utc)
-                        if response is not None
-                        else None
-                    ),
-                )
-            jsonl.write_exchange(exchange)
 
 
 def _find_exchange(
@@ -430,3 +429,29 @@ def _find_exchange(
         if exchange.request is request and exchange.response is response:
             return exchange
     return None
+
+
+async def process_http_proxy_traffic(
+    server: AsyncHTTPTestServer,
+    output_file: TextIO | None,
+    shutdown_event: asyncio.Event,
+    *,
+    response_timeout: float = 5.0,
+    response_max_timeouts: int = 3,
+) -> None:
+    """Poll HTTP forward proxy for recorded traffic."""
+
+    def lookup(
+        req: HTTPRequest,
+        resp: RecordedResponse | None,
+    ) -> RecordedExchange | None:
+        return _find_exchange(server, req, resp)
+
+    await _process_traffic(
+        server,
+        output_file,
+        shutdown_event,
+        exchange_lookup=lookup,
+        response_timeout=response_timeout,
+        response_max_timeouts=response_max_timeouts,
+    )

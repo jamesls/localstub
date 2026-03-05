@@ -4,7 +4,7 @@ import asyncio
 import logging
 import ssl
 from asyncio import transports
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, cast
 
 from rich.markup import escape as rich_escape
 
@@ -111,8 +111,8 @@ class AsyncTLSInterceptProxy:
         *,
         listen_host: str = "127.0.0.1",
         listen_port: int = 0,
-        server: Optional[AsyncHTTPTestServer] = None,
-        ca: Optional[TLSProxyCA] = None,
+        server: AsyncHTTPTestServer | None = None,
+        ca: TLSProxyCA | None = None,
         max_read: int = 8192,
         default_mode: str = "intercept",
         verify_upstream: bool = True,
@@ -485,15 +485,7 @@ class AsyncTLSInterceptProxy:
                     return
 
                 await self._recorded_responses.put(
-                    RecordedResponse(
-                        status=forwarded.response.status,
-                        reason=forwarded.response.reason,
-                        headers=forwarded.response.headers,
-                        body=forwarded.response.body.decode(
-                            "utf-8", errors="replace"
-                        ),
-                        wire_raw_bytes=forwarded.response.wire_bytes,
-                    )
+                    forwarded.response.to_recorded_response()
                 )
                 _close_log(f"{upstream_id} --> lstub", "response received")
                 _close_log(f"lstub --> {client_id}", "response relayed")
@@ -540,13 +532,7 @@ class AsyncTLSInterceptProxy:
                 return
 
             await self._recorded_responses.put(
-                RecordedResponse(
-                    status=final_response.status,
-                    reason=final_response.reason,
-                    headers=final_response.headers,
-                    body=final_response.body.decode("utf-8", errors="replace"),
-                    wire_raw_bytes=final_response.wire_bytes,
-                )
+                final_response.to_recorded_response()
             )
             _close_log(f"{upstream_id} --> lstub", "response received")
             _close_log(f"lstub --> {client_id}", "response relayed")
