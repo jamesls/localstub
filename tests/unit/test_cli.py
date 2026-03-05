@@ -173,6 +173,93 @@ class TestProcessTrafficNoResponse:
         )
 
 
+class TestProcessTrafficTimestamps:
+    @pytest.mark.asyncio
+    async def test_records_request_timestamp_before_waiting_for_response(
+        self,
+    ) -> None:
+        request_timestamp = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        response_timestamp = datetime(2000, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+        remaining = [request_timestamp, response_timestamp]
+
+        def timestamp_provider() -> datetime:
+            if not remaining:
+                raise AssertionError(
+                    "timestamp_provider called more than expected"
+                )
+            return remaining.pop(0)
+
+        headers = Headers.from_items([("Host", "example.com")])
+        request = HTTPRequest(
+            method="GET",
+            path="/delayed-response",
+            http_version="1.1",
+            headers=headers,
+            body="",
+            wire_raw_bytes=b"GET /delayed-response HTTP/1.1\r\n\r\n",
+            client=("127.0.0.1", 55555),
+        )
+        response = RecordedResponse(
+            status=200,
+            reason="OK",
+            headers=None,
+            body=None,
+            wire_raw_bytes=b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        )
+
+        class _OneExchangeProxy:
+            def __init__(self) -> None:
+                self._given_request = False
+                self._given_response = False
+
+            async def next_request(
+                self, timeout: float | None = None
+            ) -> HTTPRequest:
+                if not self._given_request:
+                    self._given_request = True
+                    return request
+                await asyncio.sleep(0)
+                raise asyncio.TimeoutError()
+
+            async def next_response(
+                self, timeout: float | None = None
+            ) -> RecordedResponse:
+                if not self._given_response:
+                    self._given_response = True
+                    await asyncio.sleep(0)
+                    return response
+                await asyncio.sleep(0)
+                raise asyncio.TimeoutError()
+
+        proxy = _OneExchangeProxy()
+        out = io.StringIO()
+        shutdown = asyncio.Event()
+
+        task = asyncio.create_task(
+            process_traffic(
+                proxy,
+                out,
+                shutdown,
+                response_timeout=0.2,
+                response_max_timeouts=2,
+                timestamp_provider=timestamp_provider,
+            )
+        )
+
+        await asyncio.sleep(0.05)
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert not remaining
+
+        lines = [line for line in out.getvalue().splitlines() if line.strip()]
+        assert len(lines) == 1
+
+        record = json.loads(lines[0])
+        assert record["timestamp"] == request_timestamp.isoformat()
+        assert record["response_timestamp"] == response_timestamp.isoformat()
+
+
 class TestProcessHttpProxyTrafficNoResponse:
     @pytest.mark.asyncio
     async def test_uses_recorded_timestamp_when_response_missing(

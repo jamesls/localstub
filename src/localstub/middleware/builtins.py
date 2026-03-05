@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import inspect
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
 
 import httpx
 
@@ -15,6 +13,7 @@ from localstub.http.request import (
     parsed_body_bytes_from_wire_raw_bytes,
 )
 from localstub.http.responsespec import HTTPResponse
+from localstub.http.utils import maybe_await
 from localstub.middleware.core import (
     ForwardProxyResponse,
     ResponderContext,
@@ -158,7 +157,4 @@ class HandlerMiddleware:
         handler = self.get_handler()
         if handler is None:
             return await call_next()
-        result = handler(ctx)
-        if inspect.isawaitable(result):
-            return await cast(Awaitable[ResponseSpec], result)
-        return cast(ResponseSpec, result)
+        return await maybe_await(handler(ctx))

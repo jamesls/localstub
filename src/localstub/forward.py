@@ -9,18 +9,25 @@ from __future__ import annotations
 
 import asyncio
 import gzip
-import inspect
 import logging
 import ssl
-from enum import Enum
 from dataclasses import dataclass
 from email.message import Message
-from http import HTTPStatus
+from enum import Enum
 from typing import Awaitable, Callable, Protocol
 
 from localstub.http.request import AsyncRequestParser, ParsedRequest
-from localstub.http.response import AsyncMultiResponseParser, ParsedResponse
-from localstub.http.utils import headers_to_message
+from localstub.http.response import (
+    AsyncMultiResponseParser,
+    ParsedResponse,
+    RecordedResponse,
+)
+from localstub.http.utils import (
+    decode_status_text,
+    headers_to_message,
+    maybe_await,
+    status_phrase,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -72,6 +79,23 @@ class ForwardResult:
     headers: Message
     body: bytes
     wire_bytes: bytes
+
+    def to_recorded_response(
+        self,
+        wire_raw_bytes: bytes | None = None,
+    ) -> RecordedResponse:
+        """Convert to a RecordedResponse for recording."""
+        return RecordedResponse(
+            status=self.status,
+            reason=self.reason,
+            headers=self.headers,
+            body=self.body.decode("utf-8", errors="replace"),
+            wire_raw_bytes=(
+                wire_raw_bytes
+                if wire_raw_bytes is not None
+                else self.wire_bytes
+            ),
+        )
 
 
 class ForwardError(Enum):
@@ -402,11 +426,7 @@ class Forwarder:
     ) -> ForwardResult:
         headers = headers_to_message(parsed.headers)
         body_bytes = self._maybe_decompress(headers, parsed.body)
-        reason = (
-            parsed.status_text.decode("ascii", errors="replace")
-            if parsed.status_text
-            else None
-        )
+        reason = decode_status_text(parsed.status_text)
 
         upstream = UpstreamResponse(
             status=parsed.status_code or 0,
@@ -417,9 +437,7 @@ class Forwarder:
         )
 
         assert self._response_transformer is not None
-        result = self._response_transformer(upstream)
-        if inspect.isawaitable(result):
-            result = await result
+        result = await maybe_await(self._response_transformer(upstream))
 
         if result.delay_before > 0:
             await asyncio.sleep(result.delay_before)
@@ -467,11 +485,7 @@ class Forwarder:
     ) -> bytes:
         version = parsed.http_version or "1.1"
         status_code = parsed.status_code or 200
-        status_text = (
-            parsed.status_text.decode("ascii", errors="replace")
-            if parsed.status_text
-            else "OK"
-        )
+        status_text = decode_status_text(parsed.status_text, "OK")
         lines = [f"HTTP/{version} {status_code} {status_text}"]
 
         skip_headers = {
@@ -492,10 +506,7 @@ class Forwarder:
         return header_bytes + new_body
 
     def _build_override_wire_bytes(self, response: OverrideResponse) -> bytes:
-        try:
-            reason = HTTPStatus(response.status).phrase
-        except ValueError:
-            reason = "UNKNOWN"
+        reason = status_phrase(response.status, "UNKNOWN")
 
         lines = [f"HTTP/1.1 {response.status} {reason}"]
 
@@ -548,11 +559,7 @@ class Forwarder:
         body = self._maybe_decompress(headers, parsed.body)
         return ForwardResult(
             status=parsed.status_code or 0,
-            reason=(
-                parsed.status_text.decode("ascii", errors="replace")
-                if parsed.status_text
-                else None
-            ),
+            reason=decode_status_text(parsed.status_text),
             headers=headers,
             body=body,
             wire_bytes=wire_bytes,

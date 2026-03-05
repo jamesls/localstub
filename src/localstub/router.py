@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import cast
 
 from localstub.http.request import HTTPRequest
+from localstub.http.utils import maybe_await
 from localstub.middleware import ResponderContext, ResponseSpec
 
 ResponderHandler = Callable[
@@ -34,11 +33,7 @@ class Router:
         handler = self.match(ctx.request)
         if handler is None:
             return None
-        result = handler(ctx)
-        if inspect.isawaitable(result):
-            resolved = await cast(Awaitable[ResponseSpec | None], result)
-        else:
-            resolved = cast(ResponseSpec | None, result)
+        resolved: ResponseSpec | None = await maybe_await(handler(ctx))
         if resolved is None:
             raise TypeError("Unhandled response spec: NoneType")
         return resolved

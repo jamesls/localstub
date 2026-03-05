@@ -5,14 +5,11 @@ import inspect
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from http import HTTPStatus
 from typing import (
     Any,
     Awaitable,
     Callable,
-    Hashable,
     Iterable,
-    Optional,
     Protocol,
     cast,
 )
@@ -30,7 +27,12 @@ from localstub.http.request import (
 )
 from localstub.http.response import RecordedResponse
 from localstub.http.responsespec import HTTPResponse
-from localstub.http.utils import headers_to_headers, headers_to_message
+from localstub.http.utils import (
+    headers_to_headers,
+    headers_to_message,
+    maybe_await,
+    status_phrase,
+)
 from localstub.middleware import (
     ConnectionMeta,
     ForwardProxyResponse,
@@ -56,6 +58,7 @@ from localstub.middleware.builtins import (
     ResponseSequenceMiddleware,
     RouterMiddleware,
     ThrottleMiddleware,
+    ThrottleResponseFunc,
     default_throttle_response,
 )
 from localstub.router import ResponderHandler, Router
@@ -63,13 +66,11 @@ from localstub.throttle import (
     Clock,
     MonotonicClock,
     ThrottleDecision,
+    ThrottleKeyFunc,
     TokenBucketThrottler,
 )
 
 LOG = logging.getLogger(__name__)
-
-ThrottleKeyFunc = Callable[[HTTPRequest], Hashable]
-ThrottleResponseFunc = Callable[[HTTPRequest, ThrottleDecision], HTTPResponse]
 ThrottleResponse = HTTPResponse | ThrottleResponseFunc
 
 
@@ -124,6 +125,15 @@ class RecordingStreamWriter:
     def bytes_sent(self) -> bytes:
         """Return all bytes written through this recorder."""
         return bytes(self._recorded)
+
+    @property
+    def bytes_sent_len(self) -> int:
+        """Length of recorded bytes without copying."""
+        return len(self._recorded)
+
+    def bytes_sent_since(self, offset: int) -> bytes:
+        """Return bytes written since *offset* without a full copy."""
+        return bytes(self._recorded[offset:])
 
     def write(self, data: bytes) -> None:
         self._recorded.extend(data)
@@ -494,7 +504,7 @@ class AsyncHTTPTestServer:
         obj: Any,
         *,
         status: int = 200,
-        headers: Optional[dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         """Configure a static JSON response returned for every request."""
         self._default_response = HTTPResponse.json(
@@ -507,7 +517,7 @@ class AsyncHTTPTestServer:
         text: str,
         *,
         status: int = 200,
-        headers: Optional[dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._default_response = HTTPResponse.text(
             text,
@@ -521,7 +531,7 @@ class AsyncHTTPTestServer:
         data: bytes,
         *,
         status: int = 200,
-        headers: Optional[dict[str, str]] = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self._default_response = HTTPResponse.raw(
             data,
@@ -883,7 +893,7 @@ class AsyncHTTPTestServer:
             writer = recording_writer
 
             if isinstance(response, ForwardProxyResponse):
-                wire_offset = len(writer.bytes_sent)
+                wire_offset = writer.bytes_sent_len
                 result = await response.forwarder.forward_and_relay(
                     host=response.host,
                     port=response.port,
@@ -892,18 +902,14 @@ class AsyncHTTPTestServer:
                     request_method=response.request_method,
                     upstream_tls=response.upstream_tls,
                 )
-                wire_bytes = writer.bytes_sent[wire_offset:]
+                wire_bytes = writer.bytes_sent_since(wire_offset)
                 if result is None:
                     return await terminal(
                         ctx,
                         HTTPResponse.text("Bad Gateway", status=502),
                     )
 
-                recorded = RecordedResponse(
-                    status=result.status,
-                    reason=result.reason,
-                    headers=result.headers,
-                    body=result.body.decode("utf-8", errors="replace"),
+                recorded = result.to_recorded_response(
                     wire_raw_bytes=wire_bytes,
                 )
                 return SendResult(
@@ -919,13 +925,13 @@ class AsyncHTTPTestServer:
                     f"Unhandled response spec: {type(response).__name__}"
                 )
 
-            wire_offset = len(writer.bytes_sent)
+            wire_offset = writer.bytes_sent_len
             should_close = await self._write_response(
                 writer,
                 response,
                 ctx.request,
             )
-            wire_bytes = writer.bytes_sent[wire_offset:]
+            wire_bytes = writer.bytes_sent_since(wire_offset)
             recorded = self._build_recorded_response(response, wire_bytes)
             return SendResult(recorded=recorded, should_close=should_close)
 
@@ -942,11 +948,9 @@ class AsyncHTTPTestServer:
                 ctx: HeaderContext,
                 call_next: Any,
             ) -> bool:
-                result = on_headers_received_handler(ctx.headers, ctx.send)
-                if inspect.isawaitable(result):
-                    should_continue = await cast(Awaitable[bool], result)
-                else:
-                    should_continue = cast(bool, result)
+                should_continue: bool = await maybe_await(
+                    on_headers_received_handler(ctx.headers, ctx.send)
+                )
                 if not should_continue:
                     return False
                 return await call_next()
@@ -984,10 +988,11 @@ class AsyncHTTPTestServer:
         exchange_recorded = False
         responder = self._build_responder()
         sender = self._build_sender(recording_writer)
+        connection = ConnectionMeta(client=request.client)
         try:
             responder_ctx = ResponderContext(
                 request=request,
-                connection=ConnectionMeta(client=request.client),
+                connection=connection,
                 services=self._services,
                 state=state,
                 received_monotonic=received_monotonic,
@@ -996,7 +1001,7 @@ class AsyncHTTPTestServer:
 
             sender_ctx = SenderContext(
                 request=request,
-                connection=ConnectionMeta(client=request.client),
+                connection=connection,
                 services=self._services,
                 state=state,
             )
@@ -1141,10 +1146,7 @@ class AsyncHTTPTestServer:
         wire_bytes: bytes,
     ) -> RecordedResponse:
         """Build RecordedResponse from response and wire bytes."""
-        try:
-            reason = HTTPStatus(response.status).phrase
-        except ValueError:
-            reason = None
+        reason = status_phrase(response.status)
 
         body = self._normalize_body(response.body)
         body_text = body.decode("utf-8", errors="replace") if body else None
@@ -1169,10 +1171,7 @@ class AsyncHTTPTestServer:
         response: HTTPResponse,
     ) -> None:
         """Write an interim response (e.g., 100 Continue) to the client."""
-        try:
-            reason = HTTPStatus(response.status).phrase
-        except ValueError:
-            reason = "UNKNOWN"
+        reason = status_phrase(response.status, "UNKNOWN")
 
         status_line = f"HTTP/1.1 {response.status} {reason}\r\n"
         writer.write(status_line.encode("ascii"))
@@ -1236,10 +1235,7 @@ class AsyncHTTPTestServer:
         response: HTTPResponse,
         request: HTTPRequest,
     ) -> bool:
-        try:
-            reason = HTTPStatus(response.status).phrase
-        except ValueError:
-            reason = "UNKNOWN"
+        reason = status_phrase(response.status, "UNKNOWN")
 
         status_line = f"HTTP/1.1 {response.status} {reason}\r\n"
         writer.write(status_line.encode("ascii"))
