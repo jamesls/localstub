@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextvars
+import json
+import re
+import ssl
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+from pyinstrument import Profiler, processors
+from pyinstrument.renderers import ConsoleRenderer, HTMLRenderer
+from pyinstrument.session import Session
+
+from localstub.server import AsyncHTTPTestServer
+from localstub.tlsproxy import AsyncTLSInterceptProxy
+
+
+BENCH_URL = "https://example.com/bench"
+EXPECTED_RESPONSE = {"ok": True, "bench": "basic"}
+DEFAULT_REQUESTS = 1_000
+DEFAULT_CONCURRENCY = 50
+DEFAULT_REQUEST_TIMEOUT = 30.0
+DEFAULT_INTERVAL = 0.001
+
+
+@dataclass(slots=True)
+class BenchConfig:
+    requests: int
+    concurrency: int
+    request_timeout: float
+    interval: float
+    report_dir: Path
+
+
+@dataclass(slots=True)
+class LoadResult:
+    requests: int
+    concurrency: int
+    elapsed_seconds: float
+
+    @property
+    def requests_per_second(self) -> float:
+        return self.requests / self.elapsed_seconds
+
+
+class BenchTLSProxy(AsyncTLSInterceptProxy):
+    def __init__(self, *, server: AsyncHTTPTestServer) -> None:
+        super().__init__(server=server)
+        self._bench_profiler: Profiler | None = None
+        self._bench_profile_context: contextvars.Context | None = None
+
+    def configure_benchmark(
+        self,
+        *,
+        profiler: Profiler,
+    ) -> None:
+        self._bench_profiler = profiler
+
+    def stop_profiler(self) -> Session | None:
+        if self._bench_profiler is None:
+            return None
+        if self._bench_profile_context is None:
+            return None
+        if self._bench_profiler.is_running:
+            return self._bench_profile_context.run(self._bench_profiler.stop)
+        return self._bench_profiler.last_session
+
+    async def _client_connected(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        task_context = self._next_profile_task_context()
+        task = asyncio.create_task(
+            self._handle_client(reader, writer),
+            context=task_context,
+        )
+        self._client_tasks.add(task)
+        task.add_done_callback(self._client_tasks.discard)
+
+    def _next_profile_task_context(self) -> contextvars.Context | None:
+        if self._bench_profiler is None:
+            return None
+        if self._bench_profile_context is None:
+            # Start the profiler in a dedicated context, then copy that
+            # context into each measured proxy connection task.
+            self._bench_profile_context = contextvars.copy_context()
+            self._bench_profile_context.run(self._bench_profiler.start)
+        return self._bench_profile_context.copy()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Benchmark the TLS intercept path and profile localstub.",
+    )
+    parser.add_argument(
+        "--requests",
+        type=int,
+        default=DEFAULT_REQUESTS,
+        help=f"number of HTTPS requests to send (default: {DEFAULT_REQUESTS})",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        help=(
+            "maximum number of concurrent aiohttp requests "
+            f"(default: {DEFAULT_CONCURRENCY})"
+        ),
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help=(
+            "per-request timeout in seconds "
+            f"(default: {DEFAULT_REQUEST_TIMEOUT})"
+        ),
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help=(
+            "pyinstrument sample interval in seconds "
+            f"(default: {DEFAULT_INTERVAL})"
+        ),
+    )
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=None,
+        help="directory for output reports",
+    )
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    return parser.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> BenchConfig:
+    if args.requests <= 0:
+        raise ValueError("--requests must be a positive integer")
+    if args.concurrency <= 0:
+        raise ValueError("--concurrency must be a positive integer")
+    if args.request_timeout <= 0:
+        raise ValueError("--request-timeout must be positive")
+    if args.interval <= 0:
+        raise ValueError("--interval must be positive")
+
+    report_dir = (
+        args.report_dir
+        if args.report_dir is not None
+        else Path(".benchmarks") / "bench-basic" / time.strftime(
+            "%Y%m%d-%H%M%S"
+        )
+    )
+    return BenchConfig(
+        requests=args.requests,
+        concurrency=args.concurrency,
+        request_timeout=args.request_timeout,
+        interval=args.interval,
+        report_dir=report_dir.resolve(),
+    )
+
+
+def emit_worker_message(message: dict[str, Any]) -> None:
+    print(json.dumps(message, sort_keys=True), flush=True)
+
+
+async def read_worker_message(
+    worker: asyncio.subprocess.Process,
+    *,
+    expected_event: str,
+) -> dict[str, Any]:
+    if worker.stdout is None:
+        raise RuntimeError("Worker stdout is unavailable")
+
+    line = await worker.stdout.readline()
+    if not line:
+        return_code = await worker.wait()
+        raise RuntimeError(
+            "Worker exited before sending "
+            f"{expected_event!r} (exit code {return_code})"
+        )
+
+    message = json.loads(line)
+    event = message.get("event")
+    if event == "error":
+        raise RuntimeError(message.get("message", "Worker error"))
+    if event != expected_event:
+        raise RuntimeError(
+            f"Expected worker event {expected_event!r}, got {event!r}"
+        )
+    return message
+
+
+def build_processor_options(repo_root: Path) -> dict[str, Any]:
+    localstub_root = re.escape(str((repo_root / "src" / "localstub").resolve()))
+    return {
+        "filter_threshold": 0.0,
+        "hide_regex": rf"^(?!{localstub_root}).*",
+        "show_regex": rf"{localstub_root}.*",
+    }
+
+
+def render_text_report(
+    profiler: Profiler,
+    *,
+    processor_options: dict[str, Any],
+) -> str:
+    renderer = ConsoleRenderer(
+        show_all=False,
+        timeline=False,
+        processor_options=processor_options,
+        unicode=False,
+        color=False,
+        flat=False,
+        time="percent_of_total",
+        short_mode=False,
+    )
+    return profiler.output(renderer)
+
+
+def render_html_report(
+    profiler: Profiler,
+    *,
+    processor_options: dict[str, Any],
+) -> str:
+    renderer = HTMLRenderer(show_all=False, timeline=False)
+    renderer.preprocessors = [processors.group_library_frames_processor]
+    renderer.preprocessor_options = processor_options
+    return profiler.output(renderer)
+
+
+def write_reports(
+    *,
+    profiler: Profiler,
+    session: Session,
+    report_dir: Path,
+    processor_options: dict[str, Any],
+) -> dict[str, str]:
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    session_path = report_dir / "profile.pyisession"
+    text_path = report_dir / "profile-localstub.txt"
+    html_path = report_dir / "profile-localstub.html"
+
+    session.save(session_path)
+    text_path.write_text(
+        render_text_report(
+            profiler,
+            processor_options=processor_options,
+        ),
+        encoding="utf-8",
+    )
+    html_path.write_text(
+        render_html_report(
+            profiler,
+            processor_options=processor_options,
+        ),
+        encoding="utf-8",
+    )
+
+    return {
+        "session_path": str(session_path),
+        "text_report_path": str(text_path),
+        "html_report_path": str(html_path),
+    }
+
+
+async def send_request(
+    *,
+    session: aiohttp.ClientSession,
+    proxy_url: str,
+    request_number: int,
+) -> None:
+    async with session.get(
+        BENCH_URL,
+        proxy=proxy_url,
+    ) as response:
+        payload = await response.json()
+        if response.status != 200:
+            raise RuntimeError(
+                f"Request {request_number} returned {response.status}"
+            )
+        if payload != EXPECTED_RESPONSE:
+            raise RuntimeError(
+                f"Request {request_number} returned unexpected JSON: {payload!r}"
+            )
+
+
+async def load_worker(
+    *,
+    session: aiohttp.ClientSession,
+    proxy_url: str,
+    request_queue: asyncio.Queue[int],
+) -> None:
+    while True:
+        try:
+            request_number = request_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        try:
+            await send_request(
+                session=session,
+                proxy_url=proxy_url,
+                request_number=request_number,
+            )
+        finally:
+            request_queue.task_done()
+
+
+async def wait_for_recorded_responses(
+    *,
+    server: AsyncHTTPTestServer,
+    count: int,
+) -> None:
+    for _ in range(count):
+        await server.next_response()
+
+
+async def run_load(
+    *,
+    config: BenchConfig,
+    proxy_url: str,
+    ca_pem_path: Path,
+) -> LoadResult:
+    ssl_ctx = ssl.create_default_context(cafile=str(ca_pem_path))
+    timeout = aiohttp.ClientTimeout(total=config.request_timeout)
+    connector = aiohttp.TCPConnector(
+        ssl=ssl_ctx,
+        limit=config.concurrency,
+        limit_per_host=config.concurrency,
+    )
+    request_queue: asyncio.Queue[int] = asyncio.Queue()
+    for request_number in range(config.requests):
+        request_queue.put_nowait(request_number)
+
+    start = time.perf_counter()
+    async with aiohttp.ClientSession(
+        connector=connector,
+        trust_env=False,
+        timeout=timeout,
+    ) as session:
+        worker_count = min(config.requests, config.concurrency)
+        async with asyncio.TaskGroup() as task_group:
+            for _ in range(worker_count):
+                task_group.create_task(
+                    load_worker(
+                        session=session,
+                        proxy_url=proxy_url,
+                        request_queue=request_queue,
+                    )
+                )
+    elapsed_seconds = time.perf_counter() - start
+    return LoadResult(
+        requests=config.requests,
+        concurrency=config.concurrency,
+        elapsed_seconds=elapsed_seconds,
+    )
+
+
+async def run_worker(config: BenchConfig) -> None:
+    profiler = Profiler(interval=config.interval, async_mode="strict")
+    server = AsyncHTTPTestServer()
+    server.set_json_response(EXPECTED_RESPONSE)
+    proxy = BenchTLSProxy(server=server)
+    proxy.configure_benchmark(
+        profiler=profiler,
+    )
+    response_waiter: asyncio.Task[None] | None = None
+
+    try:
+        async with server, proxy:
+            response_waiter = asyncio.create_task(
+                wait_for_recorded_responses(
+                    server=server,
+                    count=config.requests,
+                )
+            )
+            emit_worker_message(
+                {
+                    "event": "ready",
+                    "proxy_url": proxy.endpoint_url,
+                    "ca_pem_path": str(proxy.ca.ca_pem_path().resolve()),
+                    "report_dir": str(config.report_dir),
+                }
+            )
+            await response_waiter
+    except Exception as exc:
+        if response_waiter is not None:
+            response_waiter.cancel()
+        emit_worker_message({"event": "error", "message": repr(exc)})
+        raise
+
+    session = proxy.stop_profiler()
+    if session is None:
+        raise RuntimeError("Profiler did not capture any worker session")
+
+    processor_options = build_processor_options(Path.cwd())
+    report_paths = write_reports(
+        profiler=profiler,
+        session=session,
+        report_dir=config.report_dir,
+        processor_options=processor_options,
+    )
+    emit_worker_message({"event": "done", **report_paths})
+
+
+async def run_coordinator(config: BenchConfig) -> None:
+    worker = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--requests",
+        str(config.requests),
+        "--concurrency",
+        str(config.concurrency),
+        "--request-timeout",
+        str(config.request_timeout),
+        "--interval",
+        str(config.interval),
+        "--report-dir",
+        str(config.report_dir),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        ready = await read_worker_message(worker, expected_event="ready")
+        proxy_url = str(ready["proxy_url"])
+        ca_pem_path = Path(str(ready["ca_pem_path"]))
+
+        print(
+            f"Driving {config.requests} requests through {proxy_url} "
+            f"with concurrency {config.concurrency}..."
+        )
+        load_result = await run_load(
+            config=config,
+            proxy_url=proxy_url,
+            ca_pem_path=ca_pem_path,
+        )
+
+        done = await read_worker_message(worker, expected_event="done")
+        return_code = await worker.wait()
+        if return_code != 0:
+            raise RuntimeError(f"Worker exited with code {return_code}")
+
+        summary = {
+            "requests": load_result.requests,
+            "concurrency": load_result.concurrency,
+            "elapsed_seconds": load_result.elapsed_seconds,
+            "requests_per_second": load_result.requests_per_second,
+            "proxy_url": proxy_url,
+            "ca_pem_path": str(ca_pem_path),
+            "session_path": str(done["session_path"]),
+            "text_report_path": str(done["text_report_path"]),
+            "html_report_path": str(done["html_report_path"]),
+        }
+        summary_path = config.report_dir / "run.json"
+        summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        text_report_path = Path(str(done["text_report_path"]))
+        print()
+        print(f"Elapsed: {load_result.elapsed_seconds:.3f}s")
+        print(f"Throughput: {load_result.requests_per_second:.2f} req/s")
+        print(f"Report directory: {config.report_dir}")
+        print(f"Session: {done['session_path']}")
+        print(f"HTML report: {done['html_report_path']}")
+        print(f"Text report: {done['text_report_path']}")
+        print(f"Run summary: {summary_path}")
+        print()
+        print(text_report_path.read_text(encoding="utf-8"))
+    finally:
+        if worker.returncode is None:
+            worker.terminate()
+            await worker.wait()
+
+
+def main() -> None:
+    args = parse_args()
+    config = build_config(args)
+    if args.worker:
+        asyncio.run(run_worker(config))
+    else:
+        asyncio.run(run_coordinator(config))
+
+
+if __name__ == "__main__":
+    main()

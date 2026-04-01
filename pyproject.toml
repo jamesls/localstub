@@ -29,6 +29,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "ast-grep-cli",
+  "aiohttp",
   "pytest>=8.4.2",
   "httpx",
   "pytest-asyncio",
@@ -36,6 +37,7 @@ dev = [
   "mkdocstrings>=0.30.0",
   "mkdocs-material>=9.6.20",
   "pymdown-extensions>=10.16.1",
+  "pyinstrument",
   "jmeslog>=0.2.0",
   "poethepoet>=0.37.0",
   "ruff>=0.13.0",

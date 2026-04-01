@@ -1,0 +1,867 @@
+#!/usr/bin/env -S uv run python
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import multiprocessing
+import os
+import platform
+import ssl
+import sys
+import time
+import traceback
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from math import ceil, floor
+from multiprocessing.connection import Connection
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+DEFAULT_TARGET_URL = "https://example.com/bench"
+DEFAULT_WARMUP_SECONDS = 1.0
+DEFAULT_MEASURE_SECONDS = 4.0
+DEFAULT_CONCURRENCY = 16
+DEFAULT_SAMPLE_INTERVAL = 0.0005
+DEFAULT_SESSION_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    target_url: str
+    warmup_seconds: float
+    measure_seconds: float
+    concurrency: int
+    sample_interval: float
+    session_timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class OutputPaths:
+    traffic_profile_html: Path
+    traffic_profile_session: Path
+    summary_html: Path
+    summary_json: Path
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    successes: int
+    failures: int
+    latencies_ms: list[float]
+    errors: list[str]
+
+
+@dataclass(frozen=True)
+class LoadStats:
+    successes: int
+    failures: int
+    requests_per_second: float
+    duration_seconds: float
+    latency_p50_ms: float
+    latency_p95_ms: float
+    latency_p99_ms: float
+    latency_max_ms: float
+    errors: list[str]
+
+
+@dataclass(frozen=True)
+class Hotspot:
+    path: str
+    function: str
+    line: int | None
+    self_time_ms: float
+    total_time_ms: float
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    config: dict[str, Any]
+    warmup: LoadStats
+    measured: LoadStats
+    payload_bytes: int
+    server_metrics: dict[str, int]
+    hottest_localstub_frame: Hotspot | None
+    localstub_hotspots: list[Hotspot]
+    output_paths: dict[str, str]
+    python_version: str
+    platform: str
+    timestamp_utc: str
+
+
+@dataclass
+class _HotspotAggregate:
+    path: str
+    function: str
+    line: int | None
+    self_time_ms: float = 0.0
+    total_time_ms: float = 0.0
+
+
+def main() -> None:
+    config = BenchmarkConfig(
+        target_url=DEFAULT_TARGET_URL,
+        warmup_seconds=DEFAULT_WARMUP_SECONDS,
+        measure_seconds=DEFAULT_MEASURE_SECONDS,
+        concurrency=DEFAULT_CONCURRENCY,
+        sample_interval=DEFAULT_SAMPLE_INTERVAL,
+        session_timeout_seconds=DEFAULT_SESSION_TIMEOUT_SECONDS,
+    )
+    outputs = _build_output_paths()
+    result = _run_benchmark(config, outputs)
+    _write_summary_files(result, outputs)
+    _print_summary(result)
+
+
+def _build_output_paths(now: datetime | None = None) -> OutputPaths:
+    ts = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = REPO_ROOT / ".benchmarks" / "benchmark-tls-proxy" / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return OutputPaths(
+        traffic_profile_html=run_dir / "traffic-profile.html",
+        traffic_profile_session=run_dir / "traffic-profile.pyisession",
+        summary_html=run_dir / "summary.html",
+        summary_json=run_dir / "summary.json",
+    )
+
+
+def _run_benchmark(
+    config: BenchmarkConfig,
+    outputs: OutputPaths,
+) -> BenchmarkResult:
+    payload = _build_payload()
+    payload_bytes = json.dumps(payload).encode("utf-8")
+    context = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = context.Pipe()
+    process = context.Process(
+        target=_server_process_entry,
+        args=(child_conn, config, outputs, payload),
+    )
+    process.start()
+    child_conn.close()
+
+    try:
+        ready = _recv_message(parent_conn, timeout_seconds=60.0)
+        _raise_if_error(ready)
+        if ready.get("type") != "ready":
+            raise RuntimeError(f"Unexpected child message: {ready!r}")
+
+        warmup, measured = asyncio.run(
+            _run_client_driver(
+                config=config,
+                proxy_url=_require_str(ready, "proxy_url"),
+                ca_path=Path(_require_str(ready, "ca_path")),
+                expected_body=payload_bytes,
+                conn=parent_conn,
+            )
+        )
+
+        result_message = _recv_message(parent_conn, timeout_seconds=30.0)
+        _raise_if_error(result_message)
+        if result_message.get("type") != "profile_complete":
+            raise RuntimeError(
+                f"Unexpected child message: {result_message!r}"
+            )
+    except BaseException:
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=5.0)
+        parent_conn.close()
+        raise
+
+    process.join(timeout=5.0)
+    parent_conn.close()
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5.0)
+        raise RuntimeError("Benchmark server process did not exit cleanly")
+    if process.exitcode not in (0, None):
+        raise RuntimeError(
+            f"Benchmark server exited with status {process.exitcode}"
+        )
+
+    hotspots = [
+        Hotspot(
+            path=str(item["path"]),
+            function=str(item["function"]),
+            line=_optional_int(item.get("line")),
+            self_time_ms=float(item["self_time_ms"]),
+            total_time_ms=float(item["total_time_ms"]),
+        )
+        for item in list(result_message["localstub_hotspots"])
+    ]
+    hottest = hotspots[0] if hotspots else None
+
+    return BenchmarkResult(
+        config=asdict(config),
+        warmup=warmup,
+        measured=measured,
+        payload_bytes=len(payload_bytes),
+        server_metrics={
+            "requests_recorded": int(result_message["requests_recorded"]),
+            "responses_recorded": int(result_message["responses_recorded"]),
+            "exchanges_recorded": int(result_message["exchanges_recorded"]),
+        },
+        hottest_localstub_frame=hottest,
+        localstub_hotspots=hotspots,
+        output_paths={
+            "traffic_profile_html": str(outputs.traffic_profile_html),
+            "traffic_profile_session": str(outputs.traffic_profile_session),
+            "summary_html": str(outputs.summary_html),
+            "summary_json": str(outputs.summary_json),
+        },
+        python_version=sys.version,
+        platform=platform.platform(),
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _server_process_entry(
+    conn: Connection,
+    config: BenchmarkConfig,
+    outputs: OutputPaths,
+    payload: dict[str, Any],
+) -> None:
+    try:
+        asyncio.run(_server_process_main(conn, config, outputs, payload))
+    except BaseException:
+        message = {
+            "type": "error",
+            "message": "Server benchmark process crashed",
+            "traceback": traceback.format_exc(),
+        }
+        try:
+            conn.send(message)
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+async def _server_process_main(
+    conn: Connection,
+    config: BenchmarkConfig,
+    outputs: OutputPaths,
+    payload: dict[str, Any],
+) -> None:
+    from pyinstrument import Profiler
+    from pyinstrument.session import Session
+
+    from localstub.server import AsyncHTTPTestServer
+    from localstub.tlsproxy import AsyncTLSInterceptProxy
+
+    server = AsyncHTTPTestServer()
+    server.set_json_response(payload)
+
+    async with server, AsyncTLSInterceptProxy(server=server) as proxy:
+        conn.send(
+            {
+                "type": "ready",
+                "proxy_url": proxy.endpoint_url,
+                "ca_path": str(proxy.ca.ca_pem_path()),
+            }
+        )
+
+        start_message = await asyncio.to_thread(conn.recv)
+        if start_message.get("command") != "start_profile":
+            raise RuntimeError(
+                f"Unexpected start command: {start_message!r}"
+            )
+
+        server.clear_requests()
+        profiler = Profiler(
+            interval=config.sample_interval,
+            async_mode="disabled",
+        )
+        profiler.start()
+        conn.send({"type": "started"})
+
+        stop_message = await asyncio.to_thread(conn.recv)
+        if stop_message.get("command") != "stop_profile":
+            raise RuntimeError(f"Unexpected stop command: {stop_message!r}")
+
+        session = profiler.stop()
+        session.save(outputs.traffic_profile_session)
+        outputs.traffic_profile_html.write_text(
+            profiler.output_html(),
+            encoding="utf-8",
+        )
+
+        hotspots = _collect_localstub_hotspots(session)
+        conn.send(
+            {
+                "type": "profile_complete",
+                "requests_recorded": len(server.requests),
+                "responses_recorded": len(server.responses),
+                "exchanges_recorded": len(server.exchanges),
+                "localstub_hotspots": [
+                    {
+                        "path": hotspot.path,
+                        "function": hotspot.function,
+                        "line": hotspot.line,
+                        "self_time_ms": hotspot.self_time_ms,
+                        "total_time_ms": hotspot.total_time_ms,
+                    }
+                    for hotspot in hotspots
+                ],
+            }
+        )
+
+
+def _collect_localstub_hotspots(session: Any) -> list[Hotspot]:
+    root = session.root_frame()
+    aggregates: dict[tuple[str, str, int | None], _HotspotAggregate] = {}
+    localstub_root = (SRC_DIR / "localstub").resolve()
+
+    def walk(frame: Any) -> None:
+        file_path = frame.file_path
+        if file_path is not None:
+            resolved = Path(file_path).resolve()
+            try:
+                relative = resolved.relative_to(localstub_root.parent)
+            except ValueError:
+                relative = None
+
+            if relative is not None:
+                key = (
+                    relative.as_posix(),
+                    frame.function,
+                    frame.line_no,
+                )
+                aggregate = aggregates.setdefault(
+                    key,
+                    _HotspotAggregate(
+                        path=relative.as_posix(),
+                        function=frame.function,
+                        line=frame.line_no,
+                    ),
+                )
+                aggregate.self_time_ms += frame.total_self_time * 1000.0
+                aggregate.total_time_ms += frame.time * 1000.0
+
+        for child in frame.children:
+            walk(child)
+
+    walk(root)
+    hotspots = [
+        Hotspot(
+            path=aggregate.path,
+            function=aggregate.function,
+            line=aggregate.line,
+            self_time_ms=aggregate.self_time_ms,
+            total_time_ms=aggregate.total_time_ms,
+        )
+        for aggregate in aggregates.values()
+        if aggregate.self_time_ms > 0.0 or aggregate.total_time_ms > 0.0
+    ]
+    hotspots.sort(
+        key=lambda hotspot: (
+            hotspot.self_time_ms,
+            hotspot.total_time_ms,
+        ),
+        reverse=True,
+    )
+    return hotspots[:10]
+
+
+async def _run_client_driver(
+    *,
+    config: BenchmarkConfig,
+    proxy_url: str,
+    ca_path: Path,
+    expected_body: bytes,
+    conn: Connection,
+) -> tuple[LoadStats, LoadStats]:
+    import aiohttp
+
+    connector = aiohttp.TCPConnector(
+        ssl=_build_ssl_context(ca_path),
+        limit=config.concurrency,
+        limit_per_host=config.concurrency,
+    )
+    timeout = aiohttp.ClientTimeout(total=config.session_timeout_seconds)
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        trust_env=False,
+    ) as session:
+        print(
+            "Warmup: "
+            f"{config.warmup_seconds:.1f}s at concurrency "
+            f"{config.concurrency}"
+        )
+        warmup = await _run_load_window(
+            session=session,
+            target_url=config.target_url,
+            proxy_url=proxy_url,
+            expected_body=expected_body,
+            concurrency=config.concurrency,
+            duration_seconds=config.warmup_seconds,
+        )
+        _fail_if_errors("Warmup", warmup)
+
+        conn.send({"command": "start_profile"})
+        started_message = _recv_message(conn, timeout_seconds=10.0)
+        _raise_if_error(started_message)
+        if started_message.get("type") != "started":
+            raise RuntimeError(
+                f"Unexpected start response: {started_message!r}"
+            )
+
+        print(
+            "Measured run: "
+            f"{config.measure_seconds:.1f}s at concurrency "
+            f"{config.concurrency}"
+        )
+        measured = await _run_load_window(
+            session=session,
+            target_url=config.target_url,
+            proxy_url=proxy_url,
+            expected_body=expected_body,
+            concurrency=config.concurrency,
+            duration_seconds=config.measure_seconds,
+        )
+        _fail_if_errors("Measured run", measured)
+
+    await asyncio.sleep(0.250)
+    conn.send({"command": "stop_profile"})
+    return warmup, measured
+
+
+def _build_ssl_context(ca_path: Path) -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=str(ca_path))
+
+
+async def _run_load_window(
+    *,
+    session: Any,
+    target_url: str,
+    proxy_url: str,
+    expected_body: bytes,
+    concurrency: int,
+    duration_seconds: float,
+) -> LoadStats:
+    deadline = time.perf_counter() + duration_seconds
+    tasks = [
+        asyncio.create_task(
+            _load_worker(
+                session=session,
+                target_url=target_url,
+                proxy_url=proxy_url,
+                expected_body=expected_body,
+                deadline=deadline,
+            )
+        )
+        for _ in range(concurrency)
+    ]
+    started_at = time.perf_counter()
+    worker_results = await asyncio.gather(*tasks)
+    elapsed = time.perf_counter() - started_at
+
+    successes = 0
+    failures = 0
+    latencies_ms: list[float] = []
+    errors: list[str] = []
+    for worker_result in worker_results:
+        successes += worker_result.successes
+        failures += worker_result.failures
+        latencies_ms.extend(worker_result.latencies_ms)
+        errors.extend(worker_result.errors)
+
+    return LoadStats(
+        successes=successes,
+        failures=failures,
+        requests_per_second=(
+            float(successes) / elapsed if elapsed > 0.0 else 0.0
+        ),
+        duration_seconds=elapsed,
+        latency_p50_ms=_percentile(latencies_ms, 0.50),
+        latency_p95_ms=_percentile(latencies_ms, 0.95),
+        latency_p99_ms=_percentile(latencies_ms, 0.99),
+        latency_max_ms=max(latencies_ms, default=0.0),
+        errors=errors[:10],
+    )
+
+
+async def _load_worker(
+    *,
+    session: Any,
+    target_url: str,
+    proxy_url: str,
+    expected_body: bytes,
+    deadline: float,
+) -> WorkerResult:
+    successes = 0
+    failures = 0
+    latencies_ms: list[float] = []
+    errors: list[str] = []
+
+    while time.perf_counter() < deadline:
+        started_ns = time.perf_counter_ns()
+        try:
+            async with session.get(target_url, proxy=proxy_url) as response:
+                body = await response.read()
+                status = response.status
+        except Exception as exc:
+            failures += 1
+            if len(errors) < 5:
+                errors.append(repr(exc))
+            continue
+
+        latency_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        if status != 200:
+            failures += 1
+            if len(errors) < 5:
+                errors.append(f"Unexpected status code: {status}")
+            continue
+
+        if body != expected_body:
+            failures += 1
+            if len(errors) < 5:
+                errors.append(
+                    "Response body mismatch: "
+                    f"expected {len(expected_body)} bytes, got {len(body)}"
+                )
+            continue
+
+        successes += 1
+        latencies_ms.append(latency_ms)
+
+    return WorkerResult(
+        successes=successes,
+        failures=failures,
+        latencies_ms=latencies_ms,
+        errors=errors,
+    )
+
+
+def _build_payload() -> dict[str, Any]:
+    items = []
+    for idx in range(64):
+        items.append(
+            {
+                "id": idx,
+                "name": f"item-{idx:03d}",
+                "enabled": idx % 2 == 0,
+                "score": idx * 1.5,
+                "tags": ["bench", "tls", "proxy", f"group-{idx % 8}"],
+            }
+        )
+
+    return {
+        "ok": True,
+        "service": "localstub",
+        "benchmark": "tls-proxy",
+        "items": items,
+        "metadata": {
+            "region": "us-east-1",
+            "owner": "benchmark",
+            "build": {
+                "name": "tls-proxy-serving-path",
+                "version": 1,
+            },
+        },
+    }
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * percentile
+    lower = floor(index)
+    upper = ceil(index)
+    if lower == upper:
+        return ordered[lower]
+    fraction = index - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _write_summary_files(
+    result: BenchmarkResult,
+    outputs: OutputPaths,
+) -> None:
+    outputs.summary_json.write_text(
+        json.dumps(_result_to_json_dict(result), indent=2),
+        encoding="utf-8",
+    )
+    outputs.summary_html.write_text(
+        _render_summary_html(result, outputs.summary_html.parent),
+        encoding="utf-8",
+    )
+
+
+def _render_summary_html(
+    result: BenchmarkResult,
+    summary_dir: Path,
+) -> str:
+    traffic_html_rel = os.path.relpath(
+        result.output_paths["traffic_profile_html"],
+        start=summary_dir,
+    )
+    traffic_session_rel = os.path.relpath(
+        result.output_paths["traffic_profile_session"],
+        start=summary_dir,
+    )
+
+    rows = [
+        ("Target URL", result.config["target_url"]),
+        ("Warmup seconds", str(result.config["warmup_seconds"])),
+        ("Measure seconds", str(result.config["measure_seconds"])),
+        ("Concurrency", str(result.config["concurrency"])),
+        ("Payload bytes", str(result.payload_bytes)),
+        ("Measured req/s", f"{result.measured.requests_per_second:.2f}"),
+        ("Measured p50", f"{result.measured.latency_p50_ms:.2f} ms"),
+        ("Measured p95", f"{result.measured.latency_p95_ms:.2f} ms"),
+        ("Measured p99", f"{result.measured.latency_p99_ms:.2f} ms"),
+        ("Measured max", f"{result.measured.latency_max_ms:.2f} ms"),
+        (
+            "Requests recorded",
+            str(result.server_metrics["requests_recorded"]),
+        ),
+    ]
+    metrics_html = "\n".join(
+        (
+            "<tr>"
+            f"<th>{html.escape(label)}</th>"
+            f"<td>{html.escape(value)}</td>"
+            "</tr>"
+        )
+        for label, value in rows
+    )
+
+    if result.hottest_localstub_frame is None:
+        hottest_html = "<p>No localstub frames were identified.</p>"
+    else:
+        hottest = result.hottest_localstub_frame
+        hottest_html = (
+            "<p>"
+            f"<strong>{html.escape(hottest.path)}:"
+            f"{html.escape(hottest.function)}</strong>"
+            f" at line {hottest.line or 0} "
+            f"(self {hottest.self_time_ms:.2f} ms, "
+            f"inclusive {hottest.total_time_ms:.2f} ms)"
+            "</p>"
+        )
+
+    hotspot_rows = "\n".join(
+        (
+            "<tr>"
+            f"<td>{html.escape(hotspot.path)}</td>"
+            f"<td>{html.escape(hotspot.function)}</td>"
+            f"<td>{hotspot.line or ''}</td>"
+            f"<td>{hotspot.self_time_ms:.2f}</td>"
+            f"<td>{hotspot.total_time_ms:.2f}</td>"
+            "</tr>"
+        )
+        for hotspot in result.localstub_hotspots
+    )
+    errors_html = "".join(
+        f"<li>{html.escape(error)}</li>" for error in result.measured.errors
+    )
+    errors_section = (
+        "<h2>Errors</h2><ul>"
+        f"{errors_html}"
+        "</ul>"
+        if errors_html
+        else "<h2>Errors</h2><p>No request failures recorded.</p>"
+    )
+
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>localstub TLS Proxy Benchmark</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        font-family: Georgia, 'Times New Roman', serif;
+        background: #f7f2e8;
+        color: #1f1a17;
+      }}
+      body {{
+        margin: 0;
+        padding: 2rem;
+        background:
+          radial-gradient(circle at top left, #fff8e8, transparent 40%),
+          linear-gradient(180deg, #f7f2e8, #efe6d6);
+      }}
+      main {{
+        max-width: 60rem;
+        margin: 0 auto;
+        background: rgba(255, 250, 240, 0.94);
+        border: 1px solid #d6c9b6;
+        box-shadow: 0 18px 48px rgba(56, 42, 21, 0.12);
+        padding: 2rem;
+      }}
+      h1, h2 {{
+        font-family: 'Iowan Old Style', 'Palatino Linotype', serif;
+      }}
+      table {{
+        width: 100%;
+        border-collapse: collapse;
+      }}
+      th, td {{
+        text-align: left;
+        padding: 0.65rem;
+        border-bottom: 1px solid #e3d8c8;
+        vertical-align: top;
+      }}
+      th {{
+        width: 18rem;
+      }}
+      a {{
+        color: #8a2d12;
+      }}
+      code {{
+        font-family: 'SFMono-Regular', Menlo, monospace;
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>localstub TLS proxy benchmark</h1>
+      <p>Generated at {html.escape(result.timestamp_utc)}</p>
+      <p>
+        Primary report:
+        <a href="{html.escape(traffic_html_rel)}">traffic profile</a>.
+        Raw session:
+        <a href="{html.escape(traffic_session_rel)}">pyisession</a>.
+      </p>
+      <h2>Measured bottleneck</h2>
+      {hottest_html}
+      <h2>Metrics</h2>
+      <table>
+        <tbody>
+          {metrics_html}
+        </tbody>
+      </table>
+      <h2>Top localstub frames</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Function</th>
+            <th>Line</th>
+            <th>Self ms</th>
+            <th>Total ms</th>
+          </tr>
+        </thead>
+        <tbody>
+          {hotspot_rows}
+        </tbody>
+      </table>
+      {errors_section}
+    </main>
+  </body>
+</html>
+"""
+
+
+def _result_to_json_dict(result: BenchmarkResult) -> dict[str, Any]:
+    return {
+        "config": result.config,
+        "warmup": asdict(result.warmup),
+        "measured": asdict(result.measured),
+        "payload_bytes": result.payload_bytes,
+        "server_metrics": result.server_metrics,
+        "hottest_localstub_frame": (
+            asdict(result.hottest_localstub_frame)
+            if result.hottest_localstub_frame is not None
+            else None
+        ),
+        "localstub_hotspots": [asdict(h) for h in result.localstub_hotspots],
+        "output_paths": result.output_paths,
+        "python_version": result.python_version,
+        "platform": result.platform,
+        "timestamp_utc": result.timestamp_utc,
+    }
+
+
+def _print_summary(result: BenchmarkResult) -> None:
+    print()
+    print("Benchmark complete")
+    print(f"Summary: {result.output_paths['summary_html']}")
+    print(f"Traffic profile: {result.output_paths['traffic_profile_html']}")
+    print(
+        f"Traffic session: {result.output_paths['traffic_profile_session']}"
+    )
+    print(f"Summary JSON: {result.output_paths['summary_json']}")
+    print(
+        "Measured throughput: "
+        f"{result.measured.requests_per_second:.2f} req/s"
+    )
+    print(
+        "Measured latency: "
+        f"p50={result.measured.latency_p50_ms:.2f} ms, "
+        f"p95={result.measured.latency_p95_ms:.2f} ms, "
+        f"p99={result.measured.latency_p99_ms:.2f} ms"
+    )
+    if result.hottest_localstub_frame is not None:
+        hottest = result.hottest_localstub_frame
+        print(
+            "Hottest localstub frame: "
+            f"{hottest.path}:{hottest.line or 0} "
+            f"{hottest.function} "
+            f"(self={hottest.self_time_ms:.2f} ms, "
+            f"total={hottest.total_time_ms:.2f} ms)"
+        )
+
+
+def _recv_message(
+    conn: Connection,
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    if not conn.poll(timeout_seconds):
+        raise TimeoutError(
+            "Timed out waiting for benchmark server process response"
+        )
+    message = conn.recv()
+    if not isinstance(message, dict):
+        raise RuntimeError(f"Unexpected benchmark message: {message!r}")
+    return message
+
+
+def _raise_if_error(message: dict[str, Any]) -> None:
+    if message.get("type") != "error":
+        return
+    traceback_text = str(message.get("traceback", "")).rstrip()
+    detail = str(message.get("message", "Unknown benchmark error"))
+    if traceback_text:
+        raise RuntimeError(f"{detail}\n{traceback_text}")
+    raise RuntimeError(detail)
+
+
+def _require_str(message: dict[str, Any], key: str) -> str:
+    value = message.get(key)
+    if not isinstance(value, str):
+        raise RuntimeError(f"Expected {key!r} to be a string: {message!r}")
+    return value
+
+
+def _fail_if_errors(label: str, stats: LoadStats) -> None:
+    if stats.failures == 0:
+        return
+    details = "; ".join(stats.errors) if stats.errors else "no details"
+    raise RuntimeError(f"{label} saw {stats.failures} failures: {details}")
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+if __name__ == "__main__":
+    main()
