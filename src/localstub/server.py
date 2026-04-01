@@ -469,6 +469,7 @@ class AsyncHTTPTestServer:
     @default_response.setter
     def default_response(self, response: HTTPResponse) -> None:
         self._default_response = response
+        self._response_sequence_middleware = None
 
     def add_route(
         self,
@@ -860,6 +861,8 @@ class AsyncHTTPTestServer:
 
     def _build_responder(
         self,
+        *,
+        capture_ctx: Callable[[ResponderContext], None] | None = None,
     ) -> Callable[[ResponderContext], Awaitable[ResponseSpec]]:
         builtins: list[ResponderMiddleware] = []
         if self._throttle_middleware is not None:
@@ -878,7 +881,11 @@ class AsyncHTTPTestServer:
         def terminal(_: ResponderContext) -> ResponseSpec:
             return self._default_response
 
-        return compose_responder(middlewares, terminal)
+        return compose_responder(
+            middlewares,
+            terminal,
+            capture_ctx=capture_ctx,
+        )
 
     def _build_sender(
         self,
@@ -986,7 +993,13 @@ class AsyncHTTPTestServer:
         recording_writer: RecordingStreamWriter,
     ) -> bool:
         exchange_recorded = False
-        responder = self._build_responder()
+        sender_request = request
+
+        def capture_responder_ctx(ctx: ResponderContext) -> None:
+            nonlocal sender_request
+            sender_request = ctx.request
+
+        responder = self._build_responder(capture_ctx=capture_responder_ctx)
         sender = self._build_sender(recording_writer)
         connection = ConnectionMeta(client=request.client)
         try:
@@ -1000,7 +1013,7 @@ class AsyncHTTPTestServer:
             response_spec = await responder(responder_ctx)
 
             sender_ctx = SenderContext(
-                request=request,
+                request=sender_request,
                 connection=connection,
                 services=self._services,
                 state=state,

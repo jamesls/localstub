@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from localstub.forward import Forwarder
+from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
 
 
@@ -78,6 +79,39 @@ async def test_server_closes_http10_connection_by_default():
             await writer.drain()
 
             await _read_http_response(reader)
+            await _assert_connection_closes(reader)
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except ConnectionResetError:
+                pass
+
+        assert len(server.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_rewritten_connection_close_reaches_sender_stage():
+    async def rewrite_connection_close(
+        ctx: ResponderContext,
+        call_next: ResponderNext,
+    ) -> ResponseSpec:
+        next_ctx = ctx.clone_request(headers={"Connection": "close"})
+        return await call_next(ctx=next_ctx)
+
+    async with AsyncHTTPTestServer() as server:
+        server.use(rewrite_connection_close)
+        server.set_text_response("ok")
+
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        try:
+            writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+
+            response = await _read_http_response(reader)
+            assert b"Connection: close" in response
             await _assert_connection_closes(reader)
         finally:
             writer.close()

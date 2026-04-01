@@ -466,6 +466,68 @@ class TestRawForwarding:
         assert not request_received.is_set()
 
     @pytest.mark.asyncio
+    async def test_rejects_content_length_rewrites(self) -> None:
+        request_received = asyncio.Event()
+
+        async def upstream_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            assert b"Content-Length: 6\r\n" in headers
+            request_received.set()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+
+        try:
+            forwarder = Forwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+
+                async def rewrite_content_length(
+                    ctx: ResponderContext,
+                    call_next: ResponderNext,
+                ) -> ResponseSpec:
+                    next_ctx = ctx.clone_request(
+                        headers={"Content-Length": "6"}
+                    )
+                    return await call_next(ctx=next_ctx)
+
+                proxy.use(rewrite_content_length)
+
+                reader, writer = await asyncio.open_connection(
+                    proxy.host, proxy.port
+                )
+                try:
+                    request = (
+                        f"POST http://{upstream_host}:{upstream_port}"
+                        "/upload HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Content-Length: 5\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        "hello"
+                    ).encode()
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await _read_http_response_bytes(reader)
+                    assert b"500 Internal Server Error" in response
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert not request_received.is_set()
+
+    @pytest.mark.asyncio
     async def test_preserves_chunked_transfer_encoding(self) -> None:
 
         async def chunked_handler(

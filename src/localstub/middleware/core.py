@@ -133,6 +133,8 @@ def compose_responder(
     terminal: Callable[
         [ResponderContext], ResponseSpec | Awaitable[ResponseSpec]
     ],
+    *,
+    capture_ctx: Callable[[ResponderContext], None] | None = None,
 ) -> Callable[[ResponderContext], Awaitable[ResponseSpec]]:
     async def app(ctx: ResponderContext) -> ResponseSpec:
         index = -1
@@ -147,18 +149,27 @@ def compose_responder(
             index = i
 
             if i >= len(middlewares):
-                return await maybe_await(terminal(current_ctx))
+                result = await maybe_await(terminal(current_ctx))
+                if capture_ctx is not None:
+                    capture_ctx(current_ctx)
+                return result
 
             mw = middlewares[i]
+            delegated = False
 
             async def call_next(
                 *,
                 ctx: ResponderContext | None = None,
             ) -> ResponseSpec:
+                nonlocal delegated
+                delegated = True
                 next_ctx = current_ctx if ctx is None else ctx
                 return await dispatch(i + 1, next_ctx)
 
-            return await maybe_await(mw(current_ctx, call_next))
+            result = await maybe_await(mw(current_ctx, call_next))
+            if not delegated and capture_ctx is not None:
+                capture_ctx(current_ctx)
+            return result
 
         return await dispatch(0, ctx)
 
