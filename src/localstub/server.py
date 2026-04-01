@@ -5,6 +5,7 @@ import inspect
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import (
     Any,
     Awaitable,
@@ -76,6 +77,19 @@ ThrottleResponse = HTTPResponse | ThrottleResponseFunc
 
 def _default_throttle_key(_: HTTPRequest) -> str:
     return "global"
+
+
+@lru_cache(maxsize=128)
+def _serialize_response_head(
+    status: int,
+    headers: tuple[tuple[str, str], ...],
+) -> bytes:
+    reason = status_phrase(status, "UNKNOWN")
+    head = bytearray(f"HTTP/1.1 {status} {reason}\r\n".encode("ascii"))
+    for name, value in headers:
+        head.extend(f"{name}: {value}\r\n".encode("ascii"))
+    head.extend(b"\r\n")
+    return bytes(head)
 
 
 # Callback to send a response to client during header processing
@@ -1248,23 +1262,23 @@ class AsyncHTTPTestServer:
         response: HTTPResponse,
         request: HTTPRequest,
     ) -> bool:
-        reason = status_phrase(response.status, "UNKNOWN")
-
-        status_line = f"HTTP/1.1 {response.status} {reason}\r\n"
-        writer.write(status_line.encode("ascii"))
-
         body = self._normalize_body(response.body)
         should_close = should_close_connection(
             request,
             response_headers=response.headers,
         )
         headers = self._build_response_headers(response, body, should_close)
+        head = _serialize_response_head(
+            response.status,
+            tuple(headers.items()),
+        )
 
-        for name, value in headers.items():
-            header_line = f"{name}: {value}\r\n".encode("ascii")
-            writer.write(header_line)
+        if isinstance(self._transmission_strategy, ImmediateTransmission):
+            writer.write(head + body)
+            await writer.drain()
+            return should_close
 
-        writer.write(b"\r\n")
+        writer.write(head)
         await self._transmission_strategy.write_body(writer, body)
 
         return should_close
