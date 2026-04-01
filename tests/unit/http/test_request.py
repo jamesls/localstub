@@ -219,6 +219,45 @@ async def test_async_request_parser_parse_with_connection_wire() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_request_parser_parse_with_connection_wire_pipeline() -> (
+    None
+):
+    first_request = (
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Length: 5\r\n"
+        b"\r\n"
+        b"hello"
+    )
+    second_request = b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    reader = asyncio.StreamReader()
+    reader.feed_data(first_request + second_request)
+    connection_wire = bytearray()
+
+    first_parser = AsyncRequestParser()
+    first_parsed, first_wire = await first_parser.parse(
+        reader,
+        connection_wire,
+    )
+
+    second_parser = AsyncRequestParser()
+    second_parsed, second_wire = await second_parser.parse(
+        reader,
+        connection_wire,
+    )
+
+    assert first_parsed is not None
+    assert first_parsed.body == b"hello"
+    assert first_wire == first_request
+
+    assert second_parsed is not None
+    assert second_parsed.url == b"/next"
+    assert second_wire == second_request
+
+    assert bytes(connection_wire) == first_request + second_request
+
+
+@pytest.mark.asyncio
 async def test_async_request_parser_parse_eof_before_complete() -> None:
     reader = _create_mock_reader([b"GET / HTTP/1.1\r\nHost:"])
 
