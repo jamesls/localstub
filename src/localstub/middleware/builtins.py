@@ -24,6 +24,32 @@ from localstub.router import ResponderHandler, Router
 from localstub.throttle import RequestThrottler, ThrottleDecision
 
 ThrottleResponseFunc = Callable[[HTTPRequest, ThrottleDecision], HTTPResponse]
+BODY_FRAMING_HEADERS = ("Content-Length", "Transfer-Encoding")
+
+
+def _wire_header_values(wire_raw_bytes: bytes, name: str) -> list[str]:
+    header_end = wire_raw_bytes.find(b"\r\n\r\n")
+    if header_end == -1:
+        return []
+
+    name_bytes = name.lower().encode("ascii")
+    values: list[str] = []
+    header_block = wire_raw_bytes[:header_end]
+    for line in header_block.split(b"\r\n")[1:]:
+        header_name, separator, header_value = line.partition(b":")
+        if not separator or header_name.strip().lower() != name_bytes:
+            continue
+        values.append(header_value.strip().decode("ascii", errors="replace"))
+    return values
+
+
+def _has_raw_proxy_framing_header_rewrite(request: HTTPRequest) -> bool:
+    for name in BODY_FRAMING_HEADERS:
+        wire_values = _wire_header_values(request.wire_raw_bytes, name)
+        current_values = request.headers.get_all(name, failobj=[])
+        if wire_values != current_values:
+            return True
+    return False
 
 
 def default_throttle_response(
@@ -118,6 +144,12 @@ class RawForwardProxyMiddleware:
         ):
             return HTTPResponse.text(
                 "Raw proxy forwarding does not support request body rewrites.",
+                status=500,
+            )
+        if _has_raw_proxy_framing_header_rewrite(ctx.request):
+            return HTTPResponse.text(
+                "Raw proxy forwarding does not support framing header "
+                "rewrites.",
                 status=500,
             )
         return ForwardProxyResponse(

@@ -819,6 +819,27 @@ async def test_set_json_response_clears_sequence(server, client):
 
 
 @pytest.mark.asyncio
+async def test_default_response_property_clears_sequence(server, client):
+    server.set_response_sequence([
+        HTTPResponse(status=503),
+        HTTPResponse(status=504),
+    ])
+
+    server.default_response = HTTPResponse.json(
+        {"message": "override"},
+        status=201,
+    )
+
+    response1 = await client.get(server.url)
+    assert response1.status_code == 201
+    assert response1.json() == {"message": "override"}
+
+    response2 = await client.get(server.url)
+    assert response2.status_code == 201
+    assert response2.json() == {"message": "override"}
+
+
+@pytest.mark.asyncio
 async def test_set_text_response_clears_sequence(server, client):
     """Test that set_text_response clears any response sequence."""
     server.set_response_sequence([HTTPResponse(status=404)])
