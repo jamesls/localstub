@@ -11,6 +11,9 @@ from localstub.http.headers import Headers
 from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_headers
 
+HEADER_TERMINATOR = b"\r\n\r\n"
+CRLF = b"\r\n"
+
 
 class Writer(Protocol):
     """Minimal StreamWriter interface for extracting client info."""
@@ -248,6 +251,129 @@ class RequestProtocol:
         pass
 
 
+class _ChunkScanError(Exception):
+    def __init__(self, offset: int) -> None:
+        self.offset = offset
+
+
+def _build_request_parser() -> tuple[
+    RequestProtocol, httptools.HttpRequestParser
+]:
+    protocol = RequestProtocol()
+    parser = httptools.HttpRequestParser(protocol)
+    protocol.set_parser(parser)
+    return protocol, parser
+
+
+def _is_hex_digit(value: int) -> bool:
+    return (
+        ord("0") <= value <= ord("9")
+        or ord("A") <= value <= ord("F")
+        or ord("a") <= value <= ord("f")
+    )
+
+
+def _content_length(
+    headers: list[tuple[bytes, bytes]],
+) -> int | None:
+    for name, value in reversed(headers):
+        if name.lower() != b"content-length":
+            continue
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _is_chunked_transfer(
+    headers: list[tuple[bytes, bytes]],
+) -> bool:
+    for name, value in headers:
+        if name.lower() != b"transfer-encoding":
+            continue
+        for token in value.split(b","):
+            if token.strip().lower() == b"chunked":
+                return True
+    return False
+
+
+def _parse_chunk_size(
+    buffer: bytearray,
+    start: int,
+    end: int,
+) -> int:
+    if start == end:
+        raise _ChunkScanError(start + 1)
+    return int(bytes(buffer[start:end]), 16)
+
+
+def _scan_chunk_size_line(
+    buffer: bytearray,
+    start: int,
+) -> tuple[int, int] | None:
+    size_end = start
+
+    while True:
+        if size_end >= len(buffer):
+            return None
+
+        current = buffer[size_end]
+        if _is_hex_digit(current):
+            size_end += 1
+            continue
+
+        if current == ord(";"):
+            line_end = buffer.find(CRLF, size_end)
+            if line_end == -1:
+                return None
+            return _parse_chunk_size(buffer, start, size_end), line_end + 2
+
+        if current == ord("\r"):
+            if size_end + 1 >= len(buffer):
+                return None
+            if buffer[size_end + 1] != ord("\n"):
+                raise _ChunkScanError(size_end + 1)
+            return _parse_chunk_size(buffer, start, size_end), size_end + 2
+
+        raise _ChunkScanError(size_end + 1)
+
+
+def _scan_chunked_body_end(buffer: bytearray) -> int | None:
+    index = 0
+
+    while True:
+        chunk_size_line = _scan_chunk_size_line(buffer, index)
+        if chunk_size_line is None:
+            return None
+
+        chunk_size, chunk_data_start = chunk_size_line
+
+        if chunk_size == 0:
+            if buffer[chunk_data_start : chunk_data_start + 2] == CRLF:
+                return chunk_data_start + 2
+            trailer_end = buffer.find(HEADER_TERMINATOR, chunk_data_start)
+            if trailer_end == -1:
+                return None
+            return trailer_end + len(HEADER_TERMINATOR)
+
+        chunk_data_end = chunk_data_start + chunk_size
+        if chunk_data_end + 2 > len(buffer):
+            return None
+        if buffer[chunk_data_end : chunk_data_end + 2] != CRLF:
+            mismatch = chunk_data_end
+            while mismatch < len(buffer) and mismatch < chunk_data_end + 2:
+                expected = (
+                    ord("\r") if mismatch == chunk_data_end else ord("\n")
+                )
+                if buffer[mismatch] != expected:
+                    raise _ChunkScanError(mismatch + 1)
+                mismatch += 1
+            return None
+
+        index = chunk_data_end + 2
+
+
 class AsyncRequestParser:
     """Async wrapper for httptools.HttpRequestParser with wire tracking.
 
@@ -258,9 +384,7 @@ class AsyncRequestParser:
     """
 
     def __init__(self, max_read: int = 8192) -> None:
-        self._protocol = RequestProtocol()
-        self._parser = httptools.HttpRequestParser(self._protocol)
-        self._protocol.set_parser(self._parser)
+        self._protocol, self._parser = _build_request_parser()
         self._wire = bytearray()
         self._max_read = max_read
 
@@ -281,48 +405,27 @@ class AsyncRequestParser:
             Returns (None, wire_bytes) on parse error or EOF before complete.
 
         Note:
-            This method feeds data byte-by-byte to detect message boundaries
-            precisely. Any bytes belonging to a subsequent pipelined request
-            are pushed back into the reader for the next parse() call.
+            This method parses headers and bodies in buffered segments while
+            preserving exact wire bytes. Any bytes belonging to a subsequent
+            pipelined request are pushed back into the reader for the next
+            parse() call.
         """
-        buffer = bytearray()
+        parsed, wire_bytes, remaining = await self.parse_headers(
+            reader,
+            connection_wire,
+        )
+        if parsed is None:
+            return None, wire_bytes
 
-        while not self._protocol.result.is_complete:
-            # If buffer is empty, read more data from the stream
-            if not buffer:
-                try:
-                    data = await reader.read(self._max_read)
-                except Exception:
-                    break
+        if parsed.is_complete:
+            self._push_back(reader, remaining)
+            return parsed, wire_bytes
 
-                if not data:
-                    # EOF before complete message
-                    break
-
-                buffer.extend(data)
-
-            # Feed one byte at a time to detect message boundary precisely
-            byte = bytes([buffer.pop(0)])
-            self._wire.extend(byte)
-            if connection_wire is not None:
-                connection_wire.extend(byte)
-
-            try:
-                self._parser.feed_data(byte)
-            except httptools.HttpParserError:
-                # Malformed request - push remaining buffer back for recovery
-                if buffer:
-                    reader.feed_data(bytes(buffer))
-                return None, bytes(self._wire)
-
-        # Push any leftover bytes back to the reader for the next request
-        if buffer:
-            reader.feed_data(bytes(buffer))
-
-        if not self._protocol.result.is_complete:
-            return None, bytes(self._wire)
-
-        return self._protocol.result, bytes(self._wire)
+        return await self.continue_parse_body(
+            reader,
+            remaining,
+            connection_wire,
+        )
 
     @property
     def wire_bytes(self) -> bytes:
@@ -348,37 +451,52 @@ class AsyncRequestParser:
             Returns (None, wire_bytes, empty_buffer) on parse error or EOF.
         """
         buffer = bytearray()
+        fed = 0
 
         while not self._protocol.result.headers_complete:
-            if not buffer:
-                try:
-                    data = await reader.read(self._max_read)
-                except Exception:
+            header_end = buffer.find(HEADER_TERMINATOR)
+            if header_end == -1:
+                has_more = await self._read_more(
+                    reader,
+                    buffer,
+                    connection_wire,
+                )
+                if not has_more:
                     break
+                header_end = buffer.find(HEADER_TERMINATOR)
 
-                if not data:
-                    break
+            feed_end = (
+                header_end + len(HEADER_TERMINATOR)
+                if header_end != -1
+                else len(buffer)
+            )
+            if feed_end == fed:
+                break
 
-                buffer.extend(data)
-
-            byte = bytes([buffer.pop(0)])
-            self._wire.extend(byte)
-            if connection_wire is not None:
-                connection_wire.extend(byte)
-
+            segment = bytes(buffer[fed:feed_end])
             try:
-                self._parser.feed_data(byte)
+                self._parser.feed_data(segment)
             except httptools.HttpParserError:
-                if buffer:
-                    reader.feed_data(bytes(buffer))
+                error_offset = self._precise_error_offset(
+                    bytes(buffer[:feed_end])
+                )
+                self._wire.extend(buffer[:error_offset])
+                self._push_back(reader, buffer[error_offset:])
                 return None, bytes(self._wire), bytearray()
 
+            fed = feed_end
+
         if not self._protocol.result.headers_complete:
-            if buffer:
-                reader.feed_data(bytes(buffer))
+            self._wire.extend(buffer)
             return None, bytes(self._wire), bytearray()
 
-        return self._protocol.result, bytes(self._wire), buffer
+        header_end = buffer.find(HEADER_TERMINATOR) + len(HEADER_TERMINATOR)
+        self._wire.extend(buffer[:header_end])
+        return (
+            self._protocol.result,
+            bytes(self._wire),
+            buffer[header_end:],
+        )
 
     async def continue_parse_body(
         self,
@@ -402,37 +520,174 @@ class AsyncRequestParser:
         """
         buffer = remaining_buffer
 
+        if self._protocol.result.is_complete:
+            self._push_back(reader, buffer)
+            return self._protocol.result, bytes(self._wire)
+
+        if _is_chunked_transfer(self._protocol.result.headers):
+            return await self._parse_chunked_body(
+                reader,
+                buffer,
+                connection_wire,
+            )
+
+        content_length = _content_length(self._protocol.result.headers)
+        if content_length is not None:
+            return await self._parse_content_length_body(
+                reader,
+                buffer,
+                content_length,
+                connection_wire,
+            )
+
         while not self._protocol.result.is_complete:
             if not buffer:
-                try:
-                    data = await reader.read(self._max_read)
-                except Exception:
+                has_more = await self._read_more(
+                    reader,
+                    buffer,
+                    connection_wire,
+                )
+                if not has_more:
                     break
 
-                if not data:
-                    break
-
-                buffer.extend(data)
-
-            byte = bytes([buffer.pop(0)])
-            self._wire.extend(byte)
-            if connection_wire is not None:
-                connection_wire.extend(byte)
-
+            segment = bytes(buffer)
             try:
-                self._parser.feed_data(byte)
+                self._parser.feed_data(segment)
             except httptools.HttpParserError:
-                if buffer:
-                    reader.feed_data(bytes(buffer))
-                return None, bytes(self._wire)
+                return self._body_parse_error(reader, buffer, len(buffer))
 
+            self._wire.extend(segment)
+            buffer.clear()
+
+        if not self._protocol.result.is_complete:
+            self._wire.extend(buffer)
+            return None, bytes(self._wire)
+
+        self._push_back(reader, buffer)
+        return self._protocol.result, bytes(self._wire)
+
+    async def _read_more(
+        self,
+        reader: asyncio.StreamReader,
+        buffer: bytearray,
+        connection_wire: bytearray | None,
+    ) -> bool:
+        try:
+            data = await reader.read(self._max_read)
+        except Exception:
+            return False
+
+        if not data:
+            return False
+
+        buffer.extend(data)
+        if connection_wire is not None:
+            connection_wire.extend(data)
+        return True
+
+    def _push_back(
+        self,
+        reader: asyncio.StreamReader,
+        buffer: bytes | bytearray,
+    ) -> None:
         if buffer:
             reader.feed_data(bytes(buffer))
+
+    def _precise_error_offset(self, data: bytes) -> int:
+        protocol, parser = _build_request_parser()
+
+        for index, value in enumerate(data, start=1):
+            try:
+                parser.feed_data(bytes((value,)))
+            except httptools.HttpParserError:
+                return index
+
+            if protocol.result.is_complete:
+                return index
+
+        return len(data)
+
+    def _body_parse_error(
+        self,
+        reader: asyncio.StreamReader,
+        buffer: bytearray,
+        consumed_guess: int,
+    ) -> tuple[ParsedRequest | None, bytes]:
+        candidate = bytes(self._wire) + bytes(buffer[:consumed_guess])
+        error_offset = self._precise_error_offset(candidate)
+        body_offset = max(0, error_offset - len(self._wire))
+        self._wire.extend(buffer[:body_offset])
+        self._push_back(reader, buffer[body_offset:])
+        return None, bytes(self._wire)
+
+    async def _parse_content_length_body(
+        self,
+        reader: asyncio.StreamReader,
+        buffer: bytearray,
+        content_length: int,
+        connection_wire: bytearray | None,
+    ) -> tuple[ParsedRequest | None, bytes]:
+        while len(buffer) < content_length:
+            has_more = await self._read_more(
+                reader,
+                buffer,
+                connection_wire,
+            )
+            if not has_more:
+                self._wire.extend(buffer)
+                return None, bytes(self._wire)
+
+        body = bytes(buffer[:content_length])
+        try:
+            self._parser.feed_data(body)
+        except httptools.HttpParserError:
+            return self._body_parse_error(reader, buffer, content_length)
+
+        self._wire.extend(body)
+        self._push_back(reader, buffer[content_length:])
 
         if not self._protocol.result.is_complete:
             return None, bytes(self._wire)
 
         return self._protocol.result, bytes(self._wire)
+
+    async def _parse_chunked_body(
+        self,
+        reader: asyncio.StreamReader,
+        buffer: bytearray,
+        connection_wire: bytearray | None,
+    ) -> tuple[ParsedRequest | None, bytes]:
+        while True:
+            try:
+                chunked_end = _scan_chunked_body_end(buffer)
+            except _ChunkScanError as exc:
+                self._wire.extend(buffer[: exc.offset])
+                self._push_back(reader, buffer[exc.offset :])
+                return None, bytes(self._wire)
+
+            if chunked_end is not None:
+                chunked_body = bytes(buffer[:chunked_end])
+                try:
+                    self._parser.feed_data(chunked_body)
+                except httptools.HttpParserError:
+                    return self._body_parse_error(reader, buffer, chunked_end)
+
+                self._wire.extend(chunked_body)
+                self._push_back(reader, buffer[chunked_end:])
+
+                if not self._protocol.result.is_complete:
+                    return None, bytes(self._wire)
+
+                return self._protocol.result, bytes(self._wire)
+
+            has_more = await self._read_more(
+                reader,
+                buffer,
+                connection_wire,
+            )
+            if not has_more:
+                self._wire.extend(buffer)
+                return None, bytes(self._wire)
 
 
 class HTTPRequestReader:
