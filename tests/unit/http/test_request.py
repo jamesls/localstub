@@ -13,6 +13,7 @@ from localstub.http.request import (
     HTTPRequestReader,
     ParsedRequest,
     RequestProtocol,
+    parsed_body_bytes_from_wire_raw_bytes,
 )
 
 
@@ -235,6 +236,20 @@ async def test_async_request_parser_parse_malformed_request() -> None:
     parsed, _ = await parser.parse(reader)
 
     assert parsed is None
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_parse_malformed_single_byte_request() -> (
+    None
+):
+    reader = _create_mock_reader([b"\x00"])
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is None
+    assert wire_bytes == b"\x00"
+    reader.feed_data.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -482,6 +497,36 @@ async def test_async_request_parser_parse_headers_malformed_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_request_parser_parse_headers_with_read_exception() -> (
+    None
+):
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.read = AsyncMock(
+        side_effect=ConnectionResetError("Connection reset")
+    )
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes, remaining = await parser.parse_headers(reader)
+
+    assert parsed is None
+    assert wire_bytes == b""
+    assert remaining == bytearray()
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_parse_headers_malformed_byte() -> None:
+    reader = _create_mock_reader([b"\x00"])
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes, remaining = await parser.parse_headers(reader)
+
+    assert parsed is None
+    assert wire_bytes == b"\x00"
+    assert remaining == bytearray()
+    reader.feed_data.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_async_request_parser_continue_body_eof_before_complete() -> (
     None
 ):
@@ -504,6 +549,116 @@ async def test_async_request_parser_continue_body_eof_before_complete() -> (
     parsed, _ = await parser.continue_parse_body(reader, remaining)
 
     assert parsed is None
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_continue_body_pushes_back_pipeline() -> (
+    None
+):
+    header_bytes = (
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Length: 5\r\n"
+        b"\r\n"
+    )
+    next_request = b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.read = AsyncMock(
+        side_effect=[header_bytes, b"hello" + next_request, b""]
+    )
+
+    parser = AsyncRequestParser()
+    parsed, _, remaining = await parser.parse_headers(reader)
+
+    assert parsed is not None
+    assert remaining == bytearray()
+
+    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+
+    assert parsed is not None
+    assert parsed.is_complete
+    assert parsed.body == b"hello"
+    assert wire_bytes == header_bytes + b"hello"
+    reader.feed_data.assert_called_once_with(next_request)
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_continue_body_with_read_exception() -> (
+    None
+):
+    header_bytes = (
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Length: 5\r\n"
+        b"\r\n"
+    )
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.read = AsyncMock(
+        side_effect=[header_bytes, ConnectionResetError("Connection reset")]
+    )
+
+    parser = AsyncRequestParser()
+    parsed, _, remaining = await parser.parse_headers(reader)
+
+    assert parsed is not None
+
+    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+
+    assert parsed is None
+    assert wire_bytes == header_bytes
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_continue_body_bad_chunk_pushback() -> None:
+    header_bytes = (
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    )
+    next_request = b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.read = AsyncMock(
+        side_effect=[header_bytes, b"Z\r\nbroken\r\n" + next_request, b""]
+    )
+
+    parser = AsyncRequestParser()
+    parsed, _, remaining = await parser.parse_headers(reader)
+
+    assert parsed is not None
+
+    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+
+    assert parsed is None
+    assert wire_bytes == header_bytes + b"Z"
+    reader.feed_data.assert_called_once()
+    pushed_back = reader.feed_data.call_args.args[0]
+    assert pushed_back.startswith(b"\r\nbroken\r\n")
+    assert next_request in pushed_back
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_continue_body_bad_chunk_no_pushback() -> (
+    None
+):
+    header_bytes = (
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    )
+    reader = _create_mock_reader([header_bytes, b"Z"])
+
+    parser = AsyncRequestParser()
+    parsed, _, remaining = await parser.parse_headers(reader)
+
+    assert parsed is not None
+
+    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+
+    assert parsed is None
+    assert wire_bytes == header_bytes + b"Z"
+    reader.feed_data.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -691,6 +846,94 @@ def test_http_request_json_body_parses_json() -> None:
     assert request.json_body == {"key": "value"}
 
 
+def test_http_request_with_method_returns_updated_copy() -> None:
+    request = HTTPRequest(method="GET", path="/", http_version="1.1")
+
+    updated = request.with_method("POST")
+
+    assert updated.method == "POST"
+    assert updated.path == "/"
+    assert request.method == "GET"
+
+
+def test_http_request_with_path_returns_updated_copy() -> None:
+    request = HTTPRequest(method="GET", path="/", http_version="1.1")
+
+    updated = request.with_path("/updated")
+
+    assert updated.path == "/updated"
+    assert updated.method == "GET"
+    assert request.path == "/"
+
+
+def test_http_request_with_headers_returns_updated_copy() -> None:
+    request = HTTPRequest(method="GET", path="/", http_version="1.1")
+    headers = Headers.from_items([("X-Test", "value")])
+
+    updated = request.with_headers(headers)
+
+    assert updated.headers == headers
+    assert request.headers == Headers.empty()
+
+
+def test_http_request_wire_body_bytes_returns_body_from_wire_bytes() -> None:
+    wire_raw_bytes = (
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5\r\nhello\r\n"
+        b"0\r\n\r\n"
+    )
+    request = HTTPRequest(
+        method="POST",
+        path="/upload",
+        http_version="1.1",
+        body="hello",
+        body_bytes=b"hello",
+        wire_raw_bytes=wire_raw_bytes,
+    )
+
+    assert request.wire_body_bytes == b"5\r\nhello\r\n0\r\n\r\n"
+
+
+def test_http_request_wire_body_bytes_falls_back_to_body_bytes() -> None:
+    request = HTTPRequest(
+        method="POST",
+        path="/upload",
+        http_version="1.1",
+        body_bytes=b"hello",
+        wire_raw_bytes=b"not an http request",
+    )
+
+    assert request.wire_body_bytes == b"hello"
+
+
+def test_http_request_wire_body_bytes_falls_back_to_encoded_body_text() -> (
+    None
+):
+    request = HTTPRequest(
+        method="POST",
+        path="/upload",
+        http_version="1.1",
+        body="hello",
+        wire_raw_bytes=b"not an http request",
+    )
+
+    assert request.wire_body_bytes == b"hello"
+
+
+def test_http_request_wire_body_bytes_falls_back_to_empty_bytes() -> None:
+    request = HTTPRequest(
+        method="POST",
+        path="/upload",
+        http_version="1.1",
+        wire_raw_bytes=b"not an http request",
+    )
+
+    assert request.wire_body_bytes == b""
+
+
 def test_http_request_exposes_immutable_headers() -> None:
     headers = Headers.from_items([("X-Test", "a")])
     request = HTTPRequest(
@@ -799,6 +1042,36 @@ def test_http_request_effective_path_returns_origin_form_path() -> None:
 def test_http_request_effective_path_returns_slash_for_empty_path() -> None:
     request = HTTPRequest(method="GET", path="", http_version="1.1")
     assert request.effective_path == "/"
+
+
+def test_parsed_body_bytes_empty_wire_returns_none() -> None:
+    assert parsed_body_bytes_from_wire_raw_bytes(b"") is None
+
+
+def test_parsed_body_bytes_returns_none_for_bad_request() -> None:
+    assert parsed_body_bytes_from_wire_raw_bytes(b"\x00") is None
+
+
+def test_parsed_body_bytes_returns_none_for_incomplete_request() -> None:
+    request_bytes = b"POST /upload HTTP/1.1\r\nHost: localhost\r\n"
+
+    assert parsed_body_bytes_from_wire_raw_bytes(request_bytes) is None
+
+
+def test_parsed_body_bytes_dechunks_wire_body() -> None:
+    request_bytes = (
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5\r\nHello\r\n"
+        b"6\r\n World\r\n"
+        b"0\r\n\r\n"
+    )
+
+    assert (
+        parsed_body_bytes_from_wire_raw_bytes(request_bytes) == b"Hello World"
+    )
 
 
 def _create_mock_reader(data_chunks: list[bytes]) -> asyncio.StreamReader:
