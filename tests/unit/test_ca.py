@@ -1,4 +1,6 @@
+import os
 import ssl
+import stat
 from pathlib import Path
 
 import pytest
@@ -64,6 +66,19 @@ class TestFromDirectory:
         assert (ca_dir / "ca.pem").exists()
         assert (ca_dir / "ca.key").exists()
         assert (ca_dir / "ca.p12").exists()
+
+    def test_generates_private_key_with_owner_only_permissions(
+        self, tmp_path: Path
+    ) -> None:
+        ca_dir = tmp_path / "secure_ca"
+        original_umask = os.umask(0)
+        try:
+            TLSProxyCA.from_directory(ca_dir)
+        finally:
+            os.umask(original_umask)
+
+        key_mode = stat.S_IMODE((ca_dir / "ca.key").stat().st_mode)
+        assert key_mode == stat.S_IRUSR | stat.S_IWUSR
 
     def test_loads_existing_ca_from_directory(self, tmp_path: Path) -> None:
         ca_dir = tmp_path / "existing_ca"
