@@ -4,7 +4,11 @@ import pytest
 
 from localstub.forward import Forwarder
 from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
-from localstub.server import AsyncHTTPTestServer, HTTPResponse
+from localstub.server import (
+    AsyncHTTPTestServer,
+    HTTPResponse,
+    ThrottledTransmission,
+)
 
 
 async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
@@ -105,6 +109,60 @@ async def test_server_closes_http10_connection_by_default():
                 pass
 
         assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("method", "status"),
+    [("HEAD", 200), ("GET", 204), ("GET", 304)],
+)
+@pytest.mark.parametrize("throttled", [False, True])
+@pytest.mark.asyncio
+async def test_bodyless_response_preserves_keep_alive_connection(
+    method: str,
+    status: int,
+    throttled: bool,
+) -> None:
+    def handler(ctx: ResponderContext) -> HTTPResponse:
+        if ctx.request.path == "/bodyless":
+            return HTTPResponse(status=status, body=b"unexpected-body")
+        return HTTPResponse.text("next-response")
+
+    async with AsyncHTTPTestServer(handler=handler) as server:
+        if throttled:
+            server.set_transmission_strategy(
+                ThrottledTransmission(chunk_size=1, delay=0)
+            )
+
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        try:
+            writer.write(
+                f"{method} /bodyless HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "\r\n".encode()
+            )
+            await writer.drain()
+
+            first_response = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"),
+                timeout=1.0,
+            )
+            assert first_response.startswith(f"HTTP/1.1 {status} ".encode())
+            if status == 204:
+                assert b"content-length:" not in first_response.lower()
+            else:
+                assert b"Content-Length: 15\r\n" in first_response
+
+            writer.write(b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            await writer.drain()
+
+            next_response = await _read_http_response(reader)
+            assert next_response.startswith(b"HTTP/1.1 200 OK\r\n")
+            assert next_response.endswith(b"next-response")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
 
 @pytest.mark.asyncio
