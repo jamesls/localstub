@@ -6,6 +6,14 @@ from email.message import Message
 
 import httptools
 
+from localstub.http.framing import (
+    HEADER_TERMINATOR,
+    ChunkScanError,
+    content_length,
+    is_chunked_transfer,
+    scan_chunked_body_end,
+)
+
 
 @dataclass
 class RecordedResponse:
@@ -194,14 +202,13 @@ class AsyncMultiResponseParser:
     informational responses before the final response, and all
     responses may arrive in a single buffer read.
 
-    Feeds data byte-by-byte to precisely track where each response
+    Parses framed segments while precisely tracking where each response
     ends, preserving exact wire bytes for each response.
     """
 
     def __init__(self, max_read: int = 8192) -> None:
         self._max_read = max_read
         self._buffer = bytearray()
-        self._consumed = 0
 
     async def next_response(
         self,
@@ -225,43 +232,192 @@ class AsyncMultiResponseParser:
         is_head = (
             request_method is not None and request_method.upper() == "HEAD"
         )
-        wire_start = self._consumed
+        header_end = await self._read_headers(reader)
+        if header_end is None:
+            wire = bytes(self._buffer)
+            self._buffer.clear()
+            return None, wire
 
+        header_wire = bytes(self._buffer[:header_end])
+        try:
+            parser.feed_data(header_wire)
+        except httptools.HttpParserError:
+            error_offset = self._precise_error_offset(header_wire)
+            wire = bytes(self._buffer[:error_offset])
+            del self._buffer[:error_offset]
+            return None, wire
+
+        del self._buffer[:header_end]
+        wire = bytearray(header_wire)
+
+        if protocol.message_complete:
+            return protocol.result, bytes(wire)
+
+        if is_head and protocol.result.http_version is not None:
+            protocol.result.is_complete = True
+            return protocol.result, bytes(wire)
+
+        if is_chunked_transfer(protocol.result.headers):
+            return await self._parse_chunked_body(
+                reader,
+                protocol,
+                parser,
+                wire,
+            )
+
+        body_length = content_length(protocol.result.headers)
+        if body_length is not None:
+            return await self._parse_content_length_body(
+                reader,
+                protocol,
+                parser,
+                wire,
+                body_length,
+            )
+
+        return await self._parse_close_delimited_body(
+            reader,
+            protocol,
+            parser,
+            wire,
+        )
+
+    async def _read_more(self, reader: asyncio.StreamReader) -> bool:
+        try:
+            data = await reader.read(self._max_read)
+        except Exception:
+            return False
+
+        if not data:
+            return False
+
+        self._buffer.extend(data)
+        return True
+
+    async def _read_headers(
+        self,
+        reader: asyncio.StreamReader,
+    ) -> int | None:
         while True:
-            while self._consumed < len(self._buffer):
-                byte = bytes([self._buffer[self._consumed]])
-                self._consumed += 1
+            header_end = self._buffer.find(HEADER_TERMINATOR)
+            if header_end != -1:
+                return header_end + len(HEADER_TERMINATOR)
+            if not await self._read_more(reader):
+                return None
 
-                try:
-                    parser.feed_data(byte)
-                except httptools.HttpParserError:
-                    wire = bytes(self._buffer[wire_start : self._consumed])
-                    return None, wire
+    def _precise_error_offset(self, data: bytes) -> int:
+        protocol = ResponseProtocol()
+        parser = httptools.HttpResponseParser(protocol)
+        protocol.set_parser(parser)
 
-                if protocol.message_complete:
-                    wire = bytes(self._buffer[wire_start : self._consumed])
-                    return protocol.result, wire
-
-                if is_head and protocol.result.http_version is not None:
-                    protocol.result.is_complete = True
-                    wire = bytes(self._buffer[wire_start : self._consumed])
-                    return protocol.result, wire
-
+        for index, value in enumerate(data, start=1):
             try:
-                data = await reader.read(self._max_read)
-            except Exception:
+                parser.feed_data(bytes((value,)))
+            except httptools.HttpParserError:
+                return index
+
+            if protocol.message_complete:
+                return index
+
+        return len(data)
+
+    async def _parse_content_length_body(
+        self,
+        reader: asyncio.StreamReader,
+        protocol: ResponseProtocol,
+        parser: httptools.HttpResponseParser,
+        wire: bytearray,
+        content_length: int,
+    ) -> tuple[ParsedResponse | None, bytes]:
+        remaining = content_length
+
+        while remaining > 0:
+            if not self._buffer and not await self._read_more(reader):
+                return None, bytes(wire)
+
+            segment_length = min(remaining, len(self._buffer))
+            segment = bytes(self._buffer[:segment_length])
+            try:
+                parser.feed_data(segment)
+            except httptools.HttpParserError:
+                return self._body_parse_error(wire, segment_length)
+
+            wire.extend(segment)
+            del self._buffer[:segment_length]
+            remaining -= segment_length
+
+        if not protocol.message_complete:
+            return None, bytes(wire)
+        return protocol.result, bytes(wire)
+
+    async def _parse_chunked_body(
+        self,
+        reader: asyncio.StreamReader,
+        protocol: ResponseProtocol,
+        parser: httptools.HttpResponseParser,
+        wire: bytearray,
+    ) -> tuple[ParsedResponse | None, bytes]:
+        while True:
+            try:
+                chunked_end = scan_chunked_body_end(self._buffer)
+            except ChunkScanError as exc:
+                wire.extend(self._buffer[: exc.offset])
+                del self._buffer[: exc.offset]
+                return None, bytes(wire)
+
+            if chunked_end is not None:
+                chunked_body = bytes(self._buffer[:chunked_end])
+                try:
+                    parser.feed_data(chunked_body)
+                except httptools.HttpParserError:
+                    return self._body_parse_error(wire, chunked_end)
+
+                wire.extend(chunked_body)
+                del self._buffer[:chunked_end]
+                if not protocol.message_complete:
+                    return None, bytes(wire)
+                return protocol.result, bytes(wire)
+
+            if not await self._read_more(reader):
+                wire.extend(self._buffer)
+                self._buffer.clear()
+                return None, bytes(wire)
+
+    async def _parse_close_delimited_body(
+        self,
+        reader: asyncio.StreamReader,
+        protocol: ResponseProtocol,
+        parser: httptools.HttpResponseParser,
+        wire: bytearray,
+    ) -> tuple[ParsedResponse | None, bytes]:
+        while True:
+            if self._buffer:
+                segment = bytes(self._buffer)
+                try:
+                    parser.feed_data(segment)
+                except httptools.HttpParserError:
+                    return self._body_parse_error(wire, len(segment))
+                wire.extend(segment)
+                self._buffer.clear()
+
+            if not await self._read_more(reader):
                 break
 
-            if not data:
-                break
+        if protocol.result.http_version is not None and _is_close_delimited(
+            protocol.result.headers
+        ):
+            protocol.result.is_complete = True
+            return protocol.result, bytes(wire)
+        return None, bytes(wire)
 
-            self._buffer.extend(data)
-
-        if protocol.result.http_version is not None:
-            if _is_close_delimited(protocol.result.headers):
-                protocol.result.is_complete = True
-                wire = bytes(self._buffer[wire_start : self._consumed])
-                return protocol.result, wire
-
-        wire = bytes(self._buffer[wire_start : self._consumed])
-        return None, wire
+    def _body_parse_error(
+        self,
+        wire: bytearray,
+        consumed_guess: int,
+    ) -> tuple[ParsedResponse | None, bytes]:
+        candidate = bytes(wire) + bytes(self._buffer[:consumed_guess])
+        error_offset = self._precise_error_offset(candidate)
+        body_offset = max(0, error_offset - len(wire))
+        wire.extend(self._buffer[:body_offset])
+        del self._buffer[:body_offset]
+        return None, bytes(wire)

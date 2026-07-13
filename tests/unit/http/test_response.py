@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from localstub.http.response import (
+    AsyncMultiResponseParser,
     AsyncResponseParser,
     ParsedResponse,
     ResponseProtocol,
@@ -321,6 +322,117 @@ async def test_async_response_parser_uppercase_transfer_encoding_none() -> (
     parsed, _ = await parser.parse(reader)
 
     assert parsed is None
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_buffers_large_body_parts() -> None:
+    body = b"x" * (1024 * 1024)
+    first_response = (
+        b"HTTP/1.1 200 OK\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"\r\n"
+        + body
+    )
+    second_response = b"HTTP/1.1 204 No Content\r\n\r\n"
+    reader = _create_mock_reader([first_response + second_response])
+    parser = AsyncMultiResponseParser(max_read=len(first_response) + 1024)
+
+    first, first_wire = await parser.next_response(reader)
+    second, second_wire = await parser.next_response(reader)
+
+    assert first is not None
+    assert first.body_parts == [body]
+    assert first_wire == first_response
+    assert second is not None
+    assert second.status_code == 204
+    assert second_wire == second_response
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_streams_content_length_segments() -> None:
+    headers = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n"
+    reader = _create_mock_reader([headers + b"abc", b"def"])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is not None
+    assert parsed.body_parts == [b"abc", b"def"]
+    assert wire == headers + b"abcdef"
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_preserves_chunked_trailers() -> None:
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Transfer-Encoding: gzip, chunked\r\n"
+        b"\r\n"
+        b"5;name=value\r\nHello\r\n"
+        b"0\r\nX-Trailer: done\r\n\r\n"
+    )
+    reader = _create_mock_reader([response[:70], response[70:]])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is not None
+    assert parsed.body == b"Hello"
+    assert wire == response
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_reads_close_delimited_body() -> None:
+    headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+    reader = _create_mock_reader([headers + b"first", b"second"])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is not None
+    assert parsed.body_parts == [b"first", b"second"]
+    assert wire == headers + b"firstsecond"
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_head_retains_next_response() -> None:
+    head_response = b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n"
+    next_response = b"HTTP/1.1 204 No Content\r\n\r\n"
+    reader = _create_mock_reader([head_response + next_response])
+    parser = AsyncMultiResponseParser()
+
+    head, head_wire = await parser.next_response(reader, request_method="head")
+    following, following_wire = await parser.next_response(reader)
+
+    assert head is not None
+    assert head.body == b""
+    assert head_wire == head_response
+    assert following is not None
+    assert following.status_code == 204
+    assert following_wire == next_response
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_truncated_body_returns_none() -> None:
+    response = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort"
+    reader = _create_mock_reader([response])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is None
+    assert wire == response
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_invalid_chunk_size_returns_none() -> None:
+    headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    reader = _create_mock_reader([headers + b"Z"])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is None
+    assert wire == headers + b"Z"
 
 
 def _create_mock_reader(data_chunks: list[bytes]) -> asyncio.StreamReader:

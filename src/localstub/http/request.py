@@ -7,12 +7,16 @@ from typing import Any, Protocol
 
 import httptools
 
+from localstub.http.framing import (
+    HEADER_TERMINATOR,
+    ChunkScanError,
+    content_length,
+    is_chunked_transfer,
+    scan_chunked_body_end,
+)
 from localstub.http.headers import Headers
 from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_headers
-
-HEADER_TERMINATOR = b"\r\n\r\n"
-CRLF = b"\r\n"
 
 
 class Writer(Protocol):
@@ -251,11 +255,6 @@ class RequestProtocol:
         pass
 
 
-class _ChunkScanError(Exception):
-    def __init__(self, offset: int) -> None:
-        self.offset = offset
-
-
 def _build_request_parser() -> tuple[
     RequestProtocol, httptools.HttpRequestParser
 ]:
@@ -263,115 +262,6 @@ def _build_request_parser() -> tuple[
     parser = httptools.HttpRequestParser(protocol)
     protocol.set_parser(parser)
     return protocol, parser
-
-
-def _is_hex_digit(value: int) -> bool:
-    return (
-        ord("0") <= value <= ord("9")
-        or ord("A") <= value <= ord("F")
-        or ord("a") <= value <= ord("f")
-    )
-
-
-def _content_length(
-    headers: list[tuple[bytes, bytes]],
-) -> int | None:
-    for name, value in reversed(headers):
-        if name.lower() != b"content-length":
-            continue
-        try:
-            return int(value.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _is_chunked_transfer(
-    headers: list[tuple[bytes, bytes]],
-) -> bool:
-    for name, value in headers:
-        if name.lower() != b"transfer-encoding":
-            continue
-        for token in value.split(b","):
-            if token.strip().lower() == b"chunked":
-                return True
-    return False
-
-
-def _parse_chunk_size(
-    buffer: bytearray,
-    start: int,
-    end: int,
-) -> int:
-    if start == end:
-        raise _ChunkScanError(start + 1)
-    return int(bytes(buffer[start:end]), 16)
-
-
-def _scan_chunk_size_line(
-    buffer: bytearray,
-    start: int,
-) -> tuple[int, int] | None:
-    size_end = start
-
-    while True:
-        if size_end >= len(buffer):
-            return None
-
-        current = buffer[size_end]
-        if _is_hex_digit(current):
-            size_end += 1
-            continue
-
-        if current == ord(";"):
-            line_end = buffer.find(CRLF, size_end)
-            if line_end == -1:
-                return None
-            return _parse_chunk_size(buffer, start, size_end), line_end + 2
-
-        if current == ord("\r"):
-            if size_end + 1 >= len(buffer):
-                return None
-            if buffer[size_end + 1] != ord("\n"):
-                raise _ChunkScanError(size_end + 1)
-            return _parse_chunk_size(buffer, start, size_end), size_end + 2
-
-        raise _ChunkScanError(size_end + 1)
-
-
-def _scan_chunked_body_end(buffer: bytearray) -> int | None:
-    index = 0
-
-    while True:
-        chunk_size_line = _scan_chunk_size_line(buffer, index)
-        if chunk_size_line is None:
-            return None
-
-        chunk_size, chunk_data_start = chunk_size_line
-
-        if chunk_size == 0:
-            if buffer[chunk_data_start : chunk_data_start + 2] == CRLF:
-                return chunk_data_start + 2
-            trailer_end = buffer.find(HEADER_TERMINATOR, chunk_data_start)
-            if trailer_end == -1:
-                return None
-            return trailer_end + len(HEADER_TERMINATOR)
-
-        chunk_data_end = chunk_data_start + chunk_size
-        if chunk_data_end + 2 > len(buffer):
-            return None
-        if buffer[chunk_data_end : chunk_data_end + 2] != CRLF:
-            mismatch = chunk_data_end
-            while mismatch < len(buffer) and mismatch < chunk_data_end + 2:
-                expected = (
-                    ord("\r") if mismatch == chunk_data_end else ord("\n")
-                )
-                if buffer[mismatch] != expected:
-                    raise _ChunkScanError(mismatch + 1)
-                mismatch += 1
-            return None
-
-        index = chunk_data_end + 2
 
 
 class AsyncRequestParser:
@@ -525,19 +415,19 @@ class AsyncRequestParser:
             self._sync_connection_wire(connection_wire)
             return self._protocol.result, bytes(self._wire)
 
-        if _is_chunked_transfer(self._protocol.result.headers):
+        if is_chunked_transfer(self._protocol.result.headers):
             return await self._parse_chunked_body(
                 reader,
                 buffer,
                 connection_wire,
             )
 
-        content_length = _content_length(self._protocol.result.headers)
-        if content_length is not None:
+        body_length = content_length(self._protocol.result.headers)
+        if body_length is not None:
             return await self._parse_content_length_body(
                 reader,
                 buffer,
-                content_length,
+                body_length,
                 connection_wire,
             )
 
@@ -678,8 +568,8 @@ class AsyncRequestParser:
     ) -> tuple[ParsedRequest | None, bytes]:
         while True:
             try:
-                chunked_end = _scan_chunked_body_end(buffer)
-            except _ChunkScanError as exc:
+                chunked_end = scan_chunked_body_end(buffer)
+            except ChunkScanError as exc:
                 self._wire.extend(buffer[: exc.offset])
                 self._sync_connection_wire(connection_wire)
                 self._push_back(reader, buffer[exc.offset :])
