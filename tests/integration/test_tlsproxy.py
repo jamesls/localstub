@@ -130,6 +130,56 @@ async def test_aclose_cancels_idle_client_connection() -> None:
 
 
 @pytest.mark.asyncio
+async def test_aclose_cancels_forward_connection_after_tls_upgrade() -> None:
+    request_received = asyncio.Event()
+
+    async def withhold_response(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            request_received.set()
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    upstream = await asyncio.start_server(
+        withhold_response,
+        "127.0.0.1",
+        0,
+    )
+    upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+    proxy = AsyncTLSInterceptProxy(
+        default_mode="forward",
+        upstream_tls=False,
+    )
+    await proxy.start()
+    proxy_host, proxy_port = proxy.address
+    verify_ctx = ssl.create_default_context(cafile=str(proxy.ca.ca_pem_path()))
+
+    try:
+        async with httpx.AsyncClient(
+            proxy=f"http://{proxy_host}:{proxy_port}",
+            verify=verify_ctx,
+            http2=False,
+        ) as client:
+            request_task = asyncio.create_task(
+                client.get(f"https://{upstream_host}:{upstream_port}/pending")
+            )
+            await asyncio.wait_for(request_received.wait(), timeout=1.0)
+            await asyncio.wait_for(proxy.aclose(), timeout=2.0)
+
+            with pytest.raises(httpx.TransportError):
+                await request_task
+    finally:
+        await proxy.aclose()
+        upstream.close()
+        await upstream.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_non_connect_request_returns_400():
     async with AsyncTLSInterceptProxy() as proxy:
         host, port = proxy.address
