@@ -1268,7 +1268,7 @@ class AsyncHTTPTestServer:
         headers = dict(response.headers) if response.headers else {}
         header_names = {k.lower() for k in headers}
 
-        if 100 <= response.status < 200:
+        if 100 <= response.status < 200 or response.status == 204:
             headers = {
                 name: value
                 for name, value in headers.items()
@@ -1290,6 +1290,10 @@ class AsyncHTTPTestServer:
         request: HTTPRequest,
     ) -> bool:
         body = self._normalize_body(response.body)
+        body_allowed = request.method.upper() != "HEAD" and not (
+            100 <= response.status < 200 or response.status in {204, 304}
+        )
+        wire_body = body if body_allowed else b""
         should_close = should_close_connection(
             request,
             response_headers=response.headers,
@@ -1301,11 +1305,11 @@ class AsyncHTTPTestServer:
         )
 
         if isinstance(self._transmission_strategy, ImmediateTransmission):
-            writer.write(head + body)
+            writer.write(head + wire_body)
             await writer.drain()
             return should_close
 
         writer.write(head)
-        await self._transmission_strategy.write_body(writer, body)
+        await self._transmission_strategy.write_body(writer, wire_body)
 
         return should_close
