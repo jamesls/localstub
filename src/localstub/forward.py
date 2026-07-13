@@ -11,6 +11,7 @@ import asyncio
 import gzip
 import logging
 import ssl
+import truststore
 from dataclasses import dataclass
 from email.message import Message
 from enum import Enum
@@ -226,8 +227,10 @@ class Forwarder:
         ssl_ctx: ssl.SSLContext | None = None
         server_hostname: str | None = None
         if use_tls:
-            ssl_ctx = ssl.create_default_context()
-            if not self._verify_upstream:
+            if self._verify_upstream:
+                ssl_ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            else:
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
             server_hostname = host

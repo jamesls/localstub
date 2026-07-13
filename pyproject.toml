@@ -24,6 +24,7 @@ dependencies = [
   "httptools>=0.6.0",
   "cryptography>=46.0.3",
   "rich>=14.2.0",
+  "truststore>=0.10.0",
 ]
 
 [dependency-groups]
