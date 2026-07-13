@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 HEADER_TERMINATOR = b"\r\n\r\n"
 CRLF = b"\r\n"
 
@@ -7,6 +9,12 @@ CRLF = b"\r\n"
 class ChunkScanError(Exception):
     def __init__(self, offset: int) -> None:
         self.offset = offset
+
+
+@dataclass(frozen=True)
+class ChunkScanResult:
+    end: int | None
+    resume_from: int
 
 
 def content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
@@ -79,27 +87,37 @@ def _scan_chunk_size_line(
         raise ChunkScanError(size_end + 1)
 
 
-def scan_chunked_body_end(buffer: bytearray) -> int | None:
-    index = 0
+def scan_chunked_body(
+    buffer: bytearray,
+    start: int = 0,
+) -> ChunkScanResult:
+    """Scan chunk framing from a known chunk-size boundary.
+
+    `resume_from` identifies the first incomplete chunk so callers can
+    continue scanning after appending data without revisiting complete chunks.
+    """
+    index = start
 
     while True:
         chunk_size_line = _scan_chunk_size_line(buffer, index)
         if chunk_size_line is None:
-            return None
+            return ChunkScanResult(end=None, resume_from=index)
 
         chunk_size, chunk_data_start = chunk_size_line
 
         if chunk_size == 0:
             if buffer[chunk_data_start : chunk_data_start + 2] == CRLF:
-                return chunk_data_start + 2
+                end = chunk_data_start + 2
+                return ChunkScanResult(end=end, resume_from=end)
             trailer_end = buffer.find(HEADER_TERMINATOR, chunk_data_start)
             if trailer_end == -1:
-                return None
-            return trailer_end + len(HEADER_TERMINATOR)
+                return ChunkScanResult(end=None, resume_from=index)
+            end = trailer_end + len(HEADER_TERMINATOR)
+            return ChunkScanResult(end=end, resume_from=end)
 
         chunk_data_end = chunk_data_start + chunk_size
         if chunk_data_end + 2 > len(buffer):
-            return None
+            return ChunkScanResult(end=None, resume_from=index)
         if buffer[chunk_data_end : chunk_data_end + 2] != CRLF:
             mismatch = chunk_data_end
             while mismatch < len(buffer) and mismatch < chunk_data_end + 2:
@@ -109,6 +127,6 @@ def scan_chunked_body_end(buffer: bytearray) -> int | None:
                 if buffer[mismatch] != expected:
                     raise ChunkScanError(mismatch + 1)
                 mismatch += 1
-            return None
+            return ChunkScanResult(end=None, resume_from=index)
 
         index = chunk_data_end + 2

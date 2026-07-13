@@ -11,7 +11,7 @@ from localstub.http.framing import (
     ChunkScanError,
     content_length,
     is_chunked_transfer,
-    scan_chunked_body_end,
+    scan_chunked_body,
 )
 
 
@@ -357,15 +357,17 @@ class AsyncMultiResponseParser:
         parser: httptools.HttpResponseParser,
         wire: bytearray,
     ) -> tuple[ParsedResponse | None, bytes]:
+        scan_from = 0
         while True:
             try:
-                chunked_end = scan_chunked_body_end(self._buffer)
+                scan = scan_chunked_body(self._buffer, scan_from)
             except ChunkScanError as exc:
                 wire.extend(self._buffer[: exc.offset])
                 del self._buffer[: exc.offset]
                 return None, bytes(wire)
 
-            if chunked_end is not None:
+            if scan.end is not None:
+                chunked_end = scan.end
                 chunked_body = bytes(self._buffer[:chunked_end])
                 try:
                     parser.feed_data(chunked_body)
@@ -378,6 +380,7 @@ class AsyncMultiResponseParser:
                     return None, bytes(wire)
                 return protocol.result, bytes(wire)
 
+            scan_from = scan.resume_from
             if not await self._read_more(reader):
                 wire.extend(self._buffer)
                 self._buffer.clear()
