@@ -397,6 +397,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "httptools" },
+    { name = "httpx" },
     { name = "rich" },
     { name = "trustme" },
     { name = "truststore" },
@@ -406,7 +407,6 @@ dependencies = [
 dev = [
     { name = "aiohttp" },
     { name = "ast-grep-cli" },
-    { name = "httpx" },
     { name = "jmeslog" },
     { name = "mkdocs-material" },
     { name = "mkdocstrings" },
@@ -424,6 +424,7 @@ dev = [
 requires-dist = [
     { name = "cryptography", specifier = ">=46.0.3" },
     { name = "httptools", specifier = ">=0.6.0" },
+    { name = "httpx", specifier = ">=0.28.0" },
     { name = "rich", specifier = ">=14.2.0" },
     { name = "trustme", specifier = ">=1.1.0" },
     { name = "truststore", specifier = ">=0.10.0" },
@@ -433,7 +434,6 @@ requires-dist = [
 dev = [
     { name = "aiohttp" },
     { name = "ast-grep-cli" },
-    { name = "httpx" },
     { name = "jmeslog", specifier = ">=0.2.0" },
     { name = "mkdocs-material", specifier = ">=9.6.20" },
     { name = "mkdocstrings", specifier = ">=0.30.0" },
