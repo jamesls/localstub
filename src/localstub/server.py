@@ -777,6 +777,9 @@ class AsyncHTTPTestServer:
         if self._server is None:
             return
         self._server.close()
+        # Let callbacks for connections accepted before close register their
+        # writers before taking the shutdown snapshot.
+        await asyncio.sleep(0)
         for writer in tuple(self._client_writers):
             writer.close()
         await self._server.wait_closed()

@@ -44,19 +44,19 @@ async def _assert_connection_closes(reader: asyncio.StreamReader) -> None:
 
 
 @pytest.mark.asyncio
-async def test_aclose_closes_idle_client_connection() -> None:
+async def test_aclose_closes_just_accepted_client_connection() -> None:
     server = AsyncHTTPTestServer()
     await server.start()
     reader, writer = await asyncio.open_connection(server.host, server.port)
-    await asyncio.sleep(0)
 
     try:
-        await asyncio.wait_for(server.aclose(), timeout=0.5)
+        async with asyncio.timeout(0.5):
+            await server.aclose()
         eof = await asyncio.wait_for(reader.read(1), timeout=0.5)
         assert eof == b""
     finally:
         writer.close()
-        await writer.wait_closed()
+        await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
         await server.aclose()
 
 
