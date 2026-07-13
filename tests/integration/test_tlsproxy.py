@@ -109,6 +109,24 @@ async def test_start_idempotent_and_aclose_noop():
 
 
 @pytest.mark.asyncio
+async def test_aclose_cancels_idle_client_connection() -> None:
+    proxy = AsyncTLSInterceptProxy()
+    await proxy.start()
+    host, port = proxy.address
+    reader, writer = await asyncio.open_connection(host, port)
+    await asyncio.sleep(0)
+
+    try:
+        await asyncio.wait_for(proxy.aclose(), timeout=2.0)
+        eof = await asyncio.wait_for(reader.read(1), timeout=0.5)
+        assert eof == b""
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await proxy.aclose()
+
+
+@pytest.mark.asyncio
 async def test_non_connect_request_returns_400():
     async with AsyncTLSInterceptProxy() as proxy:
         host, port = proxy.address

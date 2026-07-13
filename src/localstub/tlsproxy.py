@@ -196,7 +196,9 @@ class AsyncTLSInterceptProxy:
         if self._listener is None:
             return
         self._listener.close()
-        await self._listener.wait_closed()
+        # Let callbacks for connections accepted before close register their
+        # client tasks before taking the shutdown snapshot.
+        await asyncio.sleep(0)
         # Wait for in-flight client handlers to finish; cancel any that linger.
         pending = [t for t in self._client_tasks if not t.done()]
         if pending:
@@ -205,6 +207,7 @@ class AsyncTLSInterceptProxy:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+        await self._listener.wait_closed()
         self._client_tasks.clear()
         self._listener = None
 
@@ -303,7 +306,7 @@ class AsyncTLSInterceptProxy:
             except Exception:
                 pass
 
-    async def _client_connected(
+    def _client_connected(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
