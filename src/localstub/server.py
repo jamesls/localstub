@@ -453,6 +453,7 @@ class AsyncHTTPTestServer:
 
         self.last_exchange: RecordedExchange | None = None
         self.exchanges: list[RecordedExchange] = []
+        self._exchange_queue: asyncio.Queue[RecordedExchange] = asyncio.Queue()
 
         # Connection-level raw bytes tracking (keyed by client address)
         self._connection_raw_bytes_received: dict[
@@ -693,6 +694,7 @@ class AsyncHTTPTestServer:
         self.responses = []
         self.last_exchange = None
         self.exchanges = []
+        self._exchange_queue = asyncio.Queue()
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
         if self._response_sequence_middleware is not None:
@@ -811,6 +813,16 @@ class AsyncHTTPTestServer:
         self.last_response = response
         return response
 
+    async def next_exchange(
+        self, timeout: float | None = None
+    ) -> RecordedExchange:
+        """Await and return the next completed request/response exchange."""
+        if timeout is None:
+            return await self._exchange_queue.get()
+        return await asyncio.wait_for(
+            self._exchange_queue.get(), timeout=timeout
+        )
+
     def _record_exchange(
         self,
         *,
@@ -827,6 +839,7 @@ class AsyncHTTPTestServer:
         )
         self.exchanges.append(exchange)
         self.last_exchange = exchange
+        self._exchange_queue.put_nowait(exchange)
         if response is not None:
             self.responses.append(response)
             self.last_response = response

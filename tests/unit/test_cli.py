@@ -16,8 +16,10 @@ from localstub.cli import (
     process_http_proxy_traffic,
     process_traffic,
 )
+from localstub.http.exchange import RecordedExchange
 from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest
+from localstub.middleware import ResponderContext
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
 from localstub.tlsproxy import RecordedResponse
 
@@ -111,25 +113,24 @@ class TestProcessTrafficNoResponse:
             wire_raw_bytes=b"GET /no-upstream HTTP/1.1\r\n\r\n",
             client=("127.0.0.1", 55555),
         )
+        request_timestamp = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        exchange = RecordedExchange(
+            request=request,
+            response=None,
+            request_timestamp=request_timestamp,
+            response_timestamp=None,
+        )
 
         class _NoResponseProxy:
             def __init__(self) -> None:
                 self._given = False
 
-            async def next_request(
+            async def next_exchange(
                 self, timeout: float | None = None
-            ) -> HTTPRequest:
+            ) -> RecordedExchange:
                 if not self._given:
                     self._given = True
-                    return request
-                # After first request, behave like a timeout poll loop
-                await asyncio.sleep(0)
-                raise asyncio.TimeoutError()
-
-            async def next_response(
-                self, timeout: float | None = None
-            ) -> RecordedResponse:
-                # Never produce a response; always time out quickly
+                    return exchange
                 await asyncio.sleep(0)
                 raise asyncio.TimeoutError()
 
@@ -137,17 +138,7 @@ class TestProcessTrafficNoResponse:
         out = io.StringIO()
         shutdown = asyncio.Event()
 
-        # Run the traffic processor in the background with aggressive
-        # timeouts so the test completes quickly.
-        task = asyncio.create_task(
-            process_traffic(
-                proxy,
-                out,
-                shutdown,
-                response_timeout=0.01,
-                response_max_timeouts=2,
-            )
-        )
+        task = asyncio.create_task(process_traffic(proxy, out, shutdown))
 
         # Give the loop a moment to process, then stop it.
         await asyncio.sleep(0.05)
@@ -180,14 +171,6 @@ class TestProcessTrafficTimestamps:
     ) -> None:
         request_timestamp = datetime(2000, 1, 1, tzinfo=timezone.utc)
         response_timestamp = datetime(2000, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
-        remaining = [request_timestamp, response_timestamp]
-
-        def timestamp_provider() -> datetime:
-            if not remaining:
-                raise AssertionError(
-                    "timestamp_provider called more than expected"
-                )
-            return remaining.pop(0)
 
         headers = Headers.from_items([("Host", "example.com")])
         request = HTTPRequest(
@@ -206,28 +189,23 @@ class TestProcessTrafficTimestamps:
             body=None,
             wire_raw_bytes=b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
         )
+        exchange = RecordedExchange(
+            request=request,
+            response=response,
+            request_timestamp=request_timestamp,
+            response_timestamp=response_timestamp,
+        )
 
         class _OneExchangeProxy:
             def __init__(self) -> None:
-                self._given_request = False
-                self._given_response = False
+                self._given = False
 
-            async def next_request(
+            async def next_exchange(
                 self, timeout: float | None = None
-            ) -> HTTPRequest:
-                if not self._given_request:
-                    self._given_request = True
-                    return request
-                await asyncio.sleep(0)
-                raise asyncio.TimeoutError()
-
-            async def next_response(
-                self, timeout: float | None = None
-            ) -> RecordedResponse:
-                if not self._given_response:
-                    self._given_response = True
-                    await asyncio.sleep(0)
-                    return response
+            ) -> RecordedExchange:
+                if not self._given:
+                    self._given = True
+                    return exchange
                 await asyncio.sleep(0)
                 raise asyncio.TimeoutError()
 
@@ -235,22 +213,11 @@ class TestProcessTrafficTimestamps:
         out = io.StringIO()
         shutdown = asyncio.Event()
 
-        task = asyncio.create_task(
-            process_traffic(
-                proxy,
-                out,
-                shutdown,
-                response_timeout=0.2,
-                response_max_timeouts=2,
-                timestamp_provider=timestamp_provider,
-            )
-        )
+        task = asyncio.create_task(process_traffic(proxy, out, shutdown))
 
         await asyncio.sleep(0.05)
         shutdown.set()
         await asyncio.wait_for(task, timeout=1.0)
-
-        assert not remaining
 
         lines = [line for line in out.getvalue().splitlines() if line.strip()]
         assert len(lines) == 1
@@ -290,8 +257,6 @@ class TestProcessHttpProxyTrafficNoResponse:
                     server,
                     out,
                     shutdown,
-                    response_timeout=0.01,
-                    response_max_timeouts=2,
                 )
             )
 
@@ -311,3 +276,52 @@ class TestProcessHttpProxyTrafficNoResponse:
         assert record["timestamp"] == fixed_timestamp.isoformat()
         assert record["response_timestamp"] is None
         assert record["response"] is None
+
+    @pytest.mark.asyncio
+    async def test_preserves_concurrent_request_response_pairs(self) -> None:
+        slow_started = asyncio.Event()
+        release_slow = asyncio.Event()
+
+        async def handler(ctx: ResponderContext) -> HTTPResponse:
+            if ctx.request.path == "/slow":
+                slow_started.set()
+                await release_slow.wait()
+                return HTTPResponse.text("slow-response")
+            return HTTPResponse.text("fast-response")
+
+        output = io.StringIO()
+        shutdown = asyncio.Event()
+
+        async with AsyncHTTPTestServer(handler=handler) as server:
+            processor = asyncio.create_task(
+                process_http_proxy_traffic(server, output, shutdown)
+            )
+            try:
+                async with httpx.AsyncClient() as client:
+                    slow_request = asyncio.create_task(
+                        client.get(f"{server.url}slow")
+                    )
+                    await asyncio.wait_for(slow_started.wait(), timeout=1.0)
+                    fast_response = await client.get(f"{server.url}fast")
+                    release_slow.set()
+                    slow_response = await slow_request
+
+                assert fast_response.text == "fast-response"
+                assert slow_response.text == "slow-response"
+                async with asyncio.timeout(1.0):
+                    while len(output.getvalue().splitlines()) < 2:
+                        await asyncio.sleep(0.01)
+            finally:
+                release_slow.set()
+                shutdown.set()
+                await asyncio.wait_for(processor, timeout=1.0)
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        response_bodies = {
+            record["request"]["path"]: record["response"]["body"]
+            for record in records
+        }
+        assert response_bodies == {
+            "/slow": "slow-response",
+            "/fast": "fast-response",
+        }
