@@ -13,6 +13,23 @@ from cryptography.hazmat.primitives.serialization import (
 )
 
 
+def _write_private_key(path: Path, key_bytes: bytes) -> None:
+    # NamedTemporaryFile creates the file with mode 0o600. The umask can only
+    # remove permissions, and replacing the destination preserves that mode.
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        prefix=f".{path.name}-",
+        delete=False,
+    ) as key_file:
+        temporary_path = Path(key_file.name)
+        key_file.write(key_bytes)
+
+    try:
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 class TLSProxyCA:
     """CA used for TLS proxy, issues per-host server contexts on demand."""
 
@@ -137,6 +154,6 @@ class TLSProxyCA:
 
         ca = trustme.CA()
         cert_path.write_bytes(ca.cert_pem.bytes())
-        key_path.write_bytes(ca.private_key_pem.bytes())
+        _write_private_key(key_path, ca.private_key_pem.bytes())
 
         return cls(ca=ca, pem_path=cert_path, pkcs12_path=pkcs12_path)
