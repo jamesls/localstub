@@ -381,6 +381,21 @@ async def test_multi_response_parser_preserves_chunked_trailers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multi_response_parser_reads_many_chunked_segments() -> None:
+    headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    chunks = [b"1\r\nx\r\n"] * 1000
+    terminator = b"0\r\n\r\n"
+    reader = _create_mock_reader([headers, *chunks, terminator])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is not None
+    assert parsed.body == b"x" * len(chunks)
+    assert wire == headers + b"".join(chunks) + terminator
+
+
+@pytest.mark.asyncio
 async def test_multi_response_parser_reads_close_delimited_body() -> None:
     headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
     reader = _create_mock_reader([headers + b"first", b"second"])

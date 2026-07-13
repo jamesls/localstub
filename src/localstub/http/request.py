@@ -12,7 +12,7 @@ from localstub.http.framing import (
     ChunkScanError,
     content_length,
     is_chunked_transfer,
-    scan_chunked_body_end,
+    scan_chunked_body,
 )
 from localstub.http.headers import Headers
 from localstub.http.uri import ParsedURI, parse_absolute_uri
@@ -566,16 +566,18 @@ class AsyncRequestParser:
         buffer: bytearray,
         connection_wire: bytearray | None,
     ) -> tuple[ParsedRequest | None, bytes]:
+        scan_from = 0
         while True:
             try:
-                chunked_end = scan_chunked_body_end(buffer)
+                scan = scan_chunked_body(buffer, scan_from)
             except ChunkScanError as exc:
                 self._wire.extend(buffer[: exc.offset])
                 self._sync_connection_wire(connection_wire)
                 self._push_back(reader, buffer[exc.offset :])
                 return None, bytes(self._wire)
 
-            if chunked_end is not None:
+            if scan.end is not None:
+                chunked_end = scan.end
                 chunked_body = bytes(buffer[:chunked_end])
                 try:
                     self._parser.feed_data(chunked_body)
@@ -596,6 +598,7 @@ class AsyncRequestParser:
 
                 return self._protocol.result, bytes(self._wire)
 
+            scan_from = scan.resume_from
             has_more = await self._read_more(reader, buffer)
             if not has_more:
                 self._wire.extend(buffer)
