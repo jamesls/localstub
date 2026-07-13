@@ -280,7 +280,12 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
             output_file = open(args.output, "a")
 
         try:
-            await process_traffic(proxy, output_file, shutdown_event)
+            if server is None:
+                await process_traffic(proxy, output_file, shutdown_event)
+            else:
+                await process_http_proxy_traffic(
+                    server, output_file, shutdown_event
+                )
         finally:
             if output_file:
                 output_file.close()
