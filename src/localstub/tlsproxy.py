@@ -237,6 +237,7 @@ class AsyncTLSInterceptProxy:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        active_writer = writer
         # Extract client port for logging
         peername = writer.get_extra_info("peername")
         client_port = peername[1] if peername else 0
@@ -283,6 +284,7 @@ class AsyncTLSInterceptProxy:
                 except Exception:
                     pass
                 return
+            active_writer = tls_writer
 
             if self._default_mode == "forward":
                 await self._forward(
@@ -304,8 +306,8 @@ class AsyncTLSInterceptProxy:
         except asyncio.CancelledError:
             try:
                 _close_log(f"lstub --> {client_id}", "task cancelled")
-                writer.close()
-                await writer.wait_closed()
+                active_writer.close()
+                await active_writer.wait_closed()
             except Exception:
                 pass
             raise
@@ -315,8 +317,8 @@ class AsyncTLSInterceptProxy:
             LOG.exception("TLS proxy error")
             try:
                 _close_log(f"lstub --> {client_id}", "unexpected error")
-                writer.close()
-                await writer.wait_closed()
+                active_writer.close()
+                await active_writer.wait_closed()
             except Exception:
                 pass
 
