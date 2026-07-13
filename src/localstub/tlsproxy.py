@@ -4,6 +4,7 @@ import asyncio
 import logging
 import ssl
 from asyncio import transports
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, cast
 
 from rich.markup import escape as rich_escape
@@ -18,6 +19,7 @@ from localstub.forward import (
     TransformResult,
     UpstreamResponse,
 )
+from localstub.http.exchange import RecordedExchange
 from localstub.http.response import (
     RecordedResponse,
 )
@@ -147,6 +149,9 @@ class AsyncTLSInterceptProxy:
         self._recorded_responses: asyncio.Queue["RecordedResponse"] = (
             asyncio.Queue()
         )
+        self._recorded_exchanges: asyncio.Queue[RecordedExchange] = (
+            asyncio.Queue()
+        )
 
     @property
     def address(self) -> tuple[str, int]:
@@ -178,6 +183,15 @@ class AsyncTLSInterceptProxy:
             return await self._recorded_responses.get()
         return await asyncio.wait_for(
             self._recorded_responses.get(), timeout=timeout
+        )
+
+    async def next_exchange(
+        self, timeout: float | None = None
+    ) -> RecordedExchange:
+        if timeout is None:
+            return await self._recorded_exchanges.get()
+        return await asyncio.wait_for(
+            self._recorded_exchanges.get(), timeout=timeout
         )
 
     async def start(self) -> None:
@@ -438,9 +452,15 @@ class AsyncTLSInterceptProxy:
             # Connection failed - record what we have without blocking on the
             # body (e.g. Expect: 100-continue clients may not send it yet).
             wire_bytes = header_wire + bytes(remaining)
-            await self._record_request(parsed, wire_bytes, client_writer)
-            await self._send_and_close(
-                client_writer, b"HTTP/1.1 502 Bad Gateway", client_id
+            request, request_timestamp = await self._record_request(
+                parsed, wire_bytes, client_writer
+            )
+            await self._record_failure_and_close(
+                request,
+                request_timestamp,
+                client_writer,
+                b"HTTP/1.1 502 Bad Gateway",
+                client_id,
             )
             return
         upstream_reader, upstream_writer = upstream
@@ -461,14 +481,16 @@ class AsyncTLSInterceptProxy:
                     client_id=client_id,
                 )
 
-                await self._record_request(
+                request, request_timestamp = await self._record_request(
                     forwarded.parsed_request,
                     forwarded.request_wire_bytes,
                     client_writer,
                 )
 
                 if forwarded.error == ForwardError.REQUEST_PARSE_FAILED:
-                    await self._send_and_close(
+                    await self._record_failure_and_close(
+                        request,
+                        request_timestamp,
                         client_writer,
                         b"HTTP/1.1 400 Bad Request",
                         client_id,
@@ -476,7 +498,9 @@ class AsyncTLSInterceptProxy:
                     return
 
                 if forwarded.response is None:
-                    await self._send_and_close(
+                    await self._record_failure_and_close(
+                        request,
+                        request_timestamp,
                         client_writer,
                         b"HTTP/1.1 502 Bad Gateway",
                         client_id,
@@ -487,8 +511,11 @@ class AsyncTLSInterceptProxy:
                     )
                     return
 
-                await self._recorded_responses.put(
-                    forwarded.response.to_recorded_response()
+                response = forwarded.response.to_recorded_response()
+                await self._record_response(
+                    request,
+                    request_timestamp,
+                    response,
                 )
                 _close_log(f"{upstream_id} --> lstub", "response received")
                 _close_log(f"lstub --> {client_id}", "response relayed")
@@ -510,7 +537,9 @@ class AsyncTLSInterceptProxy:
             if body_wire:
                 _wire_log(f"lstub <-- {client_id}", body_wire)
 
-            await self._record_request(final_parsed, full_wire, client_writer)
+            request, request_timestamp = await self._record_request(
+                final_parsed, full_wire, client_writer
+            )
             _wire_log(f"{upstream_id} <-- lstub", full_wire)
             upstream_writer.write(full_wire)
             await upstream_writer.drain()
@@ -523,7 +552,9 @@ class AsyncTLSInterceptProxy:
                 client_id=client_id,
             )
             if final_response is None:
-                await self._send_and_close(
+                await self._record_failure_and_close(
+                    request,
+                    request_timestamp,
                     client_writer,
                     b"HTTP/1.1 502 Bad Gateway",
                     client_id,
@@ -534,8 +565,11 @@ class AsyncTLSInterceptProxy:
                 )
                 return
 
-            await self._recorded_responses.put(
-                final_response.to_recorded_response()
+            response = final_response.to_recorded_response()
+            await self._record_response(
+                request,
+                request_timestamp,
+                response,
             )
             _close_log(f"{upstream_id} --> lstub", "response received")
             _close_log(f"lstub --> {client_id}", "response relayed")
@@ -548,10 +582,50 @@ class AsyncTLSInterceptProxy:
         parsed: ParsedRequest,
         wire_bytes: bytes,
         writer: asyncio.StreamWriter,
-    ) -> None:
+    ) -> tuple[HTTPRequest, datetime]:
         """Build and record an HTTPRequest."""
+        request_timestamp = datetime.now(timezone.utc)
         request = HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
         await self._recorded_requests.put(request)
+        return request, request_timestamp
+
+    async def _record_exchange(
+        self,
+        request: HTTPRequest,
+        request_timestamp: datetime,
+        response: RecordedResponse | None,
+    ) -> None:
+        response_timestamp = (
+            datetime.now(timezone.utc) if response is not None else None
+        )
+        await self._recorded_exchanges.put(
+            RecordedExchange(
+                request=request,
+                response=response,
+                request_timestamp=request_timestamp,
+                response_timestamp=response_timestamp,
+            )
+        )
+
+    async def _record_response(
+        self,
+        request: HTTPRequest,
+        request_timestamp: datetime,
+        response: RecordedResponse,
+    ) -> None:
+        await self._recorded_responses.put(response)
+        await self._record_exchange(request, request_timestamp, response)
+
+    async def _record_failure_and_close(
+        self,
+        request: HTTPRequest,
+        request_timestamp: datetime,
+        writer: asyncio.StreamWriter,
+        status_line: bytes,
+        client_id: str,
+    ) -> None:
+        await self._record_exchange(request, request_timestamp, None)
+        await self._send_and_close(writer, status_line, client_id)
 
     async def _send_and_close(
         self,

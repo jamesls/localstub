@@ -95,6 +95,9 @@ async def test_next_request_and_response_timeout_raise():
     with pytest.raises(asyncio.TimeoutError):
         await proxy.next_response(timeout=0.01)
 
+    with pytest.raises(asyncio.TimeoutError):
+        await proxy.next_exchange(timeout=0.01)
+
 
 @pytest.mark.asyncio
 async def test_start_idempotent_and_aclose_noop():
@@ -252,6 +255,10 @@ async def test_forward_returns_502_when_upstream_connection_fails():
     with pytest.raises(asyncio.TimeoutError):
         await proxy.next_response(timeout=0.1)
 
+    exchange = await proxy.next_exchange(timeout=1.0)
+    assert exchange.request is recorded_request
+    assert exchange.response is None
+
 
 @pytest.mark.asyncio
 async def test_forward_returns_502_on_connect_fail_with_expect_100_continue():
@@ -359,6 +366,9 @@ async def test_forward_records_chunked_response_with_trailer():
         recorded = await proxy.next_response(timeout=1.0)
         assert recorded.body == "peekboo"
         assert b"X-Trail: done" in recorded.wire_raw_bytes
+        exchange = await proxy.next_exchange(timeout=1.0)
+        assert exchange.request.path == "/chunked"
+        assert exchange.response is recorded
     finally:
         server.close()
         await server.wait_closed()

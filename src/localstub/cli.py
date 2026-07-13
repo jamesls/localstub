@@ -4,9 +4,7 @@ import argparse
 import asyncio
 import logging
 import signal
-from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable
 from typing import Protocol, TextIO
 
 from rich.logging import RichHandler
@@ -18,8 +16,6 @@ from localstub.ca import TLSProxyCA
 from localstub.config import load_config
 from localstub.console import console
 from localstub.http.exchange import RecordedExchange
-from localstub.http.request import HTTPRequest
-from localstub.http.response import RecordedResponse
 from localstub.server import AsyncHTTPTestServer
 from localstub.tlsproxy import AsyncTLSInterceptProxy
 from localstub.traffic_jsonl import JSONLTrafficWriter
@@ -294,58 +290,17 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
 class _TrafficSource(Protocol):
     """Shared interface for TLS proxy and HTTP server."""
 
-    async def next_request(
+    async def next_exchange(
         self, timeout: float | None = None
-    ) -> HTTPRequest: ...
-
-    async def next_response(
-        self, timeout: float | None = None
-    ) -> RecordedResponse: ...
-
-
-ExchangeLookup = Callable[
-    [HTTPRequest, RecordedResponse | None],
-    RecordedExchange | None,
-]
-
-
-async def _await_response(
-    source: _TrafficSource,
-    shutdown_event: asyncio.Event,
-    *,
-    timeout: float = 5.0,
-    max_timeouts: int = 3,
-) -> RecordedResponse | None:
-    """Poll *source* for the next response."""
-    response: RecordedResponse | None = None
-    timeouts = 0
-    while not shutdown_event.is_set() and response is None:
-        try:
-            response = await source.next_response(
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            timeouts += 1
-            if timeouts >= max_timeouts:
-                console.print(
-                    "[yellow]No response recorded; logging without response[/]"
-                )
-                break
-            continue
-    return response
+    ) -> RecordedExchange: ...
 
 
 async def _process_traffic(
     source: _TrafficSource,
     output_file: TextIO | None,
     shutdown_event: asyncio.Event,
-    *,
-    exchange_lookup: ExchangeLookup | None = None,
-    response_timeout: float = 5.0,
-    response_max_timeouts: int = 3,
-    timestamp_provider: Callable[[], datetime] | None = None,
 ) -> None:
-    """Poll *source* for request/response pairs.
+    """Poll *source* for completed request/response exchanges.
 
     Works for both the TLS intercept proxy and the HTTP forward
     proxy server.
@@ -354,17 +309,14 @@ async def _process_traffic(
         JSONLTrafficWriter(output_file) if output_file else None
     )
 
-    def now() -> datetime:
-        if timestamp_provider is None:
-            return datetime.now(timezone.utc)
-        return timestamp_provider()
-
     while not shutdown_event.is_set():
         try:
-            request = await source.next_request(timeout=0.1)
+            exchange = await source.next_exchange(timeout=0.1)
         except asyncio.TimeoutError:
             continue
-        request_timestamp = now()
+
+        request = exchange.request
+        response = exchange.response
 
         _print_http_block(
             request.wire_raw_bytes or b"",
@@ -372,18 +324,7 @@ async def _process_traffic(
             "green",
         )
 
-        response = await _await_response(
-            source,
-            shutdown_event,
-            timeout=response_timeout,
-            max_timeouts=response_max_timeouts,
-        )
-        response_timestamp = now() if response is not None else None
-
-        if shutdown_event.is_set() and response is None:
-            break
-
-        if response:
+        if response is not None:
             _print_http_block(
                 response.wire_raw_bytes,
                 "RESPONSE",
@@ -392,16 +333,6 @@ async def _process_traffic(
             )
 
         if jsonl is not None:
-            exchange: RecordedExchange | None = None
-            if exchange_lookup is not None:
-                exchange = exchange_lookup(request, response)
-            if exchange is None:
-                exchange = RecordedExchange(
-                    request=request,
-                    response=response,
-                    request_timestamp=request_timestamp,
-                    response_timestamp=response_timestamp,
-                )
             jsonl.write_exchange(exchange)
 
 
@@ -409,54 +340,15 @@ async def process_traffic(
     proxy: AsyncTLSInterceptProxy,
     output_file: TextIO | None,
     shutdown_event: asyncio.Event,
-    *,
-    response_timeout: float = 5.0,
-    response_max_timeouts: int = 3,
-    timestamp_provider: Callable[[], datetime] | None = None,
 ) -> None:
-    """Poll TLS proxy for recorded requests/responses."""
-    await _process_traffic(
-        proxy,
-        output_file,
-        shutdown_event,
-        response_timeout=response_timeout,
-        response_max_timeouts=response_max_timeouts,
-        timestamp_provider=timestamp_provider,
-    )
-
-
-def _find_exchange(
-    server: AsyncHTTPTestServer,
-    request: HTTPRequest,
-    response: RecordedResponse | None,
-) -> RecordedExchange | None:
-    for exchange in reversed(server.exchanges):
-        if exchange.request is request and exchange.response is response:
-            return exchange
-    return None
+    """Poll TLS proxy for completed exchanges."""
+    await _process_traffic(proxy, output_file, shutdown_event)
 
 
 async def process_http_proxy_traffic(
     server: AsyncHTTPTestServer,
     output_file: TextIO | None,
     shutdown_event: asyncio.Event,
-    *,
-    response_timeout: float = 5.0,
-    response_max_timeouts: int = 3,
 ) -> None:
-    """Poll HTTP forward proxy for recorded traffic."""
-
-    def lookup(
-        req: HTTPRequest,
-        resp: RecordedResponse | None,
-    ) -> RecordedExchange | None:
-        return _find_exchange(server, req, resp)
-
-    await _process_traffic(
-        server,
-        output_file,
-        shutdown_event,
-        exchange_lookup=lookup,
-        response_timeout=response_timeout,
-        response_max_timeouts=response_max_timeouts,
-    )
+    """Poll HTTP server for completed exchanges."""
+    await _process_traffic(server, output_file, shutdown_event)
