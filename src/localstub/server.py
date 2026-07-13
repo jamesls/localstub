@@ -394,6 +394,7 @@ class AsyncHTTPTestServer:
         self._host = host
         self._port = port
         self._server: asyncio.base_events.Server | None = None
+        self._client_writers: set[asyncio.StreamWriter] = set()
 
         self._handler: ResponderHandler | None = handler
         self._default_response: HTTPResponse = (
@@ -762,7 +763,7 @@ class AsyncHTTPTestServer:
             return
 
         self._server = await asyncio.start_server(
-            self._handle_client,
+            self._client_connected,
             self._host,
             self._port,
         )
@@ -774,6 +775,8 @@ class AsyncHTTPTestServer:
         if self._server is None:
             return
         self._server.close()
+        for writer in tuple(self._client_writers):
+            writer.close()
         await self._server.wait_closed()
         self._server = None
 
@@ -1059,6 +1062,7 @@ class AsyncHTTPTestServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        self._client_writers.add(writer)
         client = self._extract_client_info(writer)
         conn_recv, conn_sent = self._init_connection_tracking(client)
         recording_writer = RecordingStreamWriter(writer, conn_sent)
@@ -1097,6 +1101,16 @@ class AsyncHTTPTestServer:
                 await recording_writer.wait_closed()
             except Exception:
                 pass
+            finally:
+                self._client_writers.discard(writer)
+
+    def _client_connected(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> Awaitable[None]:
+        self._client_writers.add(writer)
+        return self._handle_client(reader, writer)
 
     async def _read_request(
         self,
