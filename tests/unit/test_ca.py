@@ -41,6 +41,48 @@ def test_constructor_honors_provided_ca_without_pem_path() -> None:
     assert ca.ca_pem_path().read_bytes() == existing_ca.cert_pem.bytes()
 
 
+class TestContextCache:
+    def test_reuses_context_for_repeated_host(self) -> None:
+        ca = TLSProxyCA()
+
+        first = ca.issue_context("example.com")
+        second = ca.issue_context("example.com")
+
+        assert first is second
+
+    def test_issues_separate_context_per_host(self) -> None:
+        ca = TLSProxyCA()
+
+        example = ca.issue_context("example.com")
+        other = ca.issue_context("other.com")
+
+        assert example is not other
+
+    def test_evicts_least_recently_used_host_when_full(self) -> None:
+        ca = TLSProxyCA(context_cache_size=2)
+
+        first = ca.issue_context("first.com")
+        second = ca.issue_context("second.com")
+        # Re-issuing first.com makes second.com the eviction candidate.
+        ca.issue_context("first.com")
+        ca.issue_context("third.com")
+
+        assert ca.issue_context("first.com") is first
+        assert ca.issue_context("second.com") is not second
+
+    def test_zero_cache_size_disables_caching(self) -> None:
+        ca = TLSProxyCA(context_cache_size=0)
+
+        first = ca.issue_context("example.com")
+        second = ca.issue_context("example.com")
+
+        assert first is not second
+
+    def test_negative_cache_size_raises_error(self) -> None:
+        with pytest.raises(ValueError, match="must not be negative"):
+            TLSProxyCA(context_cache_size=-1)
+
+
 class TestFromDirectory:
     def test_generates_ca_when_directory_does_not_exist(
         self, tmp_path: Path
