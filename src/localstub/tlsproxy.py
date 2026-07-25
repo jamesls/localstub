@@ -71,6 +71,10 @@ def _hexdump(data: bytes, bytes_per_line: int = 32) -> str:
 
 def _wire_log(direction: str, data: bytes) -> None:
     """Log wire-level data with direction indicator in hexdump format."""
+    if not LOG.isEnabledFor(logging.DEBUG):
+        # Formatting a hexdump is expensive and this is on the hot path for
+        # every byte proxied, so skip the work when it would be discarded.
+        return
     hexdump = _hexdump(data)
     # Escape direction (contains brackets), enable markup, disable highlighter
     escaped_dir = rich_escape(f"[{direction}]")
