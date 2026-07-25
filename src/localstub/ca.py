@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ssl
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from typing import Self
 
@@ -11,6 +12,8 @@ from cryptography.hazmat.primitives.serialization import (
     BestAvailableEncryption,
     pkcs12,
 )
+
+DEFAULT_CONTEXT_CACHE_SIZE = 128
 
 
 def _write_private_key(path: Path, key_bytes: bytes) -> None:
@@ -31,7 +34,13 @@ def _write_private_key(path: Path, key_bytes: bytes) -> None:
 
 
 class TLSProxyCA:
-    """CA used for TLS proxy, issues per-host server contexts on demand."""
+    """CA used for TLS proxy, issues per-host server contexts on demand.
+
+    Issued contexts are cached per hostname so repeated connections to the
+    same host reuse a single certificate and ``SSLContext``. The cache is
+    bounded by ``context_cache_size`` and evicts the least recently issued
+    host first.
+    """
 
     _ca: trustme.CA
     _ca_pem_path: Path
@@ -43,7 +52,15 @@ class TLSProxyCA:
         ca: trustme.CA | None = None,
         pem_path: Path | None = None,
         pkcs12_path: Path | None = None,
+        context_cache_size: int = DEFAULT_CONTEXT_CACHE_SIZE,
     ) -> None:
+        if context_cache_size < 0:
+            raise ValueError(
+                f"context_cache_size must not be negative: "
+                f"{context_cache_size}"
+            )
+        self._context_cache_size = context_cache_size
+        self._context_cache: OrderedDict[str, ssl.SSLContext] = OrderedDict()
         if ca is not None:
             self._ca = ca
             if pem_path is None:
@@ -82,6 +99,18 @@ class TLSProxyCA:
             self._ca_pkcs12_path.write_bytes(p12_bytes)
 
     def issue_context(self, host: str) -> ssl.SSLContext:
+        cached = self._context_cache.get(host)
+        if cached is not None:
+            self._context_cache.move_to_end(host)
+            return cached
+        context = self._build_context(host)
+        if self._context_cache_size > 0:
+            self._context_cache[host] = context
+            if len(self._context_cache) > self._context_cache_size:
+                self._context_cache.popitem(last=False)
+        return context
+
+    def _build_context(self, host: str) -> ssl.SSLContext:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         server_cert = self._ca.issue_server_cert(host)
         server_cert.configure_cert(context)
