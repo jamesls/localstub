@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import logging
 import socket
 import ssl
 import threading
@@ -48,6 +49,61 @@ async def test_tls_proxy_intercepts_https_request_to_localstub():
         assert request.path == "/"
         assert request.headers is not None
         assert request.headers["host"] == "example.com"
+
+
+@pytest.mark.asyncio
+async def test_wire_logging_emits_hexdump_when_debug_enabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="localstub.tlsproxy")
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({"ok": True})
+
+        async with AsyncTLSInterceptProxy(server=server) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get("https://example.com/")
+
+    assert response.status_code == 200
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "localstub.tlsproxy"
+    ]
+    assert any("CONNECT example.com:443" in message for message in messages)
+    assert any("0x0000:" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_wire_logging_is_skipped_when_debug_disabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="localstub.tlsproxy")
+    async with AsyncTLSInterceptProxy() as proxy:
+        host, port = proxy.address
+        reader, writer = await asyncio.open_connection(host, port)
+
+        writer.write(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        await writer.drain()
+
+        assert b"400 Bad Request" in await reader.read(1024)
+
+        writer.close()
+        await writer.wait_closed()
+
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "localstub.tlsproxy"
+    ]
 
 
 @pytest.mark.asyncio
