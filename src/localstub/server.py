@@ -1004,7 +1004,7 @@ class AsyncHTTPTestServer:
 
         return compose_headers(middlewares, terminal)
 
-    async def _record_request(
+    def _record_request(
         self,
         request: HTTPRequest,
     ) -> tuple[datetime, float]:
@@ -1013,7 +1013,7 @@ class AsyncHTTPTestServer:
         self.requests.append(request)
         self._request_timestamps[id(request)] = received_monotonic
         request_timestamp = self._timestamp_provider.now()
-        await self._request_queue.put(request)
+        self._request_queue.put_nowait(request)
         return request_timestamp, received_monotonic
 
     async def _handle_request(
@@ -1061,7 +1061,7 @@ class AsyncHTTPTestServer:
                 response_timestamp=response_timestamp,
             )
             exchange_recorded = True
-            await self._response_queue.put(send_result.recorded)
+            self._response_queue.put_nowait(send_result.recorded)
             return send_result.should_close
         except Exception:
             if not exchange_recorded:
@@ -1097,7 +1097,7 @@ class AsyncHTTPTestServer:
                 (
                     request_timestamp,
                     received_monotonic,
-                ) = await self._record_request(request)
+                ) = self._record_request(request)
                 should_close = await self._handle_request(
                     request=request,
                     request_timestamp=request_timestamp,
