@@ -133,6 +133,12 @@ async def test_server_returns_custom_headers(server, client):
     assert response.headers["x-custom-header"] == "custom-value"
     assert response.headers["Content-Type"] == "application/json"
 
+    assert server.last_response is not None
+    assert server.last_response.reason == "OK"
+    assert server.last_response.headers is not None
+    assert server.last_response.headers["x-custom-header"] == "custom-value"
+    assert server.last_response.headers["Content-Type"] == "application/json"
+
 
 @pytest.mark.asyncio
 async def test_server_records_multiple_requests(server, client):
