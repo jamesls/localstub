@@ -30,8 +30,8 @@ from localstub.http.response import RecordedResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.utils import (
     headers_to_headers,
-    headers_to_message,
     maybe_await,
+    message_from_items,
     status_phrase,
 )
 from localstub.middleware import (
@@ -1208,11 +1208,7 @@ class AsyncHTTPTestServer:
         body = self._normalize_body(response.body)
         body_text = body.decode("utf-8", errors="replace") if body else None
 
-        headers = headers_to_message(
-            [(k.encode(), v.encode()) for k, v in response.headers.items()]
-            if response.headers
-            else []
-        )
+        headers = message_from_items(response.headers.items())
 
         return RecordedResponse(
             status=response.status,
