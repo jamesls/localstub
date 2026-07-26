@@ -12,6 +12,19 @@ from localstub.http.uri import ParsedURI
 
 LOG = logging.getLogger(__name__)
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _authority(uri: ParsedURI) -> str:
+    """Render the Host header value for *uri*.
+
+    The port is omitted only when it is the default for the scheme, so
+    ``http://example.com:443/`` keeps its explicit port.
+    """
+    if uri.port == _DEFAULT_PORTS.get(uri.scheme):
+        return uri.host
+    return f"{uri.host}:{uri.port}"
+
 
 def build_origin_form_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
     """Convert absolute-form proxy request to origin-form for upstream."""
@@ -32,15 +45,13 @@ def build_origin_form_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
     }
     connection_tokens = connection_tokens_from_headers(request.headers)
     remove_headers = hop_by_hop | {"connection"} | connection_tokens
+    authority = _authority(uri)
     host_added = False
 
     for name, value in request.headers.items():
         name_lower = name.lower()
         if name_lower == "host":
-            port_suffix = ""
-            if uri.port and uri.port not in (80, 443):
-                port_suffix = f":{uri.port}"
-            lines.append(f"Host: {uri.host}{port_suffix}")
+            lines.append(f"Host: {authority}")
             host_added = True
         elif name_lower in remove_headers:
             continue
@@ -48,10 +59,7 @@ def build_origin_form_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
             lines.append(f"{name}: {value}")
 
     if not host_added:
-        port_suffix = ""
-        if uri.port and uri.port not in (80, 443):
-            port_suffix = f":{uri.port}"
-        lines.append(f"Host: {uri.host}{port_suffix}")
+        lines.append(f"Host: {authority}")
 
     header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n\r\n"
     return header_bytes + request.wire_body_bytes
