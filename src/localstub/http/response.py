@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from email.message import Message
 
@@ -13,6 +14,8 @@ from localstub.http.framing import (
     is_chunked_transfer,
     scan_chunked_body,
 )
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -158,6 +161,7 @@ class AsyncResponseParser:
             try:
                 data = await reader.read(self._max_read)
             except Exception:
+                LOG.debug("Failed to read response data", exc_info=True)
                 break
 
             if not data:
@@ -286,6 +290,7 @@ class AsyncMultiResponseParser:
         try:
             data = await reader.read(self._max_read)
         except Exception:
+            LOG.debug("Failed to read response data", exc_info=True)
             return False
 
         if not data:

@@ -153,31 +153,31 @@ class TestProxyForwarding:
     async def test_forwards_to_upstream_with_forwarder(
         self, upstream_server: AsyncHTTPTestServer
     ) -> None:
-        async with httpx.AsyncClient() as http_client:
-            async with AsyncHTTPTestServer(
-                proxy_forwarder=http_client
-            ) as proxy:
-                # Send request through the proxy
-                reader, writer = await asyncio.open_connection(
-                    proxy.host, proxy.port
-                )
-                try:
-                    # Request to the upstream server URL
-                    request = (
-                        f"GET {upstream_server.url} HTTP/1.1\r\n"
-                        f"Host: {upstream_server.host}\r\n"
-                        "Connection: close\r\n"
-                        "\r\n"
-                    ).encode()
-                    writer.write(request)
-                    await writer.drain()
+        async with (
+            httpx.AsyncClient() as http_client,
+            AsyncHTTPTestServer(proxy_forwarder=http_client) as proxy,
+        ):
+            # Send request through the proxy
+            reader, writer = await asyncio.open_connection(
+                proxy.host, proxy.port
+            )
+            try:
+                # Request to the upstream server URL
+                request = (
+                    f"GET {upstream_server.url} HTTP/1.1\r\n"
+                    f"Host: {upstream_server.host}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode()
+                writer.write(request)
+                await writer.drain()
 
-                    response = await _read_http_response_bytes(reader)
-                    assert b"200 OK" in response
-                    assert b'"upstream": true' in response
-                finally:
-                    writer.close()
-                    await writer.wait_closed()
+                response = await _read_http_response_bytes(reader)
+                assert b"200 OK" in response
+                assert b'"upstream": true' in response
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
     @pytest.mark.asyncio
     async def test_forwarder_preserves_non_utf8_request_body(self) -> None:
@@ -219,32 +219,32 @@ class TestProxyForwarding:
 
         try:
             body = b"\xff\xfe\xfd\x00abc"
-            async with httpx.AsyncClient() as http_client:
-                async with AsyncHTTPTestServer(
-                    proxy_forwarder=http_client
-                ) as proxy:
-                    reader, writer = await asyncio.open_connection(
-                        proxy.host, proxy.port
-                    )
-                    try:
-                        request = (
-                            f"POST http://{upstream_host}:{upstream_port}"
-                            "/upload HTTP/1.1\r\n"
-                            f"Host: {upstream_host}:{upstream_port}\r\n"
-                            f"Content-Length: {len(body)}\r\n"
-                            "Connection: close\r\n"
-                            "\r\n"
-                        ).encode() + body
-                        writer.write(request)
-                        await writer.drain()
+            async with (
+                httpx.AsyncClient() as http_client,
+                AsyncHTTPTestServer(proxy_forwarder=http_client) as proxy,
+            ):
+                reader, writer = await asyncio.open_connection(
+                    proxy.host, proxy.port
+                )
+                try:
+                    request = (
+                        f"POST http://{upstream_host}:{upstream_port}"
+                        "/upload HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        f"Content-Length: {len(body)}\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                    ).encode() + body
+                    writer.write(request)
+                    await writer.drain()
 
-                        await _read_http_response_bytes(reader)
-                        await asyncio.wait_for(
-                            request_received.wait(), timeout=1.0
-                        )
-                    finally:
-                        writer.close()
-                        await writer.wait_closed()
+                    await _read_http_response_bytes(reader)
+                    await asyncio.wait_for(
+                        request_received.wait(), timeout=1.0
+                    )
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
         finally:
             upstream.close()
             await upstream.wait_closed()
@@ -280,67 +280,67 @@ class TestProxyForwarding:
     async def test_response_sequence_overrides_forwarding(
         self, upstream_server: AsyncHTTPTestServer
     ) -> None:
-        async with httpx.AsyncClient() as http_client:
-            async with AsyncHTTPTestServer(
-                proxy_forwarder=http_client
-            ) as proxy:
-                # Set a response sequence
-                proxy.set_response_sequence([
-                    HTTPResponse.json({"sequence": 1}),
-                    HTTPResponse.json({"sequence": 2}),
-                ])
+        async with (
+            httpx.AsyncClient() as http_client,
+            AsyncHTTPTestServer(proxy_forwarder=http_client) as proxy,
+        ):
+            # Set a response sequence
+            proxy.set_response_sequence([
+                HTTPResponse.json({"sequence": 1}),
+                HTTPResponse.json({"sequence": 2}),
+            ])
 
-                for i in range(1, 3):
-                    reader, writer = await asyncio.open_connection(
-                        proxy.host, proxy.port
-                    )
-                    try:
-                        request = (
-                            f"GET {upstream_server.url} HTTP/1.1\r\n"
-                            f"Host: {upstream_server.host}\r\n"
-                            "Connection: close\r\n"
-                            "\r\n"
-                        ).encode()
-                        writer.write(request)
-                        await writer.drain()
+            for i in range(1, 3):
+                reader, writer = await asyncio.open_connection(
+                    proxy.host, proxy.port
+                )
+                try:
+                    request = (
+                        f"GET {upstream_server.url} HTTP/1.1\r\n"
+                        f"Host: {upstream_server.host}\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                    ).encode()
+                    writer.write(request)
+                    await writer.drain()
 
-                        response = await _read_http_response_bytes(reader)
-                        # Should get sequence response, not upstream
-                        assert f'"sequence": {i}'.encode() in response
-                    finally:
-                        writer.close()
-                        await writer.wait_closed()
+                    response = await _read_http_response_bytes(reader)
+                    # Should get sequence response, not upstream
+                    assert f'"sequence": {i}'.encode() in response
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
 
     @pytest.mark.asyncio
     async def test_origin_form_not_forwarded(
         self, upstream_server: AsyncHTTPTestServer
     ) -> None:
-        async with httpx.AsyncClient() as http_client:
-            async with AsyncHTTPTestServer(
-                proxy_forwarder=http_client
-            ) as proxy:
-                proxy.set_json_response({"local": True})
+        async with (
+            httpx.AsyncClient() as http_client,
+            AsyncHTTPTestServer(proxy_forwarder=http_client) as proxy,
+        ):
+            proxy.set_json_response({"local": True})
 
-                reader, writer = await asyncio.open_connection(
-                    proxy.host, proxy.port
+            reader, writer = await asyncio.open_connection(
+                proxy.host, proxy.port
+            )
+            try:
+                # Origin-form request (not absolute URI)
+                request = (
+                    b"GET /local/path HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n"
                 )
-                try:
-                    # Origin-form request (not absolute URI)
-                    request = (
-                        b"GET /local/path HTTP/1.1\r\n"
-                        b"Host: localhost\r\n"
-                        b"Connection: close\r\n"
-                        b"\r\n"
-                    )
-                    writer.write(request)
-                    await writer.drain()
+                writer.write(request)
+                await writer.drain()
 
-                    response = await _read_http_response_bytes(reader)
-                    # Should get local response, not forwarded
-                    assert b'"local": true' in response
-                finally:
-                    writer.close()
-                    await writer.wait_closed()
+                response = await _read_http_response_bytes(reader)
+                # Should get local response, not forwarded
+                assert b'"local": true' in response
+            finally:
+                writer.close()
+                await writer.wait_closed()
 
 
 class TestRawForwarding:

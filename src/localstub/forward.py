@@ -11,11 +11,13 @@ import asyncio
 import gzip
 import logging
 import ssl
-import truststore
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from email.message import Message
 from enum import Enum
-from typing import Awaitable, Callable, Protocol
+from typing import Protocol
+
+import truststore
 
 from localstub.http.request import AsyncRequestParser, ParsedRequest
 from localstub.http.response import (
@@ -29,7 +31,6 @@ from localstub.http.utils import (
     maybe_await,
     status_phrase,
 )
-
 
 LOG = logging.getLogger(__name__)
 
@@ -240,7 +241,11 @@ class Forwarder:
             )
         except Exception as e:
             LOG.warning(
-                "Failed to connect to upstream %s:%d: %s", host, port, e
+                "Failed to connect to upstream %s:%d: %s",
+                host,
+                port,
+                e,
+                exc_info=True,
             )
             return None
 
@@ -461,7 +466,10 @@ class Forwarder:
             try:
                 await client_writer.wait_closed()
             except Exception:
-                pass
+                LOG.debug(
+                    "Failed to close client writer",
+                    exc_info=True,
+                )
         else:
             if self._wire_log is not None:
                 self._wire_log(f"lstub --> {client_label}", wire_bytes_to_send)
@@ -479,6 +487,10 @@ class Forwarder:
         try:
             return gzip.decompress(body)
         except Exception:
+            LOG.debug(
+                "Failed to decompress gzip response body",
+                exc_info=True,
+            )
             return body
 
     def _rebuild_response_wire_bytes(

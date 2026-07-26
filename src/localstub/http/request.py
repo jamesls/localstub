@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
@@ -17,6 +18,8 @@ from localstub.http.framing import (
 from localstub.http.headers import Headers
 from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_headers
+
+LOG = logging.getLogger(__name__)
 
 
 class Writer(Protocol):
@@ -248,11 +251,9 @@ class RequestProtocol:
 
     def on_chunk_header(self) -> None:
         """Called at the start of a chunk (for chunked encoding)."""
-        pass
 
     def on_chunk_complete(self) -> None:
         """Called at the end of a chunk (for chunked encoding)."""
-        pass
 
 
 def _build_request_parser() -> tuple[
@@ -468,6 +469,7 @@ class AsyncRequestParser:
         try:
             data = await reader.read(self._max_read)
         except Exception:
+            LOG.debug("Failed to read request data", exc_info=True)
             return False
 
         if not data:

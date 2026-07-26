@@ -3,15 +3,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from typing import (
     Any,
-    Awaitable,
-    Callable,
-    Iterable,
     Protocol,
+    Self,
     cast,
 )
 
@@ -365,7 +364,7 @@ class FaultyTransmission(TransmissionStrategy):
             writer.close()
             await writer.wait_closed()
         except Exception:
-            pass
+            LOG.debug("Failed to close response writer", exc_info=True)
 
 
 class AsyncHTTPTestServer:
@@ -785,7 +784,7 @@ class AsyncHTTPTestServer:
         await self._server.wait_closed()
         self._server = None
 
-    async def __aenter__(self) -> AsyncHTTPTestServer:
+    async def __aenter__(self) -> Self:
         await self.start()
         return self
 
@@ -1116,7 +1115,7 @@ class AsyncHTTPTestServer:
                 recording_writer.close()
                 await recording_writer.wait_closed()
             except Exception:
-                pass
+                LOG.debug("Failed to close client writer", exc_info=True)
             finally:
                 self._client_writers.discard(writer)
 

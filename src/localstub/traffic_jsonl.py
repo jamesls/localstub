@@ -3,13 +3,13 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.message import Message
 from pathlib import Path
 from typing import Literal, TextIO
 
-from localstub.http.headers import Headers
 from localstub.http.exchange import RecordedExchange
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest
 from localstub.http.response import RecordedResponse
 from localstub.server import AsyncHTTPTestServer
@@ -28,8 +28,8 @@ def _safe_utf8_decode(data: bytes) -> str | None:
 
 def _isoformat_utc(ts: datetime) -> str:
     if ts.tzinfo is None:
-        return ts.replace(tzinfo=timezone.utc).isoformat()
-    return ts.astimezone(timezone.utc).isoformat()
+        return ts.replace(tzinfo=UTC).isoformat()
+    return ts.astimezone(UTC).isoformat()
 
 
 def _request_client_json(

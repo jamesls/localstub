@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -12,8 +12,8 @@ from localstub.http.responsespec import HTTPResponse
 from localstub.middleware import (
     ConnectionMeta,
     HeaderContext,
-    ResponseSpec,
     ResponderContext,
+    ResponseSpec,
     SenderContext,
     SendResult,
     ServerServices,
@@ -35,7 +35,7 @@ class FixedTimestampProvider(TimestampProvider):
 def _services() -> ServerServices:
     return ServerServices(
         timestamp_provider=FixedTimestampProvider(
-            datetime(2026, 1, 1, tzinfo=timezone.utc)
+            datetime(2026, 1, 1, tzinfo=UTC)
         )
     )
 

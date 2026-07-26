@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
 import io
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -113,7 +113,7 @@ class TestProcessTrafficNoResponse:
             wire_raw_bytes=b"GET /no-upstream HTTP/1.1\r\n\r\n",
             client=("127.0.0.1", 55555),
         )
-        request_timestamp = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        request_timestamp = datetime(2000, 1, 1, tzinfo=UTC)
         exchange = RecordedExchange(
             request=request,
             response=None,
@@ -132,7 +132,7 @@ class TestProcessTrafficNoResponse:
                     self._given = True
                     return exchange
                 await asyncio.sleep(0)
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
 
         proxy = _NoResponseProxy()
         out = io.StringIO()
@@ -169,8 +169,8 @@ class TestProcessTrafficTimestamps:
     async def test_records_request_timestamp_before_waiting_for_response(
         self,
     ) -> None:
-        request_timestamp = datetime(2000, 1, 1, tzinfo=timezone.utc)
-        response_timestamp = datetime(2000, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+        request_timestamp = datetime(2000, 1, 1, tzinfo=UTC)
+        response_timestamp = datetime(2000, 1, 1, 0, 0, 1, tzinfo=UTC)
 
         headers = Headers.from_items([("Host", "example.com")])
         request = HTTPRequest(
@@ -207,7 +207,7 @@ class TestProcessTrafficTimestamps:
                     self._given = True
                     return exchange
                 await asyncio.sleep(0)
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
 
         proxy = _OneExchangeProxy()
         out = io.StringIO()
@@ -232,7 +232,7 @@ class TestProcessHttpProxyTrafficNoResponse:
     async def test_uses_recorded_timestamp_when_response_missing(
         self,
     ) -> None:
-        fixed_timestamp = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        fixed_timestamp = datetime(2000, 1, 1, tzinfo=UTC)
 
         class _FixedTimestampProvider:
             def __init__(self, ts: datetime) -> None:

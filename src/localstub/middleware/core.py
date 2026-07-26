@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
-from typing import Any, Protocol, TypeAlias, cast
+from datetime import UTC, datetime
+from typing import Any, Protocol, cast
 
 from localstub.forward import Forwarder
 from localstub.http.request import HTTPRequest, HTTPRequestHeaders
@@ -19,7 +19,7 @@ class TimestampProvider(Protocol):
 
 class SystemTimestampProvider:
     def now(self) -> datetime:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -111,7 +111,7 @@ class ForwardProxyResponse:
     forwarder: Forwarder
 
 
-ResponseSpec: TypeAlias = HTTPResponse | ForwardProxyResponse
+type ResponseSpec = HTTPResponse | ForwardProxyResponse
 
 
 class ResponderNext(Protocol):
@@ -122,7 +122,7 @@ class ResponderNext(Protocol):
     ) -> Awaitable[ResponseSpec]: ...
 
 
-ResponderMiddleware: TypeAlias = Callable[
+type ResponderMiddleware = Callable[
     [ResponderContext, ResponderNext],
     ResponseSpec | Awaitable[ResponseSpec],
 ]
@@ -191,7 +191,7 @@ class SenderNext(Protocol):
     ) -> Awaitable[SendResult]: ...
 
 
-SenderMiddleware: TypeAlias = Callable[
+type SenderMiddleware = Callable[
     [SenderContext, ResponseSpec, SenderNext],
     SendResult | Awaitable[SendResult],
 ]
@@ -256,7 +256,7 @@ class HeaderNext(Protocol):
     ) -> Awaitable[bool]: ...
 
 
-HeaderMiddleware: TypeAlias = Callable[
+type HeaderMiddleware = Callable[
     [HeaderContext, HeaderNext],
     bool | Awaitable[bool],
 ]

@@ -3,13 +3,13 @@ from __future__ import annotations
 import base64
 import io
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.message import Message
 
 import pytest
 
-from localstub.http.headers import Headers
 from localstub.http.exchange import RecordedExchange
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest
 from localstub.http.response import RecordedResponse
 from localstub.server import AsyncHTTPTestServer
@@ -43,8 +43,8 @@ def test_exchange_to_json_obj_encodes_wire_bytes_and_timestamps() -> None:
         wire_raw_bytes=b"HTTP/1.1 200 OK\r\n\r\nhello",
     )
 
-    request_timestamp = datetime(2026, 1, 27, 12, 0, 0, tzinfo=timezone.utc)
-    response_timestamp = datetime(2026, 1, 27, 12, 0, 1, tzinfo=timezone.utc)
+    request_timestamp = datetime(2026, 1, 27, 12, 0, 0, tzinfo=UTC)
+    response_timestamp = datetime(2026, 1, 27, 12, 0, 1, tzinfo=UTC)
     exchange = RecordedExchange(
         request=request,
         response=response,
@@ -102,8 +102,8 @@ def test_exchange_to_json_obj_handles_decode_errors() -> None:
     exchange = RecordedExchange(
         request=request,
         response=response,
-        request_timestamp=datetime(2026, 1, 27, tzinfo=timezone.utc),
-        response_timestamp=datetime(2026, 1, 27, tzinfo=timezone.utc),
+        request_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
+        response_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
     )
 
     obj = exchange_to_json_obj(exchange)
@@ -126,7 +126,7 @@ def test_exchange_to_json_obj_includes_proxy_fields() -> None:
     exchange = RecordedExchange(
         request=request,
         response=None,
-        request_timestamp=datetime(2026, 1, 27, tzinfo=timezone.utc),
+        request_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
         response_timestamp=None,
     )
 
@@ -151,7 +151,7 @@ def test_jsonl_writer_writes_single_line() -> None:
     exchange = RecordedExchange(
         request=request,
         response=None,
-        request_timestamp=datetime(2026, 1, 27, tzinfo=timezone.utc),
+        request_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
         response_timestamp=None,
     )
 
@@ -170,13 +170,13 @@ def test_dump_server_traffic_jsonl_supports_start_end(tmp_path) -> None:
     exchange1 = RecordedExchange(
         request=HTTPRequest(method="GET", path="/a", http_version="1.1"),
         response=None,
-        request_timestamp=datetime(2026, 1, 27, tzinfo=timezone.utc),
+        request_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
         response_timestamp=None,
     )
     exchange2 = RecordedExchange(
         request=HTTPRequest(method="GET", path="/b", http_version="1.1"),
         response=None,
-        request_timestamp=datetime(2026, 1, 27, tzinfo=timezone.utc),
+        request_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
         response_timestamp=None,
     )
     server.exchanges.extend([exchange1, exchange2])
