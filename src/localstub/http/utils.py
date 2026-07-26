@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterable
+from collections.abc import Awaitable, Iterable
 from email.message import Message
 from http import HTTPStatus
-from typing import Any, Awaitable, cast
+from typing import Any, cast
 
 from localstub.http.headers import Headers
 

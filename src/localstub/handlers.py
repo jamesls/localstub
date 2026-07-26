@@ -1,4 +1,4 @@
-from localstub.server import HTTPRequestHeaders, SendResponse, HTTPResponse
+from localstub.server import HTTPRequestHeaders, HTTPResponse, SendResponse
 
 
 async def handle_expect_header(

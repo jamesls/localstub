@@ -23,6 +23,8 @@ from localstub.tlsproxy import (
     fault_step_transformer,
 )
 
+LOG = logging.getLogger(__name__)
+
 
 @pytest.mark.asyncio
 async def test_tls_proxy_intercepts_https_request_to_localstub():
@@ -944,7 +946,7 @@ async def test_forward_handles_client_closing_connection_early():
         try:
             await writer.wait_closed()
         except Exception:
-            pass
+            LOG.debug("Failed to close test writer", exc_info=True)
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     server_host, server_port = server.sockets[0].getsockname()[:2]
@@ -1013,7 +1015,7 @@ async def _expect_continue_handler(
     try:
         await writer.wait_closed()
     except Exception:
-        pass
+        LOG.debug("Failed to close test writer", exc_info=True)
 
 
 @pytest.mark.asyncio
@@ -1111,7 +1113,7 @@ async def _proper_expect_continue_handler(
     try:
         await writer.wait_closed()
     except Exception:
-        pass
+        LOG.debug("Failed to close test writer", exc_info=True)
 
 
 def _do_100_continue_request(
@@ -1486,13 +1488,13 @@ async def _coalesced_expect_continue_handler(
     try:
         await reader.readuntil(b"\r\n\r\n")
     except Exception:
-        pass
+        LOG.debug("Failed to read test request", exc_info=True)
 
     writer.close()
     try:
         await writer.wait_closed()
     except Exception:
-        pass
+        LOG.debug("Failed to close test writer", exc_info=True)
 
 
 @pytest.mark.asyncio
@@ -1580,7 +1582,7 @@ async def _multiple_informational_handler(
     try:
         await writer.wait_closed()
     except Exception:
-        pass
+        LOG.debug("Failed to close test writer", exc_info=True)
 
 
 @pytest.mark.asyncio
@@ -1659,7 +1661,7 @@ async def _chunked_with_continue_handler(
     try:
         await writer.wait_closed()
     except Exception:
-        pass
+        LOG.debug("Failed to close test writer", exc_info=True)
 
 
 @pytest.mark.asyncio
@@ -1730,7 +1732,7 @@ async def _simple_json_handler(
     try:
         await writer.wait_closed()
     except Exception:
-        pass
+        LOG.debug("Failed to close test writer", exc_info=True)
 
 
 @pytest.mark.asyncio

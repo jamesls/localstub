@@ -36,7 +36,7 @@ async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
 async def _assert_connection_closes(reader: asyncio.StreamReader) -> None:
     try:
         eof = await asyncio.wait_for(reader.read(1), timeout=0.5)
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         raise AssertionError(
             "Expected server to close the TCP connection (EOF)."
         ) from exc

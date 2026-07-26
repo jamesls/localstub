@@ -26,6 +26,7 @@ dependencies = [
   "rich>=14.2.0",
   "truststore>=0.10.0",
   "httpx>=0.28.0",
+  "anyio>=4.11.0",
 ]
 
 [dependency-groups]
@@ -41,7 +42,7 @@ dev = [
   "pyinstrument",
   "jmeslog>=0.2.0",
   "poethepoet>=0.37.0",
-  "ruff>=0.13.0",
+  "ruff>=0.16.0",
   "pyright[nodejs]>=1.1.405",
 ]
 

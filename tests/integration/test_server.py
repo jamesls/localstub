@@ -1,6 +1,6 @@
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -337,34 +337,36 @@ async def test_clear_requests_preserves_handler(server, client):
 async def test_session_scoped_server_pattern():
     """Test session-scoped server reuse pattern across multiple tests."""
     # Simulates a session-scoped fixture
-    async with AsyncHTTPTestServer() as server:
-        async with httpx.AsyncClient() as client:
-            # Test 1: Check initial state
-            server.set_json_response({"test": 1})
-            response = await client.get(server.url)
-            assert response.json() == {"test": 1}
-            assert len(server.requests) == 1
+    async with (
+        AsyncHTTPTestServer() as server,
+        httpx.AsyncClient() as client,
+    ):
+        # Test 1: Check initial state
+        server.set_json_response({"test": 1})
+        response = await client.get(server.url)
+        assert response.json() == {"test": 1}
+        assert len(server.requests) == 1
 
-            # Clear state between tests
-            server.clear_requests()
+        # Clear state between tests
+        server.clear_requests()
 
-            # Test 2: Fresh state after clear
-            server.set_json_response({"test": 2})
-            response = await client.get(server.url)
-            assert response.json() == {"test": 2}
-            assert len(server.requests) == 1
-            assert server.requests[0].path == "/"
+        # Test 2: Fresh state after clear
+        server.set_json_response({"test": 2})
+        response = await client.get(server.url)
+        assert response.json() == {"test": 2}
+        assert len(server.requests) == 1
+        assert server.requests[0].path == "/"
 
-            # Clear state between tests
-            server.clear_requests()
+        # Clear state between tests
+        server.clear_requests()
 
-            # Test 3: Multiple requests in one test
-            server.set_json_response({"test": 3})
-            await client.get(f"{server.url}a")
-            await client.get(f"{server.url}b")
-            assert len(server.requests) == 2
-            assert server.requests[0].path == "/a"
-            assert server.requests[1].path == "/b"
+        # Test 3: Multiple requests in one test
+        server.set_json_response({"test": 3})
+        await client.get(f"{server.url}a")
+        await client.get(f"{server.url}b")
+        assert len(server.requests) == 2
+        assert server.requests[0].path == "/a"
+        assert server.requests[1].path == "/b"
 
 
 @pytest.mark.asyncio
@@ -1024,7 +1026,7 @@ async def send_raw_request(host, port, data):
         await asyncio.sleep(0.1)
         response = await asyncio.wait_for(reader.read(4096), timeout=1.0)
         return response
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return b""
     finally:
         writer.close()
@@ -1035,7 +1037,7 @@ async def send_raw_request(host, port, data):
 async def test_server_handles_empty_request_line(server):
     """Test server handles empty request line gracefully."""
     # Send just EOF without any request line
-    reader, writer = await asyncio.open_connection(server.host, server.port)
+    _, writer = await asyncio.open_connection(server.host, server.port)
     writer.close()
     await writer.wait_closed()
 
@@ -1067,7 +1069,7 @@ async def test_server_handles_http09_simple_request(server):
 async def test_server_handles_eof_while_reading_headers(server):
     """Test server handles EOF while reading headers."""
     # Send request line but close before sending complete headers
-    reader, writer = await asyncio.open_connection(server.host, server.port)
+    _, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(b"GET / HTTP/1.1\r\n")
     writer.write(b"Host: localhost\r\n")
     await writer.drain()
@@ -1124,7 +1126,7 @@ async def test_server_handles_invalid_chunk_size(server):
 @pytest.mark.asyncio
 async def test_server_handles_eof_in_chunked_body(server):
     """Test server handles EOF while reading chunked body."""
-    reader, writer = await asyncio.open_connection(server.host, server.port)
+    _, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(
         b"POST / HTTP/1.1\r\n"
         b"Host: localhost\r\n"
@@ -1143,7 +1145,7 @@ async def test_server_handles_eof_in_chunked_body(server):
 @pytest.mark.asyncio
 async def test_server_handles_eof_in_chunk_trailers(server):
     """Test server handles EOF while reading chunk trailers."""
-    reader, writer = await asyncio.open_connection(server.host, server.port)
+    _, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(
         b"POST / HTTP/1.1\r\n"
         b"Host: localhost\r\n"
@@ -1254,9 +1256,7 @@ async def test_server_handles_exception_during_request_processing():
         server.handler = failing_handler
 
         # Make request that will trigger handler exception
-        reader, writer = await asyncio.open_connection(
-            server.host, server.port
-        )
+        _, writer = await asyncio.open_connection(server.host, server.port)
         writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
         await writer.drain()
 
@@ -1298,7 +1298,7 @@ async def test_server_handles_writer_close_exception():
 @pytest.mark.asyncio
 async def test_server_handles_immediate_eof_in_request_line(server):
     """Test server handles immediate EOF (no data at all)."""
-    reader, writer = await asyncio.open_connection(server.host, server.port)
+    _, writer = await asyncio.open_connection(server.host, server.port)
     # Close immediately without sending anything
     writer.close()
     await writer.wait_closed()
@@ -1310,7 +1310,7 @@ async def test_server_handles_immediate_eof_in_request_line(server):
 @pytest.mark.asyncio
 async def test_server_handles_eof_after_chunk_size(server):
     """Test server handles EOF right after reading chunk size line."""
-    reader, writer = await asyncio.open_connection(server.host, server.port)
+    _, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(
         b"POST / HTTP/1.1\r\n"
         b"Host: localhost\r\n"
@@ -1870,10 +1870,10 @@ async def test_on_headers_received_multiple_informational_responses():
 @pytest.mark.asyncio
 async def test_exchange_timestamps_use_timestamp_provider():
     timestamps = [
-        datetime(2026, 1, 27, 12, 0, 0, tzinfo=timezone.utc),
-        datetime(2026, 1, 27, 12, 0, 1, tzinfo=timezone.utc),
-        datetime(2026, 1, 27, 12, 0, 2, tzinfo=timezone.utc),
-        datetime(2026, 1, 27, 12, 0, 3, tzinfo=timezone.utc),
+        datetime(2026, 1, 27, 12, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 27, 12, 0, 1, tzinfo=UTC),
+        datetime(2026, 1, 27, 12, 0, 2, tzinfo=UTC),
+        datetime(2026, 1, 27, 12, 0, 3, tzinfo=UTC),
     ]
     provider = ManualTimestampProvider(timestamps)
 

@@ -2,25 +2,29 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import signal
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Protocol, TextIO
 
+import anyio
+import httpx
 from rich.logging import RichHandler
 from rich.syntax import Syntax
-
-import httpx
 
 from localstub.ca import TLSProxyCA
 from localstub.config import load_config
 from localstub.console import console
 from localstub.http.exchange import RecordedExchange
+from localstub.http.utils import maybe_await
 from localstub.server import AsyncHTTPTestServer
 from localstub.tlsproxy import AsyncTLSInterceptProxy
-from localstub.traffic_jsonl import JSONLTrafficWriter
+from localstub.traffic_jsonl import exchange_to_json_obj
 
 DEFAULT_PORT = 8888
+type TrafficOutput = TextIO | anyio.AsyncFile[str]
 
 
 def _detect_syntax(body: str, headers: str) -> str:
@@ -31,7 +35,7 @@ def _detect_syntax(body: str, headers: str) -> str:
     if "application/xml" in headers_lower or "text/xml" in headers_lower:
         return "xml"
     body_stripped = body.strip()
-    if body_stripped.startswith("{") or body_stripped.startswith("["):
+    if body_stripped.startswith(("{", "[")):
         return "json"
     if body_stripped.startswith("<"):
         return "xml"
@@ -211,19 +215,20 @@ async def run_http_proxy(args: argparse.Namespace) -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
-        output_file: TextIO | None = None
-        if args.output:
-            output_file = open(args.output, "a")
+        async with AsyncExitStack() as output_stack:
+            output_file: TrafficOutput | None = None
+            if args.output:
+                output_file = await output_stack.enter_async_context(
+                    await anyio.open_file(args.output, "a", encoding="utf-8")
+                )
 
-        try:
-            await process_http_proxy_traffic(
-                server, output_file, shutdown_event
-            )
-        finally:
-            if output_file:
-                output_file.close()
-            if forwarder:
-                await forwarder.aclose()
+            try:
+                await process_http_proxy_traffic(
+                    server, output_file, shutdown_event
+                )
+            finally:
+                if forwarder:
+                    await forwarder.aclose()
 
 
 async def run_tls_proxy(args: argparse.Namespace) -> None:
@@ -271,20 +276,19 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
             # Signal handlers may be unsupported (e.g. on Windows)
             pass
 
-        output_file: TextIO | None = None
-        if args.output:
-            output_file = open(args.output, "a")
+        async with AsyncExitStack() as output_stack:
+            output_file: TrafficOutput | None = None
+            if args.output:
+                output_file = await output_stack.enter_async_context(
+                    await anyio.open_file(args.output, "a", encoding="utf-8")
+                )
 
-        try:
             if server is None:
                 await process_traffic(proxy, output_file, shutdown_event)
             else:
                 await process_http_proxy_traffic(
                     server, output_file, shutdown_event
                 )
-        finally:
-            if output_file:
-                output_file.close()
 
 
 class _TrafficSource(Protocol):
@@ -297,7 +301,7 @@ class _TrafficSource(Protocol):
 
 async def _process_traffic(
     source: _TrafficSource,
-    output_file: TextIO | None,
+    output_file: TrafficOutput | None,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Poll *source* for completed request/response exchanges.
@@ -305,14 +309,10 @@ async def _process_traffic(
     Works for both the TLS intercept proxy and the HTTP forward
     proxy server.
     """
-    jsonl: JSONLTrafficWriter | None = (
-        JSONLTrafficWriter(output_file) if output_file else None
-    )
-
     while not shutdown_event.is_set():
         try:
             exchange = await source.next_exchange(timeout=0.1)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
         request = exchange.request
@@ -332,13 +332,15 @@ async def _process_traffic(
                 status=response.status,
             )
 
-        if jsonl is not None:
-            jsonl.write_exchange(exchange)
+        if output_file is not None:
+            record = json.dumps(exchange_to_json_obj(exchange)) + "\n"
+            await maybe_await(output_file.write(record))
+            await maybe_await(output_file.flush())
 
 
 async def process_traffic(
     proxy: AsyncTLSInterceptProxy,
-    output_file: TextIO | None,
+    output_file: TrafficOutput | None,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Poll TLS proxy for completed exchanges."""
@@ -347,7 +349,7 @@ async def process_traffic(
 
 async def process_http_proxy_traffic(
     server: AsyncHTTPTestServer,
-    output_file: TextIO | None,
+    output_file: TrafficOutput | None,
     shutdown_event: asyncio.Event,
 ) -> None:
     """Poll HTTP server for completed exchanges."""

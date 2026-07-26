@@ -4,9 +4,8 @@ import stat
 from pathlib import Path
 
 import pytest
-from cryptography.hazmat.primitives.serialization import pkcs12
-
 import trustme
+from cryptography.hazmat.primitives.serialization import pkcs12
 
 from localstub.ca import TLSProxyCA
 

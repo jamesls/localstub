@@ -4,33 +4,32 @@ import asyncio
 import logging
 import ssl
 from asyncio import transports
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, cast
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Self, cast
 
 from rich.markup import escape as rich_escape
 
 if TYPE_CHECKING:
     from localstub.server import FaultStep
 
+from localstub.ca import TLSProxyCA
 from localstub.forward import (
-    ForwardError,
     Forwarder,
+    ForwardError,
     ResponseTransformer,
     TransformResult,
     UpstreamResponse,
 )
 from localstub.http.exchange import RecordedExchange
-from localstub.http.response import (
-    RecordedResponse,
-)
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequest,
     ParsedRequest,
 )
-from localstub.ca import TLSProxyCA
+from localstub.http.response import (
+    RecordedResponse,
+)
 from localstub.server import AsyncHTTPTestServer
-
 
 LOG = logging.getLogger(__name__)
 
@@ -150,7 +149,7 @@ class AsyncTLSInterceptProxy:
 
         # Recording queues for forwarded traffic
         self._recorded_requests: asyncio.Queue[HTTPRequest] = asyncio.Queue()
-        self._recorded_responses: asyncio.Queue["RecordedResponse"] = (
+        self._recorded_responses: asyncio.Queue[RecordedResponse] = (
             asyncio.Queue()
         )
         self._recorded_exchanges: asyncio.Queue[RecordedExchange] = (
@@ -182,7 +181,7 @@ class AsyncTLSInterceptProxy:
 
     async def next_response(
         self, timeout: float | None = None
-    ) -> "RecordedResponse":
+    ) -> RecordedResponse:
         if timeout is None:
             return await self._recorded_responses.get()
         return await asyncio.wait_for(
@@ -220,7 +219,7 @@ class AsyncTLSInterceptProxy:
         # Wait for in-flight client handlers to finish; cancel any that linger.
         pending = [t for t in self._client_tasks if not t.done()]
         if pending:
-            done, pending = await asyncio.wait(pending, timeout=1.0)
+            _, pending = await asyncio.wait(pending, timeout=1.0)
             for task in pending:
                 task.cancel()
             if pending:
@@ -229,7 +228,7 @@ class AsyncTLSInterceptProxy:
         self._client_tasks.clear()
         self._listener = None
 
-    async def __aenter__(self) -> "AsyncTLSInterceptProxy":
+    async def __aenter__(self) -> Self:
         await self.start()
         return self
 
@@ -286,7 +285,10 @@ class AsyncTLSInterceptProxy:
                     writer.close()
                     await writer.wait_closed()
                 except Exception:
-                    pass
+                    LOG.debug(
+                        "Failed to close client writer after TLS handshake",
+                        exc_info=True,
+                    )
                 return
             active_writer = tls_writer
 
@@ -313,7 +315,10 @@ class AsyncTLSInterceptProxy:
                 active_writer.close()
                 await active_writer.wait_closed()
             except Exception:
-                pass
+                LOG.debug(
+                    "Failed to close client writer after cancellation",
+                    exc_info=True,
+                )
             raise
         except Exception:
             # Any other exception is unexpected; keep the traceback to aid
@@ -324,7 +329,10 @@ class AsyncTLSInterceptProxy:
                 active_writer.close()
                 await active_writer.wait_closed()
             except Exception:
-                pass
+                LOG.debug(
+                    "Failed to close client writer after proxy error",
+                    exc_info=True,
+                )
 
     def _client_connected(
         self,
@@ -353,6 +361,7 @@ class AsyncTLSInterceptProxy:
             host, port_str = self._split_connect_target(target)
             port = int(port_str)
         except Exception:
+            LOG.debug("Failed to parse CONNECT target", exc_info=True)
             return None, None
 
         # Consume remaining headers up to blank line
@@ -442,7 +451,7 @@ class AsyncTLSInterceptProxy:
         _wire_log(f"lstub <-- {client_id}", header_wire)
 
         # Check for Expect: 100-continue with client actually waiting.
-        expect_hdr = dict((k.lower(), v) for k, v in parsed.headers).get(
+        expect_hdr = {k.lower(): v for k, v in parsed.headers}.get(
             b"expect", b""
         )
         client_waiting = (
@@ -590,7 +599,7 @@ class AsyncTLSInterceptProxy:
         writer: asyncio.StreamWriter,
     ) -> tuple[HTTPRequest, datetime]:
         """Build and record an HTTPRequest."""
-        request_timestamp = datetime.now(timezone.utc)
+        request_timestamp = datetime.now(UTC)
         request = HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
         await self._recorded_requests.put(request)
         return request, request_timestamp
@@ -602,7 +611,7 @@ class AsyncTLSInterceptProxy:
         response: RecordedResponse | None,
     ) -> None:
         response_timestamp = (
-            datetime.now(timezone.utc) if response is not None else None
+            datetime.now(UTC) if response is not None else None
         )
         await self._recorded_exchanges.put(
             RecordedExchange(
@@ -652,11 +661,14 @@ class AsyncTLSInterceptProxy:
                 try:
                     await writer.wait_closed()
                 except Exception:
-                    pass
+                    LOG.debug(
+                        "Failed to close client writer",
+                        exc_info=True,
+                    )
 
 
 def fault_step_transformer(
-    *steps: "FaultStep",
+    *steps: FaultStep,
 ) -> ResponseTransformer:
     """Create a ResponseTransformer from FaultStep instances.
 
