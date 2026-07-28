@@ -16,6 +16,18 @@ LOG = logging.getLogger(__name__)
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+
 
 def _authority(uri: ParsedURI) -> str:
     """Render the Host header value for *uri*.
@@ -67,6 +79,41 @@ def build_origin_form_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
     return header_bytes + request.wire_body_bytes
 
 
+async def _read_upstream_body(
+    upstream_response: httpx.Response,
+) -> tuple[bytes, bool]:
+    """Read the upstream body, returning it and whether it is decoded."""
+    try:
+        body = bytearray()
+        async for chunk in upstream_response.aiter_raw():
+            body.extend(chunk)
+        return bytes(body), False
+    except httpx.StreamConsumed:
+        # A response hook (or a mock transport response built from
+        # ``content=``) already consumed the raw stream. httpx caches
+        # only the decoded body, so the upstream encoding and length
+        # headers no longer describe it.
+        return upstream_response.content, True
+
+
+def _forwarded_response_headers(
+    upstream_response: httpx.Response,
+    *,
+    body_is_decoded: bool,
+) -> dict[str, str]:
+    drop_headers = set(_HOP_BY_HOP_HEADERS)
+    for value in upstream_response.headers.get_list("Connection"):
+        drop_headers.update(parse_connection_tokens(value))
+    if body_is_decoded:
+        drop_headers.update({"content-encoding", "content-length"})
+
+    response_headers: dict[str, str] = {}
+    for name, value in upstream_response.headers.items():
+        if name.lower() not in drop_headers:
+            response_headers[name] = value
+    return response_headers
+
+
 async def forward_via_httpx(
     client: httpx.AsyncClient,
     request: HTTPRequest,
@@ -81,18 +128,7 @@ async def forward_via_httpx(
 
     upstream_url = request.path or "/"
 
-    hop_by_hop = {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    }
-    request_hop_by_hop = hop_by_hop | connection_tokens_from_headers(
+    request_hop_by_hop = _HOP_BY_HOP_HEADERS | connection_tokens_from_headers(
         request.headers
     )
     headers: dict[str, str] = {}
@@ -107,23 +143,16 @@ async def forward_via_httpx(
             headers=headers,
             content=request.body_bytes or None,
         ) as upstream_response:
-            response_body = bytearray()
-            async for chunk in upstream_response.aiter_raw():
-                response_body.extend(chunk)
-
-            response_hop_by_hop = set(hop_by_hop)
-            for value in upstream_response.headers.get_list("Connection"):
-                response_hop_by_hop.update(parse_connection_tokens(value))
-
-            response_headers: dict[str, str] = {}
-            for name, value in upstream_response.headers.items():
-                if name.lower() not in response_hop_by_hop:
-                    response_headers[name] = value
-
+            body, body_is_decoded = await _read_upstream_body(
+                upstream_response
+            )
             return HTTPResponse(
                 status=upstream_response.status_code,
-                headers=response_headers,
-                body=bytes(response_body),
+                headers=_forwarded_response_headers(
+                    upstream_response,
+                    body_is_decoded=body_is_decoded,
+                ),
+                body=body,
             )
     except httpx.RequestError as exc:
         LOG.warning("Upstream request failed: %s", exc)
