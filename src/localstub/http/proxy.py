@@ -4,7 +4,10 @@ import logging
 
 import httpx
 
-from localstub.http.connection import connection_tokens_from_headers
+from localstub.http.connection import (
+    connection_tokens_from_headers,
+    parse_connection_tokens,
+)
 from localstub.http.request import HTTPRequest
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.uri import ParsedURI
@@ -89,9 +92,12 @@ async def forward_via_httpx(
         "transfer-encoding",
         "upgrade",
     }
+    request_hop_by_hop = hop_by_hop | connection_tokens_from_headers(
+        request.headers
+    )
     headers: dict[str, str] = {}
     for name, value in request.headers.items():
-        if name.lower() not in hop_by_hop:
+        if name.lower() not in request_hop_by_hop:
             headers[name] = value
 
     try:
@@ -105,9 +111,13 @@ async def forward_via_httpx(
             async for chunk in upstream_response.aiter_raw():
                 response_body.extend(chunk)
 
+            response_hop_by_hop = set(hop_by_hop)
+            for value in upstream_response.headers.get_list("Connection"):
+                response_hop_by_hop.update(parse_connection_tokens(value))
+
             response_headers: dict[str, str] = {}
             for name, value in upstream_response.headers.items():
-                if name.lower() not in hop_by_hop:
+                if name.lower() not in response_hop_by_hop:
                     response_headers[name] = value
 
             return HTTPResponse(
