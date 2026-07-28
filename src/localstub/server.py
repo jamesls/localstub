@@ -1142,7 +1142,7 @@ class AsyncHTTPTestServer:
             parsed, wire_bytes = await parser.parse(reader, connection_wire)
             if parsed is None:
                 return None
-            return self._build_request(parsed, wire_bytes, writer), state
+            return self._build_request(parsed, wire_bytes, client), state
 
         parsed, header_wire, remaining = await parser.parse_headers(
             reader, connection_wire
@@ -1185,16 +1185,20 @@ class AsyncHTTPTestServer:
         if parsed is None:
             return None
 
-        return self._build_request(parsed, wire_bytes, writer), state
+        return self._build_request(parsed, wire_bytes, client), state
 
     def _build_request(
         self,
         parsed: ParsedRequest,
         wire_bytes: bytes,
-        writer: Writer,
+        client: tuple[str, int] | None,
     ) -> HTTPRequest:
         """Build HTTPRequest from parsed data."""
-        return HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
+        return HTTPRequest.from_parsed(
+            parsed,
+            wire_bytes,
+            client=client,
+        )
 
     def _build_recorded_response(
         self,

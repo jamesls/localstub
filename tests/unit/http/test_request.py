@@ -44,6 +44,25 @@ def test_parsed_request_body_property_multiple_parts() -> None:
     assert request.body == b"hello world"
 
 
+def test_http_request_from_parsed_prefers_explicit_client() -> None:
+    parsed = ParsedRequest(
+        method="GET",
+        url=b"/",
+        http_version="1.1",
+    )
+    writer = Mock(spec=asyncio.StreamWriter)
+
+    request = HTTPRequest.from_parsed(
+        parsed,
+        b"GET / HTTP/1.1\r\n\r\n",
+        client=("127.0.0.1", 54321),
+        writer=writer,
+    )
+
+    assert request.client == ("127.0.0.1", 54321)
+    writer.get_extra_info.assert_not_called()
+
+
 def test_request_protocol_on_message_begin_resets_result() -> None:
     protocol = RequestProtocol()
     protocol.result.method = "GET"

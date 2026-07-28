@@ -56,6 +56,7 @@ class HTTPRequest:
         parsed: ParsedRequest,
         wire_raw_bytes: bytes,
         *,
+        client: tuple[str, int] | None = None,
         writer: Writer | None = None,
     ) -> HTTPRequest:
         headers = headers_to_headers(parsed.headers)
@@ -66,8 +67,7 @@ class HTTPRequest:
             if parsed.url is not None
             else ""
         )
-        client: tuple[str, int] | None = None
-        if writer is not None:
+        if client is None and writer is not None:
             peer = writer.get_extra_info("peername")
             if isinstance(peer, tuple) and len(peer) >= 2:
                 client = (peer[0], peer[1])
