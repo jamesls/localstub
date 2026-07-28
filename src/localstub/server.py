@@ -1183,7 +1183,14 @@ class AsyncHTTPTestServer:
         self._client_writers.add(writer)
         task = asyncio.create_task(self._handle_client(reader, writer))
         self._client_tasks.add(task)
-        task.add_done_callback(self._client_tasks.discard)
+
+        def _release_client(done_task: asyncio.Task[None]) -> None:
+            # A task canceled before its first step never enters
+            # _handle_client, so its writer must be released here too.
+            self._client_tasks.discard(done_task)
+            self._client_writers.discard(writer)
+
+        task.add_done_callback(_release_client)
 
     async def _read_request(
         self,
