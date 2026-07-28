@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import socket
 
 import httpx
 import pytest
 import pytest_asyncio
 
+from localstub.cli import parse_args, run_http_proxy
 from localstub.forward import Forwarder
 from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
@@ -74,12 +76,77 @@ async def _read_http_response_bytes(
         return header_bytes + await reader.readexactly(int(content_length))
 
 
+async def _connect_when_ready(
+    host: str,
+    port: int,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async with asyncio.timeout(2.0):
+        while True:
+            try:
+                return await asyncio.open_connection(host, port)
+            except OSError:
+                await asyncio.sleep(0.01)
+
+
 @pytest_asyncio.fixture
 async def upstream_server() -> AsyncHTTPTestServer:
     """Create an upstream server that the proxy will forward to."""
     async with AsyncHTTPTestServer() as server:
         server.set_json_response({"upstream": True, "status": "ok"})
         yield server
+
+
+@pytest.mark.asyncio
+async def test_http_proxy_mode_handles_expect_100_continue_client(
+    upstream_server: AsyncHTTPTestServer,
+) -> None:
+    with socket.socket() as available_port:
+        available_port.bind(("127.0.0.1", 0))
+        proxy_port = available_port.getsockname()[1]
+
+    args = parse_args([
+        "--mode",
+        "http-proxy",
+        "--port",
+        str(proxy_port),
+    ])
+    proxy_task = asyncio.create_task(run_http_proxy(args))
+
+    try:
+        reader, writer = await _connect_when_ready("127.0.0.1", proxy_port)
+        try:
+            body = b"expect continue upload"
+            request_headers = (
+                f"PUT {upstream_server.url}upload HTTP/1.1\r\n"
+                f"Host: {upstream_server.host}:{upstream_server.port}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Expect: 100-continue\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode()
+            writer.write(request_headers)
+            await writer.drain()
+
+            interim_response = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"),
+                timeout=0.5,
+            )
+            assert interim_response == b"HTTP/1.1 100 Continue\r\n\r\n"
+
+            writer.write(body)
+            await writer.drain()
+            final_response = await _read_http_response_bytes(reader)
+
+            assert b"HTTP/1.1 200 OK" in final_response
+            upstream_request = await upstream_server.next_request(timeout=0.5)
+            assert upstream_request.body_bytes == body
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    finally:
+        proxy_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proxy_task
 
 
 class TestProxyRequestRecording:

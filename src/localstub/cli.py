@@ -17,6 +17,7 @@ from rich.syntax import Syntax
 from localstub.ca import TLSProxyCA
 from localstub.config import load_config
 from localstub.console import console
+from localstub.handlers import handle_expect_header
 from localstub.http.exchange import RecordedExchange
 from localstub.http.utils import maybe_await
 from localstub.server import AsyncHTTPTestServer
@@ -186,6 +187,7 @@ async def run_http_proxy(args: argparse.Namespace) -> None:
 
     server = AsyncHTTPTestServer(
         port=args.port,
+        on_headers_received=handle_expect_header,
         proxy_forwarder=forwarder,
     )
 
