@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 
 import httpx
 import pytest
@@ -148,6 +149,31 @@ class TestProxyRequestRecording:
 
 class TestProxyForwarding:
     """Tests for forwarding proxy requests to upstream."""
+
+    @pytest.mark.asyncio
+    async def test_forwarder_does_not_corrupt_compressed_response(
+        self,
+    ) -> None:
+        body = b"compressed upstream response"
+        compressed_body = gzip.compress(body)
+
+        async with AsyncHTTPTestServer() as upstream:
+            upstream.set_raw_response(
+                compressed_body,
+                headers={"Content-Encoding": "gzip"},
+            )
+
+            async with (
+                httpx.AsyncClient() as upstream_client,
+                AsyncHTTPTestServer(proxy_forwarder=upstream_client) as proxy,
+                httpx.AsyncClient(proxy=proxy.url) as downstream_client,
+            ):
+                response = await downstream_client.get(
+                    upstream.url,
+                    headers={"Connection": "close"},
+                )
+
+        assert response.content == body
 
     @pytest.mark.asyncio
     async def test_forwards_to_upstream_with_forwarder(
