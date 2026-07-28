@@ -961,9 +961,12 @@ class AsyncHTTPTestServer:
             )
             return SendResult(
                 recorded=recorded,
-                should_close=should_close_connection(
-                    request,
-                    response_headers=result.headers,
+                should_close=(
+                    result.is_eof_delimited
+                    or should_close_connection(
+                        request,
+                        response_headers=result.headers,
+                    )
                 ),
             )
 

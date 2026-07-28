@@ -81,6 +81,7 @@ class ForwardResult:
     headers: Message
     body: bytes
     wire_bytes: bytes
+    is_eof_delimited: bool = False
 
     def to_recorded_response(
         self,
@@ -578,4 +579,5 @@ class Forwarder:
             headers=headers,
             body=body,
             wire_bytes=wire_bytes,
+            is_eof_delimited=parsed.is_eof_delimited,
         )
