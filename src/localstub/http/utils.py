@@ -25,13 +25,10 @@ def maybe_await(value: Any) -> Awaitable[Any]:
 
 
 def headers_to_headers(headers: list[tuple[bytes, bytes]]) -> Headers:
-    items: list[tuple[str, str]] = []
-    for name, value in headers:
-        items.append((
-            name.decode("iso-8859-1"),
-            value.decode("iso-8859-1"),
-        ))
-    return Headers.from_items(items)
+    return Headers.from_items(
+        (name.decode("iso-8859-1"), value.decode("iso-8859-1"))
+        for name, value in headers
+    )
 
 
 def status_phrase(
