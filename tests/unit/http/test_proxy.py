@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
+import httpx
+import pytest
+
 from localstub.http.headers import Headers
-from localstub.http.proxy import build_origin_form_request
+from localstub.http.proxy import build_origin_form_request, forward_via_httpx
 from localstub.http.request import HTTPRequest
+
+
+class AsyncResponseStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b""
 
 
 def _proxy_request(uri: str) -> HTTPRequest:
@@ -80,3 +90,60 @@ def test_build_origin_form_request_adds_host_when_missing() -> None:
     wire = build_origin_form_request(request, uri)
 
     assert _host_header(wire) == "example.com:443"
+
+
+@pytest.mark.asyncio
+async def test_httpx_proxy_strips_dynamic_request_headers() -> None:
+    received_headers: httpx.Headers | None = None
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        nonlocal received_headers
+        received_headers = request.headers
+        return httpx.Response(200, stream=AsyncResponseStream())
+
+    request = HTTPRequest(
+        method="GET",
+        path="http://example.com/path",
+        http_version="1.1",
+        headers=Headers.from_items([
+            ("Host", "example.com"),
+            ("Connection", "X-Hop"),
+            ("X-Hop", "request-only"),
+            ("X-End-To-End", "preserved"),
+        ]),
+    )
+    transport = httpx.MockTransport(handle_request)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        await forward_via_httpx(client, request)
+
+    assert received_headers is not None
+    assert "X-Hop" not in received_headers
+    assert received_headers["X-End-To-End"] == "preserved"
+
+
+@pytest.mark.asyncio
+async def test_httpx_proxy_strips_dynamic_response_headers() -> None:
+    def handle_request(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "Connection": "X-Hop",
+                "X-Hop": "response-only",
+                "X-End-To-End": "preserved",
+            },
+            stream=AsyncResponseStream(),
+        )
+
+    request = _proxy_request("http://example.com/path")
+    transport = httpx.MockTransport(handle_request)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await forward_via_httpx(client, request)
+
+    response_headers = {
+        name.lower(): value for name, value in response.headers.items()
+    }
+    assert "connection" not in response_headers
+    assert "x-hop" not in response_headers
+    assert response_headers["x-end-to-end"] == "preserved"
