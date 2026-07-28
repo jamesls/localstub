@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from collections.abc import AsyncIterator
 
 import httpx
@@ -11,8 +12,11 @@ from localstub.http.request import HTTPRequest
 
 
 class AsyncResponseStream(httpx.AsyncByteStream):
+    def __init__(self, data: bytes = b"") -> None:
+        self._data = data
+
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        yield b""
+        yield self._data
 
 
 def _proxy_request(uri: str) -> HTTPRequest:
@@ -147,3 +151,51 @@ async def test_httpx_proxy_strips_dynamic_response_headers() -> None:
     assert "connection" not in response_headers
     assert "x-hop" not in response_headers
     assert response_headers["x-end-to-end"] == "preserved"
+
+
+@pytest.mark.asyncio
+async def test_httpx_proxy_with_hook_consumed_stream_returns_body() -> None:
+    body = b"hook consumed response"
+    compressed_body = gzip.compress(body)
+
+    def handle_request(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            stream=AsyncResponseStream(compressed_body),
+        )
+
+    async def read_body_hook(response: httpx.Response) -> None:
+        await response.aread()
+
+    request = _proxy_request("http://example.com/path")
+    transport = httpx.MockTransport(handle_request)
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        event_hooks={"response": [read_body_hook]},
+    ) as client:
+        response = await forward_via_httpx(client, request)
+
+    assert response.status == 200
+    assert response.body == body
+    response_header_names = {name.lower() for name in response.headers}
+    assert "content-encoding" not in response_header_names
+    assert "content-length" not in response_header_names
+
+
+@pytest.mark.asyncio
+async def test_httpx_proxy_forwards_response_built_from_content_bytes() -> (
+    None
+):
+    def handle_request(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"mock body")
+
+    request = _proxy_request("http://example.com/path")
+    transport = httpx.MockTransport(handle_request)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await forward_via_httpx(client, request)
+
+    assert response.status == 200
+    assert response.body == b"mock body"
