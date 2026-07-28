@@ -19,6 +19,10 @@ class Router:
         default_factory=dict
     )
 
+    @property
+    def has_routes(self) -> bool:
+        return type(self) is not Router or bool(self._routes)
+
     def add(self, method: str, path: str, handler: ResponderHandler) -> None:
         self._routes[(method.upper(), path)] = handler
 

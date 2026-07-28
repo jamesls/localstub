@@ -7,6 +7,15 @@ import pytest
 import pytest_asyncio
 
 from localstub.http.request import HTTPRequest
+from localstub.middleware import (
+    ResponderContext,
+    ResponderNext,
+    ResponseSpec,
+    SenderContext,
+    SenderNext,
+    SendResult,
+)
+from localstub.router import Router
 from localstub.server import (
     AsyncHTTPTestServer,
     HTTPRequestHeaders,
@@ -77,6 +86,113 @@ async def test_server_receives_request_and_returns_json_response(
     assert server.exchanges[0].request_timestamp.tzinfo is not None
     assert server.exchanges[0].response_timestamp is not None
     assert server.exchanges[0].response_timestamp.tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_static_response_rechecks_responder_middleware() -> None:
+    async with (
+        AsyncHTTPTestServer(
+            default_response=HTTPResponse.text("static")
+        ) as server,
+        httpx.AsyncClient() as client,
+    ):
+        response = await client.get(server.url)
+
+        async def replace_response(
+            ctx: ResponderContext,
+            call_next: ResponderNext,
+        ) -> ResponseSpec:
+            _ = (ctx, call_next)
+            return HTTPResponse.text("middleware")
+
+        server.use(replace_response)
+        replaced = await client.get(server.url)
+
+    assert response.text == "static"
+    assert replaced.text == "middleware"
+
+
+@pytest.mark.asyncio
+async def test_static_response_rechecks_sender_middleware() -> None:
+    async with (
+        AsyncHTTPTestServer(
+            default_response=HTTPResponse.text("static")
+        ) as server,
+        httpx.AsyncClient() as client,
+    ):
+        response = await client.get(server.url)
+
+        async def replace_response(
+            ctx: SenderContext,
+            response: ResponseSpec,
+            call_next: SenderNext,
+        ) -> SendResult:
+            _ = (ctx, response)
+            return await call_next(HTTPResponse.text("middleware"))
+
+        server.use_sender(replace_response)
+        replaced = await client.get(server.url)
+
+    assert response.text == "static"
+    assert replaced.text == "middleware"
+
+
+@pytest.mark.asyncio
+async def test_sender_middleware_is_snapshotted_before_responder() -> None:
+    responder_started = asyncio.Event()
+    release_responder = asyncio.Event()
+
+    async def responder(_: ResponderContext) -> HTTPResponse:
+        responder_started.set()
+        await release_responder.wait()
+        return HTTPResponse.text("responder")
+
+    async def replace_response(
+        ctx: SenderContext,
+        response: ResponseSpec,
+        call_next: SenderNext,
+    ) -> SendResult:
+        _ = (ctx, response)
+        return await call_next(HTTPResponse.text("middleware"))
+
+    async with (
+        AsyncHTTPTestServer(handler=responder) as server,
+        httpx.AsyncClient() as client,
+    ):
+        request_task = asyncio.create_task(client.get(server.url))
+        await responder_started.wait()
+        server.use_sender(replace_response)
+        release_responder.set()
+
+        in_flight_response = await request_task
+        next_response = await client.get(server.url)
+
+    assert in_flight_response.text == "responder"
+    assert next_response.text == "middleware"
+
+
+@pytest.mark.asyncio
+async def test_router_subclass_without_registered_routes_handles_request() -> (
+    None
+):
+    class CustomRouter(Router):
+        async def handle(
+            self,
+            ctx: ResponderContext,
+        ) -> ResponseSpec | None:
+            _ = ctx
+            return HTTPResponse.text("custom router")
+
+    async with (
+        AsyncHTTPTestServer(
+            default_response=HTTPResponse.text("static")
+        ) as server,
+        httpx.AsyncClient() as client,
+    ):
+        server.router = CustomRouter()
+        response = await client.get(server.url)
+
+    assert response.text == "custom router"
 
 
 @pytest.mark.asyncio
