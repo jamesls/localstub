@@ -675,6 +675,62 @@ class TestRawForwarding:
             await upstream.wait_closed()
 
     @pytest.mark.asyncio
+    async def test_closes_downstream_after_eof_delimited_response(
+        self,
+    ) -> None:
+        body = b"eof-delimited response"
+
+        async def eof_delimited_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n" + body
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(
+            eof_delimited_handler,
+            "127.0.0.1",
+            0,
+        )
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+
+        try:
+            forwarder = Forwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                reader, writer = await asyncio.open_connection(
+                    proxy.host,
+                    proxy.port,
+                )
+                try:
+                    request = (
+                        f"GET http://{upstream_host}:{upstream_port}/"
+                        " HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "\r\n"
+                    ).encode()
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await _read_http_response_bytes(
+                        reader,
+                        timeout=0.5,
+                    )
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert body in response
+
+    @pytest.mark.asyncio
     async def test_recorded_response_has_wire_bytes(self) -> None:
 
         async def chunked_handler(

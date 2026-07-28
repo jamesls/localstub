@@ -39,6 +39,7 @@ class ParsedResponse:
     headers: list[tuple[bytes, bytes]] = field(default_factory=list)
     body_parts: list[bytes] = field(default_factory=list)
     is_complete: bool = False
+    is_eof_delimited: bool = False
 
     @property
     def body(self) -> bytes:
@@ -186,6 +187,7 @@ class AsyncResponseParser:
             if self._protocol.result.http_version is not None:
                 if _is_close_delimited(self._protocol.result.headers):
                     self._protocol.result.is_complete = True
+                    self._protocol.result.is_eof_delimited = True
                 else:
                     return None, bytes(self._wire)
             else:
@@ -415,6 +417,7 @@ class AsyncMultiResponseParser:
             protocol.result.headers
         ):
             protocol.result.is_complete = True
+            protocol.result.is_eof_delimited = True
             return protocol.result, bytes(wire)
         return None, bytes(wire)
 
