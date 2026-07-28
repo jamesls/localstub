@@ -919,6 +919,69 @@ class AsyncHTTPTestServer:
             capture_ctx=capture_ctx,
         )
 
+    def _uses_static_response(self) -> bool:
+        return (
+            not self.responder_middlewares
+            and self._throttle_middleware is None
+            and self._response_sequence_middleware is None
+            and self._raw_forward_proxy_middleware is None
+            and self._httpx_forward_proxy_middleware is None
+            and not self.router.has_routes
+            and self._handler is None
+        )
+
+    async def _send_response(
+        self,
+        recording_writer: RecordingStreamWriter,
+        request: HTTPRequest,
+        response: ResponseSpec,
+    ) -> SendResult:
+        writer = recording_writer
+
+        if isinstance(response, ForwardProxyResponse):
+            wire_offset = writer.bytes_sent_len
+            result = await response.forwarder.forward_and_relay(
+                host=response.host,
+                port=response.port,
+                request_wire_bytes=response.request_wire_bytes,
+                client_writer=cast(Any, writer),
+                request_method=response.request_method,
+                upstream_tls=response.upstream_tls,
+            )
+            wire_bytes = writer.bytes_sent_since(wire_offset)
+            if result is None:
+                return await self._send_response(
+                    recording_writer,
+                    request,
+                    HTTPResponse.text("Bad Gateway", status=502),
+                )
+
+            recorded = result.to_recorded_response(
+                wire_raw_bytes=wire_bytes,
+            )
+            return SendResult(
+                recorded=recorded,
+                should_close=should_close_connection(
+                    request,
+                    response_headers=result.headers,
+                ),
+            )
+
+        if not isinstance(response, HTTPResponse):
+            raise TypeError(
+                f"Unhandled response spec: {type(response).__name__}"
+            )
+
+        wire_offset = writer.bytes_sent_len
+        should_close = await self._write_response(
+            writer,
+            response,
+            request,
+        )
+        wire_bytes = writer.bytes_sent_since(wire_offset)
+        recorded = self._build_recorded_response(response, wire_bytes)
+        return SendResult(recorded=recorded, should_close=should_close)
+
     def _build_sender(
         self,
         recording_writer: RecordingStreamWriter,
@@ -929,50 +992,11 @@ class AsyncHTTPTestServer:
             ctx: SenderContext,
             response: ResponseSpec,
         ) -> SendResult:
-            writer = recording_writer
-
-            if isinstance(response, ForwardProxyResponse):
-                wire_offset = writer.bytes_sent_len
-                result = await response.forwarder.forward_and_relay(
-                    host=response.host,
-                    port=response.port,
-                    request_wire_bytes=response.request_wire_bytes,
-                    client_writer=cast(Any, writer),
-                    request_method=response.request_method,
-                    upstream_tls=response.upstream_tls,
-                )
-                wire_bytes = writer.bytes_sent_since(wire_offset)
-                if result is None:
-                    return await terminal(
-                        ctx,
-                        HTTPResponse.text("Bad Gateway", status=502),
-                    )
-
-                recorded = result.to_recorded_response(
-                    wire_raw_bytes=wire_bytes,
-                )
-                return SendResult(
-                    recorded=recorded,
-                    should_close=should_close_connection(
-                        ctx.request,
-                        response_headers=result.headers,
-                    ),
-                )
-
-            if not isinstance(response, HTTPResponse):
-                raise TypeError(
-                    f"Unhandled response spec: {type(response).__name__}"
-                )
-
-            wire_offset = writer.bytes_sent_len
-            should_close = await self._write_response(
-                writer,
-                response,
+            return await self._send_response(
+                recording_writer,
                 ctx.request,
+                response,
             )
-            wire_bytes = writer.bytes_sent_since(wire_offset)
-            recorded = self._build_recorded_response(response, wire_bytes)
-            return SendResult(recorded=recorded, should_close=should_close)
 
         return compose_sender(middlewares, terminal)
 
@@ -1026,31 +1050,50 @@ class AsyncHTTPTestServer:
     ) -> bool:
         exchange_recorded = False
         sender_request = request
-
-        def capture_responder_ctx(ctx: ResponderContext) -> None:
-            nonlocal sender_request
-            sender_request = ctx.request
-
-        responder = self._build_responder(capture_ctx=capture_responder_ctx)
-        sender = self._build_sender(recording_writer)
-        connection = ConnectionMeta(client=request.client)
+        connection: ConnectionMeta | None = None
+        sender = (
+            self._build_sender(recording_writer)
+            if self.sender_middlewares
+            else None
+        )
         try:
-            responder_ctx = ResponderContext(
-                request=request,
-                connection=connection,
-                services=self._services,
-                state=state,
-                received_monotonic=received_monotonic,
-            )
-            response_spec = await responder(responder_ctx)
+            if self._uses_static_response():
+                response_spec: ResponseSpec = self._default_response
+            else:
 
-            sender_ctx = SenderContext(
-                request=sender_request,
-                connection=connection,
-                services=self._services,
-                state=state,
-            )
-            send_result = await sender(sender_ctx, response_spec)
+                def capture_responder_ctx(ctx: ResponderContext) -> None:
+                    nonlocal sender_request
+                    sender_request = ctx.request
+
+                responder = self._build_responder(
+                    capture_ctx=capture_responder_ctx
+                )
+                connection = ConnectionMeta(client=request.client)
+                responder_ctx = ResponderContext(
+                    request=request,
+                    connection=connection,
+                    services=self._services,
+                    state=state,
+                    received_monotonic=received_monotonic,
+                )
+                response_spec = await responder(responder_ctx)
+
+            if sender is not None:
+                if connection is None:
+                    connection = ConnectionMeta(client=request.client)
+                sender_ctx = SenderContext(
+                    request=sender_request,
+                    connection=connection,
+                    services=self._services,
+                    state=state,
+                )
+                send_result = await sender(sender_ctx, response_spec)
+            else:
+                send_result = await self._send_response(
+                    recording_writer,
+                    sender_request,
+                    response_spec,
+                )
 
             response_timestamp = self._timestamp_provider.now()
             self._record_exchange(
