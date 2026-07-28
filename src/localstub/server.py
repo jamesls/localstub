@@ -394,6 +394,7 @@ class AsyncHTTPTestServer:
         self._port = port
         self._server: asyncio.base_events.Server | None = None
         self._client_writers: set[asyncio.StreamWriter] = set()
+        self._client_tasks: set[asyncio.Task[None]] = set()
 
         self._handler: ResponderHandler | None = handler
         self._default_response: HTTPResponse = (
@@ -777,11 +778,20 @@ class AsyncHTTPTestServer:
             return
         self._server.close()
         # Let callbacks for connections accepted before close register their
-        # writers before taking the shutdown snapshot.
+        # writers and tasks before taking the shutdown snapshot.
         await asyncio.sleep(0)
         for writer in tuple(self._client_writers):
             writer.close()
+        current_task = asyncio.current_task()
+        client_tasks = tuple(
+            task for task in self._client_tasks if task is not current_task
+        )
+        for task in client_tasks:
+            task.cancel()
+        if client_tasks:
+            await asyncio.gather(*client_tasks, return_exceptions=True)
         await self._server.wait_closed()
+        self._client_tasks.clear()
         self._server = None
 
     async def __aenter__(self) -> Self:
@@ -1169,9 +1179,11 @@ class AsyncHTTPTestServer:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-    ) -> Awaitable[None]:
+    ) -> None:
         self._client_writers.add(writer)
-        return self._handle_client(reader, writer)
+        task = asyncio.create_task(self._handle_client(reader, writer))
+        self._client_tasks.add(task)
+        task.add_done_callback(self._client_tasks.discard)
 
     async def _read_request(
         self,

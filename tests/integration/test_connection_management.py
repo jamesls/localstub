@@ -61,6 +61,44 @@ async def test_aclose_closes_just_accepted_client_connection() -> None:
 
 
 @pytest.mark.asyncio
+async def test_aclose_stops_active_handler_before_returning() -> None:
+    handler_started = asyncio.Event()
+    handler_release = asyncio.Event()
+    handler_finished = asyncio.Event()
+    state_mutated = False
+
+    async def handler(_: ResponderContext) -> HTTPResponse:
+        nonlocal state_mutated
+        handler_started.set()
+        try:
+            await handler_release.wait()
+            state_mutated = True
+            return HTTPResponse.text("late response")
+        finally:
+            handler_finished.set()
+
+    server = AsyncHTTPTestServer(handler=handler)
+    await server.start()
+    _, writer = await asyncio.open_connection(server.host, server.port)
+
+    try:
+        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+        await asyncio.wait_for(handler_started.wait(), timeout=0.5)
+
+        await asyncio.wait_for(server.aclose(), timeout=0.5)
+        handler_release.set()
+        await asyncio.wait_for(handler_finished.wait(), timeout=0.5)
+
+        assert not state_mutated
+    finally:
+        handler_release.set()
+        writer.close()
+        await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+        await server.aclose()
+
+
+@pytest.mark.asyncio
 async def test_server_closes_when_response_has_connection_close():
     def handler(request):
         return HTTPResponse.text(
