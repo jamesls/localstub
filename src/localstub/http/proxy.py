@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from typing import cast
 
 import httpx
 
@@ -96,23 +95,26 @@ async def forward_via_httpx(
             headers[name] = value
 
     try:
-        upstream_response = await client.request(
+        async with client.stream(
             method=request.method or "GET",
             url=upstream_url,
             headers=headers,
             content=request.body_bytes or None,
-        )
+        ) as upstream_response:
+            response_body = bytearray()
+            async for chunk in upstream_response.aiter_raw():
+                response_body.extend(chunk)
+
+            response_headers: dict[str, str] = {}
+            for name, value in upstream_response.headers.items():
+                if name.lower() not in hop_by_hop:
+                    response_headers[name] = value
+
+            return HTTPResponse(
+                status=upstream_response.status_code,
+                headers=response_headers,
+                body=bytes(response_body),
+            )
     except httpx.RequestError as exc:
         LOG.warning("Upstream request failed: %s", exc)
         return HTTPResponse(status=502, body=f"Bad Gateway: {exc}".encode())
-
-    response_headers: dict[str, str] = {}
-    for name, value in upstream_response.headers.items():
-        if name.lower() not in hop_by_hop:
-            response_headers[name] = value
-
-    return HTTPResponse(
-        status=upstream_response.status_code,
-        headers=response_headers,
-        body=cast(bytes, upstream_response.content),
-    )
