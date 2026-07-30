@@ -149,6 +149,63 @@ async def test_http_proxy_mode_handles_expect_100_continue_client(
             await proxy_task
 
 
+@pytest.mark.asyncio
+async def test_http_proxy_mode_ignores_environment_proxy(
+    upstream_server: AsyncHTTPTestServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with AsyncHTTPTestServer() as environment_proxy:
+        environment_proxy.set_text_response(
+            "request used environment proxy",
+            status=418,
+        )
+        monkeypatch.setenv("HTTP_PROXY", environment_proxy.url)
+        monkeypatch.setenv("http_proxy", environment_proxy.url)
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+
+        with socket.socket() as available_port:
+            available_port.bind(("127.0.0.1", 0))
+            proxy_port = available_port.getsockname()[1]
+
+        args = parse_args([
+            "--mode",
+            "http-proxy",
+            "--port",
+            str(proxy_port),
+        ])
+        proxy_task = asyncio.create_task(run_http_proxy(args))
+
+        try:
+            reader, writer = await _connect_when_ready(
+                "127.0.0.1",
+                proxy_port,
+            )
+            try:
+                request = (
+                    f"GET {upstream_server.url} HTTP/1.1\r\n"
+                    f"Host: {upstream_server.host}:"
+                    f"{upstream_server.port}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode()
+                writer.write(request)
+                await writer.drain()
+
+                response = await _read_http_response_bytes(reader)
+
+                assert b"HTTP/1.1 200 OK" in response
+                assert b'"upstream": true' in response
+                await upstream_server.next_request(timeout=0.5)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        finally:
+            proxy_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await proxy_task
+
+
 class TestProxyRequestRecording:
     """Tests for recording proxy requests with absolute-form URIs."""
 

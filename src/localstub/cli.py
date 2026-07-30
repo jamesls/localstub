@@ -182,7 +182,7 @@ async def run_http_proxy(args: argparse.Namespace) -> None:
         mode_label = "record"
     else:
         # Forward mode: forward to upstream
-        forwarder = httpx.AsyncClient()
+        forwarder = httpx.AsyncClient(trust_env=False)
         mode_label = "forward"
 
     server = AsyncHTTPTestServer(
