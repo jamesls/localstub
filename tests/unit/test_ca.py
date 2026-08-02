@@ -153,6 +153,30 @@ class TestFromDirectory:
         context = reloaded_ca.issue_context("example.com")
         assert isinstance(context, ssl.SSLContext)
 
+    def test_raises_error_when_only_cert_exists(self, tmp_path: Path) -> None:
+        ca_dir = tmp_path / "cert_only"
+        ca_dir.mkdir()
+        cert_path = ca_dir / "ca.pem"
+        cert_path.write_text("surviving cert")
+
+        with pytest.raises(ValueError, match="ca.pem but no .key file"):
+            TLSProxyCA.from_directory(ca_dir)
+
+        assert cert_path.read_text() == "surviving cert"
+        assert not (ca_dir / "ca.key").exists()
+
+    def test_raises_error_when_only_key_exists(self, tmp_path: Path) -> None:
+        ca_dir = tmp_path / "key_only"
+        ca_dir.mkdir()
+        key_path = ca_dir / "ca.key"
+        key_path.write_text("surviving key")
+
+        with pytest.raises(ValueError, match="ca.key but no .pem file"):
+            TLSProxyCA.from_directory(ca_dir)
+
+        assert key_path.read_text() == "surviving key"
+        assert not (ca_dir / "ca.pem").exists()
+
     def test_raises_error_for_multiple_pem_files(self, tmp_path: Path) -> None:
         ca_dir = tmp_path / "multi_pem"
         ca_dir.mkdir()
