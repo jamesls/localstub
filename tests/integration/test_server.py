@@ -1361,6 +1361,28 @@ async def test_next_request_with_timeout_expires():
             await server.next_request(timeout=0.1)
 
 
+def test_next_exchange_nowait_returns_none_when_no_exchange():
+    server = AsyncHTTPTestServer()
+    assert server.next_exchange_nowait() is None
+
+
+@pytest.mark.asyncio
+async def test_next_exchange_nowait_returns_queued_exchange(server, client):
+    server.set_json_response({"ok": True})
+
+    response = await client.get(f"{server.url}queued")
+    assert response.status_code == 200
+
+    # The exchange is queued before the response is queued, so once
+    # next_response() returns the exchange is guaranteed to be available.
+    await server.next_response(timeout=1.0)
+
+    exchange = server.next_exchange_nowait()
+    assert exchange is not None
+    assert exchange.request.path == "/queued"
+    assert server.next_exchange_nowait() is None
+
+
 @pytest.mark.asyncio
 async def test_server_handles_exception_during_request_processing():
     """Test server handles exceptions during request processing."""

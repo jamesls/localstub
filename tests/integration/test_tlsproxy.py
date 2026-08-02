@@ -157,6 +157,51 @@ async def test_next_request_and_response_timeout_raise():
         await proxy.next_exchange(timeout=0.01)
 
 
+def test_next_exchange_nowait_returns_none_when_no_exchange():
+    proxy = AsyncTLSInterceptProxy()
+    assert proxy.next_exchange_nowait() is None
+
+
+@pytest.mark.asyncio
+async def test_next_exchange_nowait_returns_queued_exchange():
+    # Acquire an unused local port, then close the server so that connecting
+    # to the port will be refused.
+    tmp = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    unused_port = tmp.sockets[0].getsockname()[1]
+    tmp.close()
+    await tmp.wait_closed()
+
+    async with AsyncTLSInterceptProxy(
+        server=None,
+        default_mode="forward",
+        verify_upstream=False,
+        upstream_tls=False,
+    ) as proxy:
+        proxy_host, proxy_port = proxy.address
+        verify_ctx = ssl.create_default_context(
+            cafile=str(proxy.ca.ca_pem_path())
+        )
+
+        async with httpx.AsyncClient(
+            proxy=f"http://{proxy_host}:{proxy_port}",
+            verify=verify_ctx,
+            http2=False,
+        ) as client:
+            response = await client.get(
+                f"https://127.0.0.1:{unused_port}/queued",
+                follow_redirects=False,
+            )
+
+    # The exchange is recorded before the 502 is written to the client,
+    # so it is guaranteed to be queued once the response is received.
+    assert response.status_code == 502
+
+    exchange = proxy.next_exchange_nowait()
+    assert exchange is not None
+    assert exchange.request.path == "/queued"
+    assert proxy.next_exchange_nowait() is None
+
+
 @pytest.mark.asyncio
 async def test_start_idempotent_and_aclose_noop():
     proxy = AsyncTLSInterceptProxy()

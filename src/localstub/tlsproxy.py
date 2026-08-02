@@ -197,6 +197,12 @@ class AsyncTLSInterceptProxy:
             self._recorded_exchanges.get(), timeout=timeout
         )
 
+    def next_exchange_nowait(self) -> RecordedExchange | None:
+        try:
+            return self._recorded_exchanges.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
     async def start(self) -> None:
         if self._listener is not None:
             return

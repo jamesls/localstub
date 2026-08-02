@@ -835,6 +835,13 @@ class AsyncHTTPTestServer:
             self._exchange_queue.get(), timeout=timeout
         )
 
+    def next_exchange_nowait(self) -> RecordedExchange | None:
+        """Return the next completed exchange, or None if none is queued."""
+        try:
+            return self._exchange_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
     def _record_exchange(
         self,
         *,

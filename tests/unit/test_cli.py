@@ -134,6 +134,9 @@ class TestProcessTrafficNoResponse:
                 await asyncio.sleep(0)
                 raise TimeoutError()
 
+            def next_exchange_nowait(self) -> RecordedExchange | None:
+                return None
+
         proxy = _NoResponseProxy()
         out = io.StringIO()
         shutdown = asyncio.Event()
@@ -162,6 +165,59 @@ class TestProcessTrafficNoResponse:
             base64.b64decode(record["request"]["raw_wire_bytes"])
             == b"GET /no-upstream HTTP/1.1\r\n\r\n"
         )
+
+
+class TestProcessTrafficShutdownDrain:
+    @pytest.mark.asyncio
+    async def test_writes_queued_exchanges_after_shutdown(self) -> None:
+        headers = Headers.from_items([("Host", "example.com")])
+        exchanges = [
+            RecordedExchange(
+                request=HTTPRequest(
+                    method="GET",
+                    path=f"/queued-{i}",
+                    http_version="1.1",
+                    headers=headers,
+                    body="",
+                    wire_raw_bytes=(
+                        f"GET /queued-{i} HTTP/1.1\r\n\r\n".encode()
+                    ),
+                    client=("127.0.0.1", 55555),
+                ),
+                response=None,
+                request_timestamp=datetime(2000, 1, 1, tzinfo=UTC),
+                response_timestamp=None,
+            )
+            for i in range(2)
+        ]
+
+        class _QueuedProxy:
+            def __init__(self, queued: list[RecordedExchange]) -> None:
+                self._queued = queued
+
+            async def next_exchange(
+                self, timeout: float | None = None
+            ) -> RecordedExchange:
+                await asyncio.sleep(0)
+                raise TimeoutError()
+
+            def next_exchange_nowait(self) -> RecordedExchange | None:
+                if self._queued:
+                    return self._queued.pop(0)
+                return None
+
+        out = io.StringIO()
+        shutdown = asyncio.Event()
+        shutdown.set()
+
+        await asyncio.wait_for(
+            process_traffic(_QueuedProxy(exchanges), out, shutdown),
+            timeout=1.0,
+        )
+
+        lines = [line for line in out.getvalue().splitlines() if line.strip()]
+        paths = [json.loads(line)["request"]["path"] for line in lines]
+        assert paths == ["/queued-0", "/queued-1"]
 
 
 class TestProcessTrafficTimestamps:
@@ -208,6 +264,9 @@ class TestProcessTrafficTimestamps:
                     return exchange
                 await asyncio.sleep(0)
                 raise TimeoutError()
+
+            def next_exchange_nowait(self) -> RecordedExchange | None:
+                return None
 
         proxy = _OneExchangeProxy()
         out = io.StringIO()

@@ -300,6 +300,36 @@ class _TrafficSource(Protocol):
         self, timeout: float | None = None
     ) -> RecordedExchange: ...
 
+    def next_exchange_nowait(self) -> RecordedExchange | None: ...
+
+
+async def _emit_exchange(
+    exchange: RecordedExchange,
+    output_file: TrafficOutput | None,
+) -> None:
+    """Print an exchange to the console and persist it if configured."""
+    request = exchange.request
+    response = exchange.response
+
+    _print_http_block(
+        request.wire_raw_bytes or b"",
+        "REQUEST",
+        "green",
+    )
+
+    if response is not None:
+        _print_http_block(
+            response.wire_raw_bytes,
+            "RESPONSE",
+            "blue",
+            status=response.status,
+        )
+
+    if output_file is not None:
+        record = json.dumps(exchange_to_json_obj(exchange)) + "\n"
+        await maybe_await(output_file.write(record))
+        await maybe_await(output_file.flush())
+
 
 async def _process_traffic(
     source: _TrafficSource,
@@ -316,28 +346,12 @@ async def _process_traffic(
             exchange = await source.next_exchange(timeout=0.1)
         except TimeoutError:
             continue
+        await _emit_exchange(exchange, output_file)
 
-        request = exchange.request
-        response = exchange.response
-
-        _print_http_block(
-            request.wire_raw_bytes or b"",
-            "REQUEST",
-            "green",
-        )
-
-        if response is not None:
-            _print_http_block(
-                response.wire_raw_bytes,
-                "RESPONSE",
-                "blue",
-                status=response.status,
-            )
-
-        if output_file is not None:
-            record = json.dumps(exchange_to_json_obj(exchange)) + "\n"
-            await maybe_await(output_file.write(record))
-            await maybe_await(output_file.flush())
+    # Drain exchanges that completed before shutdown so they still
+    # reach the console and JSONL output.
+    while (exchange := source.next_exchange_nowait()) is not None:
+        await _emit_exchange(exchange, output_file)
 
 
 async def process_traffic(
