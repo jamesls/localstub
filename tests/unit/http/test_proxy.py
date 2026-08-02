@@ -127,6 +127,41 @@ async def test_httpx_proxy_strips_dynamic_request_headers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_httpx_proxy_regenerates_content_length_after_body_rewrite() -> (
+    None
+):
+    received_request: httpx.Request | None = None
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        nonlocal received_request
+        received_request = request
+        return httpx.Response(200, stream=AsyncResponseStream())
+
+    rewritten_body = b"rewritten body"
+    request = HTTPRequest(
+        method="POST",
+        path="http://example.com/path",
+        http_version="1.1",
+        headers=Headers.from_items([
+            ("Host", "example.com"),
+            ("Content-Length", "4"),
+        ]),
+        body_bytes=rewritten_body,
+    )
+    transport = httpx.MockTransport(handle_request)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await forward_via_httpx(client, request)
+
+    assert response.status == 200
+    assert received_request is not None
+    assert received_request.content == rewritten_body
+    assert received_request.headers["Content-Length"] == str(
+        len(rewritten_body)
+    )
+
+
+@pytest.mark.asyncio
 async def test_httpx_proxy_strips_dynamic_response_headers() -> None:
     def handle_request(_: httpx.Request) -> httpx.Response:
         return httpx.Response(
