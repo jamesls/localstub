@@ -128,12 +128,17 @@ async def forward_via_httpx(
 
     upstream_url = request.path or "/"
 
-    request_hop_by_hop = _HOP_BY_HOP_HEADERS | connection_tokens_from_headers(
-        request.headers
+    # The upstream body is reserialized from ``request.body_bytes``, which
+    # middleware may have rewritten, so the original Content-Length no
+    # longer describes it. Drop it and let httpx regenerate the framing.
+    drop_request_headers = (
+        _HOP_BY_HOP_HEADERS
+        | connection_tokens_from_headers(request.headers)
+        | {"content-length"}
     )
     headers: dict[str, str] = {}
     for name, value in request.headers.items():
-        if name.lower() not in request_hop_by_hop:
+        if name.lower() not in drop_request_headers:
             headers[name] = value
 
     try:
