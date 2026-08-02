@@ -156,9 +156,12 @@ class TLSProxyCA:
         """Load or create a CA from a directory.
 
         If the directory contains a .pem and .key file, loads the existing CA.
-        Otherwise, generates a new CA and saves to ca.pem, ca.key, ca.p12.
+        If the directory contains neither, generates a new CA and saves to
+        ca.pem, ca.key, ca.p12.
 
-        Raises ValueError if multiple .pem or .key files are found.
+        Raises ValueError if multiple .pem or .key files are found, or if
+        only one of the .pem/.key pair exists (generating a new CA could
+        overwrite the surviving file).
         """
         ca_dir.mkdir(parents=True, exist_ok=True)
 
@@ -176,6 +179,15 @@ class TLSProxyCA:
                 private_key_bytes=key_files[0].read_bytes(),
             )
             return cls(ca=ca, pem_path=pem_files[0])
+
+        if pem_files or key_files:
+            found = (pem_files or key_files)[0]
+            missing = ".key" if pem_files else ".pem"
+            raise ValueError(
+                f"Refusing to generate a new CA: {ca_dir} contains "
+                f"{found.name} but no {missing} file. Restore the missing "
+                f"file or remove {found.name} to generate a new CA."
+            )
 
         cert_path = ca_dir / "ca.pem"
         key_path = ca_dir / "ca.key"
