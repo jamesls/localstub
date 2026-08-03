@@ -73,13 +73,29 @@ from localstub.throttle import (
 LOG = logging.getLogger(__name__)
 ThrottleResponse = HTTPResponse | ThrottleResponseFunc
 
-# Event-loop turns aclose() yields before closing the listening socket, so
-# already-accepted connections reach _client_connected and get torn down.
-# Turning an accepted socket into that callback took up to 5 turns when
-# measured on CPython 3.12 (worst case: a connection made by a blocking
-# connect()); this leaves headroom above that. These are bare sleep(0) yields,
-# so unused turns cost nothing beyond a few trips through the loop.
+# Event-loop turns aclose() yields after pausing accepts, so already-accepted
+# connections reach _client_connected and get torn down. Turning an accepted
+# socket into that callback took up to 5 turns when measured on CPython 3.12
+# (worst case: a connection made by a blocking connect()); this leaves
+# headroom above that. These are bare sleep(0) yields, so unused turns cost
+# nothing beyond a few trips through the loop.
 _SHUTDOWN_DRAIN_TURNS = 8
+
+
+def _pause_server_accepts(server: asyncio.Server) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        for listener in server.sockets:
+            loop.remove_reader(listener.fileno())
+    except NotImplementedError:
+        # Proactor loops attach accepted transports in the accept callback, so
+        # they have no selector task that can be stranded by Server.close().
+        server.close()
+
+
+async def _drain_pending_accepts() -> None:
+    for _ in range(_SHUTDOWN_DRAIN_TURNS):
+        await asyncio.sleep(0)
 
 
 def _default_throttle_key(_: HTTPRequest) -> str:
@@ -784,35 +800,45 @@ class AsyncHTTPTestServer:
         self.host, self.port = sockname[0], sockname[1]
 
     async def aclose(self) -> None:
-        if self._server is None:
+        server = self._server
+        if server is None:
             return
         self._closing = True
-        # Let in-flight accepts reach _client_connected before closing the
-        # listener. A client's connect() returning only means the kernel
-        # completed the handshake; asyncio then accepts the socket and spends
-        # several loop turns building the transport before invoking our
-        # callback. Closing the listener partway through that pipeline strands
-        # the half-built connection: it is already off the kernel accept queue,
-        # so closing the listener will not reset it, yet no writer exists for
-        # the snapshot below to close, so the client waits forever for a FIN.
-        # Yielding lets the callback run, where the _closing guard closes it.
-        for _ in range(_SHUTDOWN_DRAIN_TURNS):
-            await asyncio.sleep(0)
-        self._server.close()
-        for writer in tuple(self._client_writers):
-            writer.close()
-        current_task = asyncio.current_task()
-        client_tasks = tuple(
-            task for task in self._client_tasks if task is not current_task
-        )
-        for task in client_tasks:
-            task.cancel()
-        if client_tasks:
-            await asyncio.gather(*client_tasks, return_exceptions=True)
-        await self._server.wait_closed()
-        self._client_tasks.clear()
-        self._server = None
-        self._closing = False
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            # Stop selector loops from accepting more sockets without closing
+            # the asyncio.Server yet. Closing it while an already-accepted
+            # socket is still attaching its transport can strand the peer.
+            _pause_server_accepts(server)
+            drain_task = asyncio.create_task(_drain_pending_accepts())
+            try:
+                await asyncio.shield(drain_task)
+            except asyncio.CancelledError as exc:
+                # Finish the critical drain before honoring cancellation.
+                await drain_task
+                cancelled = exc
+
+            server.close()
+            for writer in tuple(self._client_writers):
+                writer.close()
+            current_task = asyncio.current_task()
+            client_tasks = tuple(
+                task for task in self._client_tasks if task is not current_task
+            )
+            for task in client_tasks:
+                task.cancel()
+            if client_tasks:
+                await asyncio.gather(*client_tasks, return_exceptions=True)
+            await server.wait_closed()
+            self._client_tasks.clear()
+        finally:
+            server.close()
+            if self._server is server:
+                self._server = None
+            self._closing = False
+
+        if cancelled is not None:
+            raise cancelled
 
     async def __aenter__(self) -> Self:
         await self.start()
