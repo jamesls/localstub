@@ -73,6 +73,14 @@ from localstub.throttle import (
 LOG = logging.getLogger(__name__)
 ThrottleResponse = HTTPResponse | ThrottleResponseFunc
 
+# Event-loop turns aclose() yields before closing the listening socket, so
+# already-accepted connections reach _client_connected and get torn down.
+# Turning an accepted socket into that callback took up to 5 turns when
+# measured on CPython 3.12 (worst case: a connection made by a blocking
+# connect()); this leaves headroom above that. These are bare sleep(0) yields,
+# so unused turns cost nothing beyond a few trips through the loop.
+_SHUTDOWN_DRAIN_TURNS = 8
+
 
 def _default_throttle_key(_: HTTPRequest) -> str:
     return "global"
@@ -393,6 +401,7 @@ class AsyncHTTPTestServer:
         self._host = host
         self._port = port
         self._server: asyncio.base_events.Server | None = None
+        self._closing = False
         self._client_writers: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
 
@@ -764,6 +773,7 @@ class AsyncHTTPTestServer:
         if self._server is not None:
             return
 
+        self._closing = False
         self._server = await asyncio.start_server(
             self._client_connected,
             self._host,
@@ -776,10 +786,19 @@ class AsyncHTTPTestServer:
     async def aclose(self) -> None:
         if self._server is None:
             return
+        self._closing = True
+        # Let in-flight accepts reach _client_connected before closing the
+        # listener. A client's connect() returning only means the kernel
+        # completed the handshake; asyncio then accepts the socket and spends
+        # several loop turns building the transport before invoking our
+        # callback. Closing the listener partway through that pipeline strands
+        # the half-built connection: it is already off the kernel accept queue,
+        # so closing the listener will not reset it, yet no writer exists for
+        # the snapshot below to close, so the client waits forever for a FIN.
+        # Yielding lets the callback run, where the _closing guard closes it.
+        for _ in range(_SHUTDOWN_DRAIN_TURNS):
+            await asyncio.sleep(0)
         self._server.close()
-        # Let callbacks for connections accepted before close register their
-        # writers and tasks before taking the shutdown snapshot.
-        await asyncio.sleep(0)
         for writer in tuple(self._client_writers):
             writer.close()
         current_task = asyncio.current_task()
@@ -793,6 +812,7 @@ class AsyncHTTPTestServer:
         await self._server.wait_closed()
         self._client_tasks.clear()
         self._server = None
+        self._closing = False
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -1187,6 +1207,12 @@ class AsyncHTTPTestServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        if self._closing:
+            # Accepted so late in shutdown that aclose() already snapshotted
+            # the writers to close. Close immediately so the client still gets
+            # a FIN instead of waiting on a connection nobody owns.
+            writer.close()
+            return
         self._client_writers.add(writer)
         task = asyncio.create_task(self._handle_client(reader, writer))
         self._client_tasks.add(task)
