@@ -1,4 +1,5 @@
 import asyncio
+import socket
 
 import pytest
 
@@ -57,6 +58,47 @@ async def test_aclose_closes_just_accepted_client_connection() -> None:
     finally:
         writer.close()
         await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+        await server.aclose()
+
+
+@pytest.mark.parametrize("accept_progress_turns", [1, 2, 3, 4])
+@pytest.mark.asyncio
+async def test_aclose_closes_half_accepted_connection(
+    accept_progress_turns: int,
+) -> None:
+    # Turning an accepted socket into a _client_connected call takes asyncio
+    # several event-loop turns. A connection caught midway through that
+    # pipeline is the one that hangs: it is already off the kernel accept
+    # queue, so closing the listener will not reset it, yet no writer is
+    # registered yet for aclose() to close. A blocking connect() completes the
+    # handshake without yielding, so the number of turns taken afterwards
+    # selects how far the accept has progressed -- covering the whole pipeline
+    # rather than betting on one scheduling outcome.
+    server = AsyncHTTPTestServer()
+    await server.start()
+    assert server.host is not None
+    assert server.port is not None
+
+    sock = socket.create_connection((server.host, server.port))
+    sock.setblocking(False)
+    try:
+        for _ in range(accept_progress_turns):
+            await asyncio.sleep(0)
+
+        async with asyncio.timeout(1.0):
+            await server.aclose()
+
+        loop = asyncio.get_running_loop()
+        # A read must complete rather than block forever. EOF means a clean
+        # teardown; a reset means the kernel discarded a still-queued
+        # connection. Either proves the connection was not left dangling.
+        try:
+            data = await asyncio.wait_for(loop.sock_recv(sock, 1), timeout=0.5)
+            assert data == b""
+        except ConnectionResetError:
+            pass
+    finally:
+        sock.close()
         await server.aclose()
 
 
