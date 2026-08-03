@@ -103,6 +103,56 @@ async def test_aclose_closes_half_accepted_connection(
 
 
 @pytest.mark.asyncio
+async def test_aclose_closes_connection_started_during_shutdown() -> None:
+    server = AsyncHTTPTestServer()
+    await server.start()
+    assert server.host is not None
+    assert server.port is not None
+
+    close_task = asyncio.create_task(server.aclose())
+    await asyncio.sleep(0)
+    sock = socket.create_connection((server.host, server.port))
+    sock.setblocking(False)
+
+    try:
+        await asyncio.wait_for(close_task, timeout=1.0)
+        loop = asyncio.get_running_loop()
+        try:
+            data = await asyncio.wait_for(loop.sock_recv(sock, 1), timeout=0.5)
+            assert data == b""
+        except ConnectionResetError:
+            pass
+    finally:
+        sock.close()
+        await server.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_aclose_finishes_shutdown_and_allows_restart() -> None:
+    server = AsyncHTTPTestServer()
+    await server.start()
+
+    close_task = asyncio.create_task(server.aclose())
+    await asyncio.sleep(0)
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    await server.start()
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    try:
+        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+        response = await _read_http_response(reader)
+        assert response.startswith(b"HTTP/1.1 200 OK\r\n")
+    finally:
+        writer.close()
+        await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+        await server.aclose()
+
+
+@pytest.mark.asyncio
 async def test_aclose_stops_active_handler_before_returning() -> None:
     handler_started = asyncio.Event()
     handler_release = asyncio.Event()
