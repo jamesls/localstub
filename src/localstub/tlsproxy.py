@@ -29,6 +29,10 @@ from localstub.http.request import (
 from localstub.http.response import (
     RecordedResponse,
 )
+from localstub.recording import (
+    DEFAULT_RECORDING_BUFFER_SIZE,
+    BoundedRecordQueue,
+)
 from localstub.server import AsyncHTTPTestServer
 
 LOG = logging.getLogger(__name__)
@@ -124,7 +128,22 @@ class AsyncTLSInterceptProxy:
         upstream_tls: bool = True,
         response_transformer: ResponseTransformer | None = None,
         forwarder: Forwarder | None = None,
+        recording_buffer_size: int | None = DEFAULT_RECORDING_BUFFER_SIZE,
     ) -> None:
+        # Recording queues for forwarded traffic.  Bounded so memory stays
+        # flat when a consumer never drains a stream (e.g. the CLI only
+        # reads exchanges).  Created first so an invalid buffer size fails
+        # before the CA default resolution generates keys and writes files.
+        self._recorded_requests: BoundedRecordQueue[HTTPRequest] = (
+            BoundedRecordQueue(recording_buffer_size, name="requests")
+        )
+        self._recorded_responses: BoundedRecordQueue[RecordedResponse] = (
+            BoundedRecordQueue(recording_buffer_size, name="responses")
+        )
+        self._recorded_exchanges: BoundedRecordQueue[RecordedExchange] = (
+            BoundedRecordQueue(recording_buffer_size, name="exchanges")
+        )
+
         self._listen_host = listen_host
         self._listen_port = listen_port
         self._server = server
@@ -146,15 +165,6 @@ class AsyncTLSInterceptProxy:
         self._host: str | None = None
         self._port: int | None = None
         self._client_tasks: set[asyncio.Task[None]] = set()
-
-        # Recording queues for forwarded traffic
-        self._recorded_requests: asyncio.Queue[HTTPRequest] = asyncio.Queue()
-        self._recorded_responses: asyncio.Queue[RecordedResponse] = (
-            asyncio.Queue()
-        )
-        self._recorded_exchanges: asyncio.Queue[RecordedExchange] = (
-            asyncio.Queue()
-        )
 
     @property
     def address(self) -> tuple[str, int]:
@@ -198,10 +208,22 @@ class AsyncTLSInterceptProxy:
         )
 
     def next_exchange_nowait(self) -> RecordedExchange | None:
-        try:
-            return self._recorded_exchanges.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
+        return self._recorded_exchanges.get_nowait()
+
+    @property
+    def dropped_requests(self) -> int:
+        """Requests evicted unread from the next_request() buffer."""
+        return self._recorded_requests.dropped
+
+    @property
+    def dropped_responses(self) -> int:
+        """Responses evicted unread from the next_response() buffer."""
+        return self._recorded_responses.dropped
+
+    @property
+    def dropped_exchanges(self) -> int:
+        """Exchanges evicted unread from the next_exchange() buffer."""
+        return self._recorded_exchanges.dropped
 
     async def start(self) -> None:
         if self._listener is not None:
@@ -473,7 +495,7 @@ class AsyncTLSInterceptProxy:
             # Connection failed - record what we have without blocking on the
             # body (e.g. Expect: 100-continue clients may not send it yet).
             wire_bytes = header_wire + bytes(remaining)
-            request, request_timestamp = await self._record_request(
+            request, request_timestamp = self._record_request(
                 parsed, wire_bytes, client_writer
             )
             await self._record_failure_and_close(
@@ -502,7 +524,7 @@ class AsyncTLSInterceptProxy:
                     client_id=client_id,
                 )
 
-                request, request_timestamp = await self._record_request(
+                request, request_timestamp = self._record_request(
                     forwarded.parsed_request,
                     forwarded.request_wire_bytes,
                     client_writer,
@@ -533,7 +555,7 @@ class AsyncTLSInterceptProxy:
                     return
 
                 response = forwarded.response.to_recorded_response()
-                await self._record_response(
+                self._record_response(
                     request,
                     request_timestamp,
                     response,
@@ -558,7 +580,7 @@ class AsyncTLSInterceptProxy:
             if body_wire:
                 _wire_log(f"lstub <-- {client_id}", body_wire)
 
-            request, request_timestamp = await self._record_request(
+            request, request_timestamp = self._record_request(
                 final_parsed, full_wire, client_writer
             )
             _wire_log(f"{upstream_id} <-- lstub", full_wire)
@@ -587,7 +609,7 @@ class AsyncTLSInterceptProxy:
                 return
 
             response = final_response.to_recorded_response()
-            await self._record_response(
+            self._record_response(
                 request,
                 request_timestamp,
                 response,
@@ -598,7 +620,7 @@ class AsyncTLSInterceptProxy:
         finally:
             upstream_writer.close()
 
-    async def _record_request(
+    def _record_request(
         self,
         parsed: ParsedRequest,
         wire_bytes: bytes,
@@ -607,10 +629,10 @@ class AsyncTLSInterceptProxy:
         """Build and record an HTTPRequest."""
         request_timestamp = datetime.now(UTC)
         request = HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
-        await self._recorded_requests.put(request)
+        self._recorded_requests.put(request)
         return request, request_timestamp
 
-    async def _record_exchange(
+    def _record_exchange(
         self,
         request: HTTPRequest,
         request_timestamp: datetime,
@@ -619,7 +641,7 @@ class AsyncTLSInterceptProxy:
         response_timestamp = (
             datetime.now(UTC) if response is not None else None
         )
-        await self._recorded_exchanges.put(
+        self._recorded_exchanges.put(
             RecordedExchange(
                 request=request,
                 response=response,
@@ -628,14 +650,14 @@ class AsyncTLSInterceptProxy:
             )
         )
 
-    async def _record_response(
+    def _record_response(
         self,
         request: HTTPRequest,
         request_timestamp: datetime,
         response: RecordedResponse,
     ) -> None:
-        await self._recorded_responses.put(response)
-        await self._record_exchange(request, request_timestamp, response)
+        self._recorded_responses.put(response)
+        self._record_exchange(request, request_timestamp, response)
 
     async def _record_failure_and_close(
         self,
@@ -645,7 +667,7 @@ class AsyncTLSInterceptProxy:
         status_line: bytes,
         client_id: str,
     ) -> None:
-        await self._record_exchange(request, request_timestamp, None)
+        self._record_exchange(request, request_timestamp, None)
         await self._send_and_close(writer, status_line, client_id)
 
     async def _send_and_close(

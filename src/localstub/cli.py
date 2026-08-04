@@ -302,6 +302,9 @@ class _TrafficSource(Protocol):
 
     def next_exchange_nowait(self) -> RecordedExchange | None: ...
 
+    @property
+    def dropped_exchanges(self) -> int: ...
+
 
 async def _emit_exchange(
     exchange: RecordedExchange,
@@ -352,6 +355,12 @@ async def _process_traffic(
     # reach the console and JSONL output.
     while (exchange := source.next_exchange_nowait()) is not None:
         await _emit_exchange(exchange, output_file)
+
+    if source.dropped_exchanges:
+        console.print(
+            f"[yellow]{source.dropped_exchanges} exchange(s) were "
+            "dropped before they could be recorded[/]"
+        )
 
 
 async def process_traffic(

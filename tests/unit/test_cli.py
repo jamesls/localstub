@@ -122,6 +122,8 @@ class TestProcessTrafficNoResponse:
         )
 
         class _NoResponseProxy:
+            dropped_exchanges: int = 0
+
             def __init__(self) -> None:
                 self._given = False
 
@@ -192,6 +194,8 @@ class TestProcessTrafficShutdownDrain:
         ]
 
         class _QueuedProxy:
+            dropped_exchanges: int = 0
+
             def __init__(self, queued: list[RecordedExchange]) -> None:
                 self._queued = queued
 
@@ -218,6 +222,35 @@ class TestProcessTrafficShutdownDrain:
         lines = [line for line in out.getvalue().splitlines() if line.strip()]
         paths = [json.loads(line)["request"]["path"] for line in lines]
         assert paths == ["/queued-0", "/queued-1"]
+
+
+class TestProcessTrafficDroppedExchanges:
+    @pytest.mark.asyncio
+    async def test_prints_note_when_exchanges_were_dropped(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class _DroppingProxy:
+            dropped_exchanges: int = 3
+
+            async def next_exchange(
+                self, timeout: float | None = None
+            ) -> RecordedExchange:
+                await asyncio.sleep(0)
+                raise TimeoutError()
+
+            def next_exchange_nowait(self) -> RecordedExchange | None:
+                return None
+
+        shutdown = asyncio.Event()
+        shutdown.set()
+
+        await asyncio.wait_for(
+            process_traffic(_DroppingProxy(), None, shutdown),
+            timeout=1.0,
+        )
+
+        captured = capsys.readouterr()
+        assert "3 exchange(s) were dropped" in captured.out
 
 
 class TestProcessTrafficTimestamps:
@@ -253,6 +286,8 @@ class TestProcessTrafficTimestamps:
         )
 
         class _OneExchangeProxy:
+            dropped_exchanges: int = 0
+
             def __init__(self) -> None:
                 self._given = False
 

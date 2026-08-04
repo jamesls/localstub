@@ -61,6 +61,11 @@ from localstub.middleware.builtins import (
     ThrottleResponseFunc,
     default_throttle_response,
 )
+from localstub.recording import (
+    DEFAULT_RECORDING_BUFFER_SIZE,
+    BoundedRecordQueue,
+    trim_history,
+)
 from localstub.router import ResponderHandler, Router
 from localstub.throttle import (
     Clock,
@@ -413,6 +418,7 @@ class AsyncHTTPTestServer:
         raw_forwarder: Forwarder | None = None,
         clock: Clock | None = None,
         timestamp_provider: TimestampProvider | None = None,
+        recording_buffer_size: int | None = DEFAULT_RECORDING_BUFFER_SIZE,
     ) -> None:
         self._host = host
         self._port = port
@@ -468,17 +474,28 @@ class AsyncHTTPTestServer:
 
         self._request_timestamps: dict[int, float] = {}
 
+        # Recorded history and queues are bounded so memory stays flat
+        # when the server runs long enough that traffic outpaces whatever
+        # is consuming the records (e.g. the CLI's forward-proxy mode).
+        self._recording_buffer_size = recording_buffer_size
+
         self.last_request: HTTPRequest | None = None
         self.requests: list[HTTPRequest] = []
-        self._request_queue: asyncio.Queue[HTTPRequest] = asyncio.Queue()
-        self._response_queue: asyncio.Queue[RecordedResponse] = asyncio.Queue()
+        self._request_queue: BoundedRecordQueue[HTTPRequest] = (
+            BoundedRecordQueue(recording_buffer_size, name="requests")
+        )
+        self._response_queue: BoundedRecordQueue[RecordedResponse] = (
+            BoundedRecordQueue(recording_buffer_size, name="responses")
+        )
 
         self.last_response: RecordedResponse | None = None
         self.responses: list[RecordedResponse] = []
 
         self.last_exchange: RecordedExchange | None = None
         self.exchanges: list[RecordedExchange] = []
-        self._exchange_queue: asyncio.Queue[RecordedExchange] = asyncio.Queue()
+        self._exchange_queue: BoundedRecordQueue[RecordedExchange] = (
+            BoundedRecordQueue(recording_buffer_size, name="exchanges")
+        )
 
         # Connection-level raw bytes tracking (keyed by client address)
         self._connection_raw_bytes_received: dict[
@@ -678,7 +695,9 @@ class AsyncHTTPTestServer:
             Monotonic timestamp when the request was received.
 
         Raises:
-            ValueError: If the request is not found.
+            ValueError: If the request is not found.  Timestamps are only
+                retained for requests still in the ``requests`` history,
+                which is bounded by ``recording_buffer_size``.
         """
         try:
             return self._request_timestamps[id(request)]
@@ -713,13 +732,19 @@ class AsyncHTTPTestServer:
         self.last_request = None
         self.requests = []
         self._request_timestamps = {}
-        self._request_queue = asyncio.Queue()
-        self._response_queue = asyncio.Queue()
+        self._request_queue = BoundedRecordQueue(
+            self._recording_buffer_size, name="requests"
+        )
+        self._response_queue = BoundedRecordQueue(
+            self._recording_buffer_size, name="responses"
+        )
         self.last_response = None
         self.responses = []
         self.last_exchange = None
         self.exchanges = []
-        self._exchange_queue = asyncio.Queue()
+        self._exchange_queue = BoundedRecordQueue(
+            self._recording_buffer_size, name="exchanges"
+        )
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
         if self._response_sequence_middleware is not None:
@@ -883,10 +908,22 @@ class AsyncHTTPTestServer:
 
     def next_exchange_nowait(self) -> RecordedExchange | None:
         """Return the next completed exchange, or None if none is queued."""
-        try:
-            return self._exchange_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
+        return self._exchange_queue.get_nowait()
+
+    @property
+    def dropped_requests(self) -> int:
+        """Requests evicted unread from the next_request() buffer."""
+        return self._request_queue.dropped
+
+    @property
+    def dropped_responses(self) -> int:
+        """Responses evicted unread from the next_response() buffer."""
+        return self._response_queue.dropped
+
+    @property
+    def dropped_exchanges(self) -> int:
+        """Exchanges evicted unread from the next_exchange() buffer."""
+        return self._exchange_queue.dropped
 
     def _record_exchange(
         self,
@@ -903,10 +940,12 @@ class AsyncHTTPTestServer:
             response_timestamp=response_timestamp,
         )
         self.exchanges.append(exchange)
+        trim_history(self.exchanges, self._recording_buffer_size)
         self.last_exchange = exchange
-        self._exchange_queue.put_nowait(exchange)
+        self._exchange_queue.put(exchange)
         if response is not None:
             self.responses.append(response)
+            trim_history(self.responses, self._recording_buffer_size)
             self.last_response = response
 
     async def handle_http_connection(
@@ -1100,9 +1139,14 @@ class AsyncHTTPTestServer:
         received_monotonic = self._clock.now()
         self.last_request = request
         self.requests.append(request)
+        evicted_requests = trim_history(
+            self.requests, self._recording_buffer_size
+        )
+        for evicted in evicted_requests:
+            self._request_timestamps.pop(id(evicted), None)
         self._request_timestamps[id(request)] = received_monotonic
         request_timestamp = self._timestamp_provider.now()
-        self._request_queue.put_nowait(request)
+        self._request_queue.put(request)
         return request_timestamp, received_monotonic
 
     async def _handle_request(
@@ -1169,7 +1213,7 @@ class AsyncHTTPTestServer:
                 response_timestamp=response_timestamp,
             )
             exchange_recorded = True
-            self._response_queue.put_nowait(send_result.recorded)
+            self._response_queue.put(send_result.recorded)
             return send_result.should_close
         except Exception:
             if not exchange_recorded:

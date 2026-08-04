@@ -2117,3 +2117,102 @@ async def test_forward_transformer_conditional_based_on_content_type():
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def _fixed_ok_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    await reader.readuntil(b"\r\n\r\n")
+    writer.write(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Length: 2\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"ok"
+    )
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_recording_buffer_evicts_oldest_when_full():
+    server = await asyncio.start_server(_fixed_ok_handler, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            recording_buffer_size=2,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                for i in range(3):
+                    response = await client.get(
+                        f"https://{upstream_host}:{upstream_port}/path-{i}"
+                    )
+                    assert response.status_code == 200
+
+        assert proxy.dropped_requests == 1
+        assert proxy.dropped_responses == 1
+        assert proxy.dropped_exchanges == 1
+
+        oldest = await proxy.next_request(timeout=1.0)
+        assert oldest.path == "/path-1"
+        exchange = await proxy.next_exchange(timeout=1.0)
+        assert exchange.request.path == "/path-1"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_recording_within_buffer_never_drops():
+    server = await asyncio.start_server(_fixed_ok_handler, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                response = await client.get(
+                    f"https://{upstream_host}:{upstream_port}/solo"
+                )
+                assert response.status_code == 200
+
+        assert not proxy.dropped_requests
+        assert not proxy.dropped_responses
+        assert not proxy.dropped_exchanges
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def test_zero_recording_buffer_size_raises_value_error():
+    with pytest.raises(ValueError, match="at least 1"):
+        AsyncTLSInterceptProxy(recording_buffer_size=0)

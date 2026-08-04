@@ -202,3 +202,13 @@ async def test_faulty_transmission_drop_connection() -> None:
     assert writer.close.call_count == 1
     assert writer.wait_closed.call_count == 1
     assert recorder.bytes_sent == b"ab"
+
+
+def test_zero_recording_buffer_size_raises_value_error():
+    with pytest.raises(ValueError, match="at least 1"):
+        AsyncHTTPTestServer(recording_buffer_size=0)
+
+
+def test_negative_recording_buffer_size_raises_value_error():
+    with pytest.raises(ValueError, match="at least 1"):
+        AsyncHTTPTestServer(recording_buffer_size=-1)
