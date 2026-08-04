@@ -2073,3 +2073,70 @@ async def test_clear_requests_clears_timestamps(server, client):
     server.clear_requests()
     with pytest.raises(ValueError, match="not found"):
         server.get_request_timestamp(request)
+
+
+@pytest.mark.asyncio
+async def test_recording_buffer_size_caps_history_and_queues():
+    async with AsyncHTTPTestServer(recording_buffer_size=2) as server:
+        server.set_json_response({"ok": True})
+        async with httpx.AsyncClient() as client:
+            for i in range(3):
+                await client.get(f"{server.url}path-{i}")
+
+        assert [req.path for req in server.requests] == [
+            "/path-1",
+            "/path-2",
+        ]
+        assert len(server.responses) == 2
+        assert len(server.exchanges) == 2
+        assert server.dropped_requests == 1
+        assert server.dropped_responses == 1
+        assert server.dropped_exchanges == 1
+
+        oldest = await server.next_request(timeout=1.0)
+        assert oldest.path == "/path-1"
+
+
+@pytest.mark.asyncio
+async def test_recording_within_buffer_size_keeps_everything(server, client):
+    server.set_json_response({"ok": True})
+    for _ in range(3):
+        await client.get(server.url)
+
+    assert len(server.requests) == 3
+    assert not server.dropped_requests
+    assert not server.dropped_responses
+    assert not server.dropped_exchanges
+
+
+@pytest.mark.asyncio
+async def test_clear_requests_preserves_recording_buffer_size():
+    async with AsyncHTTPTestServer(recording_buffer_size=1) as server:
+        server.set_json_response({"ok": True})
+        async with httpx.AsyncClient() as client:
+            await client.get(f"{server.url}first")
+            await client.get(f"{server.url}second")
+            assert server.dropped_requests == 1
+
+            server.clear_requests()
+            assert not server.dropped_requests
+
+            await client.get(f"{server.url}third")
+            await client.get(f"{server.url}fourth")
+
+        assert [req.path for req in server.requests] == ["/fourth"]
+        assert server.dropped_requests == 1
+
+
+@pytest.mark.asyncio
+async def test_trimmed_request_loses_its_timestamp():
+    async with AsyncHTTPTestServer(recording_buffer_size=1) as server:
+        server.set_json_response({"ok": True})
+        async with httpx.AsyncClient() as client:
+            await client.get(f"{server.url}first")
+            first = server.requests[0]
+            await client.get(f"{server.url}second")
+
+        assert server.get_request_timestamp(server.requests[0]) > 0
+        with pytest.raises(ValueError, match="not found"):
+            server.get_request_timestamp(first)
