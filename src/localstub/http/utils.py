@@ -4,7 +4,7 @@ import inspect
 from collections.abc import Awaitable, Iterable
 from email.message import Message
 from http import HTTPStatus
-from typing import Any, cast
+from typing import cast
 
 from localstub.http.headers import Headers
 
@@ -13,12 +13,12 @@ _STATUS_PHRASES: dict[int, str] = {
 }
 
 
-def maybe_await(value: Any) -> Awaitable[Any]:
+def maybe_await[T](value: T | Awaitable[T]) -> Awaitable[T]:
     """Wrap a sync-or-async return value into an awaitable."""
     if inspect.isawaitable(value):
-        return cast(Awaitable[Any], value)
+        return cast(Awaitable[T], value)
 
-    async def done() -> Any:
+    async def done() -> T:
         return value
 
     return done()

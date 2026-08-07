@@ -706,7 +706,6 @@ async def test_forward_handles_zero_and_invalid_content_length():
 
 @pytest.mark.asyncio
 async def test_forward_to_plain_http_when_tls_disabled():
-    """Forward mode: proxy relays to HTTP upstream when TLS is disabled."""
 
     async with AsyncHTTPTestServer() as upstream:
         upstream.set_json_response({"upstream": True})
@@ -857,10 +856,6 @@ async def test_forward_preserves_close_delimited_response_bodies():
 
 @pytest.mark.asyncio
 async def test_proxy_records_request_and_response_when_forwarding_to_real():
-    """
-    Proxy should record the decrypted HTTP request and the upstream HTTP
-    response while forwarding to a real HTTPS origin.
-    """
 
     async with AsyncTLSInterceptProxy(default_mode="forward") as proxy:
         proxy_host, proxy_port = proxy.address
@@ -964,14 +959,6 @@ async def test_forward_handles_head_request_with_content_length():
 
 @pytest.mark.asyncio
 async def test_forward_handles_client_closing_connection_early():
-    """
-    Proxy should gracefully handle client closing connection
-    after reading the response.
-
-    This simulates behavior seen with the AWS CLI where the client
-    reads the response and closes the connection, which can cause
-    ConnectionResetError in wait_closed().
-    """
 
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -1065,10 +1052,6 @@ async def _expect_continue_handler(
 
 @pytest.mark.asyncio
 async def test_forward_handles_100_continue_before_final_response():
-    """
-    Proxy should handle servers that send 100 Continue before the final
-    response, relaying both to the client without closing prematurely.
-    """
     server = await asyncio.start_server(
         _expect_continue_handler,
         "127.0.0.1",
@@ -1454,18 +1437,6 @@ def _recv_http_response(
 
 @pytest.mark.asyncio
 async def test_forward_client_waits_for_100_continue_before_sending_body():
-    """
-    Test that the proxy properly handles the 100-continue protocol where
-    the client sends only headers first, waits for 100 Continue, then
-    sends the body.
-
-    This test uses low-level socket operations because httpx doesn't
-    implement proper 100-continue semantics (it sends headers and body
-    together without waiting for 100 Continue).
-
-    Expected: the proxy forwards headers upstream, relays 100 Continue to
-    the client, then forwards the body and relays the final response.
-    """
     upstream_server = await asyncio.start_server(
         _proper_expect_continue_handler,
         "127.0.0.1",
@@ -1544,7 +1515,6 @@ async def _coalesced_expect_continue_handler(
 
 @pytest.mark.asyncio
 async def test_forward_preserves_final_response_when_100_and_200_coalesce():
-    """Proxy should not lose buffered bytes from coalesced responses."""
     upstream_server = await asyncio.start_server(
         _coalesced_expect_continue_handler,
         "127.0.0.1",
@@ -1632,10 +1602,6 @@ async def _multiple_informational_handler(
 
 @pytest.mark.asyncio
 async def test_forward_handles_multiple_informational_responses():
-    """
-    Proxy should handle multiple 1xx informational responses before the
-    final response, relaying each to the client.
-    """
     server = await asyncio.start_server(
         _multiple_informational_handler,
         "127.0.0.1",
@@ -1711,10 +1677,6 @@ async def _chunked_with_continue_handler(
 
 @pytest.mark.asyncio
 async def test_forward_handles_100_continue_with_chunked_response():
-    """
-    Proxy should handle 100 Continue followed by a chunked response,
-    which is the pattern used by S3 for uploads with Expect: 100-continue.
-    """
     server = await asyncio.start_server(
         _chunked_with_continue_handler,
         "127.0.0.1",
@@ -1782,7 +1744,6 @@ async def _simple_json_handler(
 
 @pytest.mark.asyncio
 async def test_forward_transforms_response_body_with_byteflip():
-    """Transformer can flip bits in the response body using ByteFlip."""
     server = await asyncio.start_server(
         _simple_json_handler,
         "127.0.0.1",
@@ -1829,7 +1790,6 @@ async def test_forward_transforms_response_body_with_byteflip():
 
 @pytest.mark.asyncio
 async def test_forward_transformer_delay_before():
-    """Transformer can add delay before sending the response."""
 
     def delay_transformer(upstream: UpstreamResponse) -> TransformResult:
         return TransformResult(body=upstream.body, delay_before=0.1)
@@ -1875,7 +1835,6 @@ async def test_forward_transformer_delay_before():
 
 @pytest.mark.asyncio
 async def test_forward_transformer_override_response():
-    """Transformer can completely replace the response."""
 
     def override_transformer(upstream: UpstreamResponse) -> TransformResult:
         return TransformResult(
@@ -1930,7 +1889,6 @@ async def test_forward_transformer_override_response():
 
 @pytest.mark.asyncio
 async def test_forward_async_transformer():
-    """Transformer can be an async function."""
 
     async def async_transformer(upstream: UpstreamResponse) -> TransformResult:
         # Simulate some async work
@@ -1977,7 +1935,6 @@ async def test_forward_async_transformer():
 
 @pytest.mark.asyncio
 async def test_fault_step_transformer_chains_multiple_steps():
-    """fault_step_transformer can chain multiple FaultSteps."""
     server = await asyncio.start_server(
         _simple_json_handler,
         "127.0.0.1",
@@ -2025,7 +1982,6 @@ async def test_fault_step_transformer_chains_multiple_steps():
 
 @pytest.mark.asyncio
 async def test_forward_transformer_passthrough_when_none_returned():
-    """Transformer returning None body passes through original response."""
 
     def passthrough_transformer(upstream: UpstreamResponse) -> TransformResult:
         # Return empty result - should passthrough original
@@ -2070,7 +2026,6 @@ async def test_forward_transformer_passthrough_when_none_returned():
 
 @pytest.mark.asyncio
 async def test_forward_transformer_conditional_based_on_content_type():
-    """Transformer can conditionally modify based on response headers."""
 
     def conditional_transformer(upstream: UpstreamResponse) -> TransformResult:
         content_type = ""

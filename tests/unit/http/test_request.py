@@ -1032,7 +1032,7 @@ def test_http_request_is_proxy_request_true_for_http() -> None:
         path="http://example.com/path",
         http_version="1.1",
     )
-    assert request.is_proxy_request is True
+    assert request.is_proxy_request
 
 
 def test_http_request_is_proxy_request_true_for_https() -> None:
@@ -1041,17 +1041,17 @@ def test_http_request_is_proxy_request_true_for_https() -> None:
         path="https://example.com/path",
         http_version="1.1",
     )
-    assert request.is_proxy_request is True
+    assert request.is_proxy_request
 
 
 def test_http_request_is_proxy_request_false_for_origin_form() -> None:
     request = HTTPRequest(method="GET", path="/path", http_version="1.1")
-    assert request.is_proxy_request is False
+    assert not request.is_proxy_request
 
 
 def test_http_request_is_proxy_request_false_for_empty_path() -> None:
     request = HTTPRequest(method="GET", path="", http_version="1.1")
-    assert request.is_proxy_request is False
+    assert not request.is_proxy_request
 
 
 def test_http_request_target_uri_returns_parsed_for_absolute_uri() -> None:

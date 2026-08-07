@@ -11,7 +11,6 @@ from typing import (
     Any,
     Protocol,
     Self,
-    cast,
 )
 
 import httpx
@@ -38,6 +37,7 @@ from localstub.middleware import (
     ForwardProxyResponse,
     HeaderContext,
     HeaderMiddleware,
+    HeaderNext,
     ResponderContext,
     ResponderMiddleware,
     ResponseSpec,
@@ -138,7 +138,7 @@ class Writer(Protocol):
 
     def writelines(self, data: Iterable[bytes]) -> None: ...
 
-    async def drain(self) -> Any: ...
+    async def drain(self) -> None: ...
 
     def write_eof(self) -> None: ...
 
@@ -187,7 +187,7 @@ class RecordingStreamWriter:
         for chunk in data:
             self.write(chunk)
 
-    async def drain(self) -> Any:
+    async def drain(self) -> None:
         return await self._writer.drain()
 
     def write_eof(self) -> None:
@@ -1046,7 +1046,7 @@ class AsyncHTTPTestServer:
                 host=response.host,
                 port=response.port,
                 request_wire_bytes=response.request_wire_bytes,
-                client_writer=cast(Any, writer),
+                client_writer=writer,
                 request_method=response.request_method,
                 upstream_tls=response.upstream_tls,
             )
@@ -1114,7 +1114,7 @@ class AsyncHTTPTestServer:
 
             async def on_headers_received(
                 ctx: HeaderContext,
-                call_next: Any,
+                call_next: HeaderNext,
             ) -> bool:
                 should_continue: bool = await maybe_await(
                     on_headers_received_handler(ctx.headers, ctx.send)

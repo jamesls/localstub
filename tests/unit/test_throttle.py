@@ -24,20 +24,20 @@ def test_token_bucket_allows_burst_then_refills():
     bucket = TokenBucket(rate_per_second=2.0, capacity=2.0, clock=clock)
 
     allowed, retry_after = bucket.try_acquire()
-    assert allowed is True
+    assert allowed
     assert retry_after == 0.0
 
     allowed, retry_after = bucket.try_acquire()
-    assert allowed is True
+    assert allowed
     assert retry_after == 0.0
 
     allowed, retry_after = bucket.try_acquire()
-    assert allowed is False
+    assert not allowed
     assert retry_after == pytest.approx(0.5)
 
     clock.advance(0.5)
     allowed, retry_after = bucket.try_acquire()
-    assert allowed is True
+    assert allowed
     assert retry_after == 0.0
 
 
@@ -73,11 +73,11 @@ def test_token_bucket_reset_restores_capacity():
     clock = ManualClock()
     bucket = TokenBucket(rate_per_second=1.0, capacity=1.0, clock=clock)
 
-    assert bucket.try_acquire()[0] is True
-    assert bucket.try_acquire()[0] is False
+    assert bucket.try_acquire()[0]
+    assert not bucket.try_acquire()[0]
 
     bucket.reset()
-    assert bucket.try_acquire()[0] is True
+    assert bucket.try_acquire()[0]
 
 
 def test_token_bucket_throttler_default_burst_for_low_rate_is_one():
@@ -91,10 +91,10 @@ def test_token_bucket_throttler_default_burst_for_low_rate_is_one():
     assert throttler.rate_per_second == 0.5
 
     req = HTTPRequest(method="GET", path="/", http_version="1.1")
-    assert throttler.check(req).allowed is True
+    assert throttler.check(req).allowed
 
     decision = throttler.check(req)
-    assert decision.allowed is False
+    assert not decision.allowed
     assert decision.retry_after_seconds == pytest.approx(2.0)
 
 
@@ -131,23 +131,17 @@ def test_token_bucket_throttler_isolated_per_key():
         clock=clock,
     )
 
-    assert (
-        throttler.check(
-            HTTPRequest(method="GET", path="/a", http_version="1.1")
-        ).allowed
-        is True
-    )
-    assert (
-        throttler.check(
-            HTTPRequest(method="GET", path="/b", http_version="1.1")
-        ).allowed
-        is True
-    )
+    assert throttler.check(
+        HTTPRequest(method="GET", path="/a", http_version="1.1")
+    ).allowed
+    assert throttler.check(
+        HTTPRequest(method="GET", path="/b", http_version="1.1")
+    ).allowed
 
     decision = throttler.check(
         HTTPRequest(method="GET", path="/a", http_version="1.1")
     )
-    assert decision.allowed is False
+    assert not decision.allowed
     assert decision.retry_after_seconds == pytest.approx(1.0)
 
 
@@ -161,8 +155,8 @@ def test_token_bucket_throttler_reset_clears_state():
     )
 
     req = HTTPRequest(method="GET", path="/", http_version="1.1")
-    assert throttler.check(req).allowed is True
-    assert throttler.check(req).allowed is False
+    assert throttler.check(req).allowed
+    assert not throttler.check(req).allowed
 
     throttler.reset()
-    assert throttler.check(req).allowed is True
+    assert throttler.check(req).allowed

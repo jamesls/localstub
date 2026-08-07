@@ -350,7 +350,6 @@ async def test_server_tracks_requests_by_client(server):
 
 @pytest.mark.asyncio
 async def test_clear_requests_resets_state(server, client):
-    """Test that clear_requests() clears all recorded request state."""
     server.set_json_response({"status": "ok"})
 
     # Make several requests
@@ -380,7 +379,6 @@ async def test_clear_requests_resets_state(server, client):
 
 @pytest.mark.asyncio
 async def test_clear_requests_allows_multiple_cycles(server, client):
-    """Test that clear_requests() can be called multiple times."""
     server.set_json_response({"cycle": 1})
 
     # Cycle 1
@@ -405,7 +403,6 @@ async def test_clear_requests_allows_multiple_cycles(server, client):
 
 @pytest.mark.asyncio
 async def test_clear_requests_preserves_default_response(server, client):
-    """Test that clear_requests() preserves the default response config."""
     server.set_json_response({"message": "configured"}, status=201)
 
     # Make a request and verify response
@@ -424,7 +421,6 @@ async def test_clear_requests_preserves_default_response(server, client):
 
 @pytest.mark.asyncio
 async def test_clear_requests_preserves_handler(server, client):
-    """Test that clear_requests() preserves the custom handler."""
 
     request_count = 0
 
@@ -451,7 +447,6 @@ async def test_clear_requests_preserves_handler(server, client):
 
 @pytest.mark.asyncio
 async def test_session_scoped_server_pattern():
-    """Test session-scoped server reuse pattern across multiple tests."""
     # Simulates a session-scoped fixture
     async with (
         AsyncHTTPTestServer() as server,
@@ -487,7 +482,6 @@ async def test_session_scoped_server_pattern():
 
 @pytest.mark.asyncio
 async def test_connection_bytes_received_single_request(server, client):
-    """Test that connection-level bytes are captured for a single request."""
     server.set_json_response({"status": "ok"})
 
     await client.get(f"{server.url}test")
@@ -510,7 +504,6 @@ async def test_connection_bytes_received_single_request(server, client):
 
 @pytest.mark.asyncio
 async def test_connection_bytes_sent_single_request(server, client):
-    """Test that connection-level sent bytes are captured."""
     server.set_json_response({"status": "ok"})
 
     await client.get(server.url)
@@ -536,7 +529,6 @@ async def test_connection_bytes_sent_single_request(server, client):
 async def test_connection_bytes_multiple_requests_same_connection(
     server, client
 ):
-    """Test that connection bytes accumulate across multiple requests."""
     server.set_json_response({"response": "ok"})
 
     # Make multiple requests on the same connection
@@ -576,7 +568,6 @@ async def test_connection_bytes_multiple_requests_same_connection(
 
 @pytest.mark.asyncio
 async def test_connection_bytes_separate_clients():
-    """Test that connection bytes are tracked separately per client."""
     async with AsyncHTTPTestServer() as server:
         server.set_json_response({"status": "ok"})
 
@@ -614,7 +605,6 @@ async def test_connection_bytes_separate_clients():
 
 @pytest.mark.asyncio
 async def test_connection_bytes_cleared_with_clear_requests(server, client):
-    """Test that clear_requests() also clears connection bytes."""
     server.set_json_response({"status": "ok"})
 
     await client.get(server.url)
@@ -638,7 +628,6 @@ async def test_connection_bytes_cleared_with_clear_requests(server, client):
 
 @pytest.mark.asyncio
 async def test_connection_bytes_match_per_request_bytes(server, client):
-    """Test connection bytes include the same data as per-request bytes."""
     server.set_json_response({"status": "ok"})
 
     await client.post(f"{server.url}test", json={"key": "value"})
@@ -660,7 +649,6 @@ async def test_connection_bytes_match_per_request_bytes(server, client):
 
 @pytest.mark.asyncio
 async def test_router_matches_method_and_path(server, client):
-    """Router dispatches to method+path routes before fallback/default."""
 
     async def get_handler(request):
         return HTTPResponse.text("GET-OK")
@@ -682,7 +670,6 @@ async def test_router_matches_method_and_path(server, client):
 
 @pytest.mark.asyncio
 async def test_router_falls_back_to_handler_when_no_route(server, client):
-    """If no route matches, server.handler handles the request."""
 
     def fallback_handler(request):
         return HTTPResponse.text("fallback")
@@ -704,7 +691,6 @@ async def test_router_falls_back_to_handler_when_no_route(server, client):
 
 @pytest.mark.asyncio
 async def test_router_defaults_when_no_handler_and_no_route(server, client):
-    """If neither route nor handler present, default response is used."""
     # Ensure no handler is set explicitly
     server.handler = None
 
@@ -844,7 +830,6 @@ async def test_connection_bytes_with_chunked_encoding(server, client):
 
 @pytest.mark.asyncio
 async def test_response_sequence_returns_responses_in_order(server, client):
-    """Test that response sequence returns configured responses in order."""
     server.set_response_sequence([
         HTTPResponse(status=500),
         HTTPResponse(status=502),
@@ -872,7 +857,6 @@ async def test_response_sequence_returns_responses_in_order(server, client):
 async def test_response_sequence_exhaustion_falls_back_to_default(
     server, client
 ):
-    """Test sequence falls back to handler/default after exhaustion."""
     # Set a handler as fallback
     server.handler = lambda req: HTTPResponse.json({"fallback": True})
 
@@ -897,7 +881,6 @@ async def test_response_sequence_exhaustion_falls_back_to_default(
 
 @pytest.mark.asyncio
 async def test_response_sequence_clears_default_response(server, client):
-    """Test that set_response_sequence clears previous default response."""
     # First set a default response
     server.set_json_response({"default": "value"})
 
@@ -922,7 +905,6 @@ async def test_response_sequence_clears_default_response(server, client):
 
 @pytest.mark.asyncio
 async def test_set_json_response_clears_sequence(server, client):
-    """Test that set_json_response clears any response sequence."""
     # First set a sequence
     server.set_response_sequence([
         HTTPResponse(status=500),
@@ -965,7 +947,6 @@ async def test_default_response_property_clears_sequence(server, client):
 
 @pytest.mark.asyncio
 async def test_set_text_response_clears_sequence(server, client):
-    """Test that set_text_response clears any response sequence."""
     server.set_response_sequence([HTTPResponse(status=404)])
     server.set_text_response("text override")
 
@@ -976,7 +957,6 @@ async def test_set_text_response_clears_sequence(server, client):
 
 @pytest.mark.asyncio
 async def test_set_raw_response_clears_sequence(server, client):
-    """Test that set_raw_response clears any response sequence."""
     server.set_response_sequence([HTTPResponse(status=500)])
     server.set_raw_response(b"raw bytes")
 
@@ -987,7 +967,6 @@ async def test_set_raw_response_clears_sequence(server, client):
 
 @pytest.mark.asyncio
 async def test_clear_requests_resets_sequence_index(server, client):
-    """Test that clear_requests allows sequence reuse."""
     server.set_response_sequence([
         HTTPResponse(status=500),
         HTTPResponse.json({"attempt": 2}),
@@ -1013,7 +992,6 @@ async def test_clear_requests_resets_sequence_index(server, client):
 
 @pytest.mark.asyncio
 async def test_response_sequence_for_retry_testing():
-    """Test the motivating use case: testing client retry behavior."""
     async with AsyncHTTPTestServer() as server:
         # Configure server to fail twice, then succeed
         server.set_response_sequence([
@@ -1051,7 +1029,6 @@ async def test_response_sequence_for_retry_testing():
 
 @pytest.mark.asyncio
 async def test_response_sequence_respects_router_priority(server, client):
-    """Test that response sequence has higher priority than routes."""
     # Set up a route
     server.add_route(
         "GET", "/special", lambda req: HTTPResponse.text("route-handler")
@@ -1068,7 +1045,6 @@ async def test_response_sequence_respects_router_priority(server, client):
 
 @pytest.mark.asyncio
 async def test_response_sequence_works_across_multiple_clients():
-    """Test that response sequence is global across different clients."""
     async with AsyncHTTPTestServer() as server:
         server.set_response_sequence([
             HTTPResponse.json({"client": 1}),
@@ -1097,7 +1073,6 @@ async def test_response_sequence_works_across_multiple_clients():
 async def test_response_sequence_with_different_request_methods(
     server, client
 ):
-    """Test that sequence works regardless of HTTP method."""
     server.set_response_sequence([
         HTTPResponse.json({"method": "first"}),
         HTTPResponse.json({"method": "second"}),
@@ -1122,7 +1097,6 @@ async def test_response_sequence_with_different_request_methods(
 
 @pytest.mark.asyncio
 async def test_empty_response_sequence_uses_fallback(server, client):
-    """Test that an empty sequence immediately falls back."""
     server.set_json_response({"default": True})
     server.set_response_sequence([])  # Empty sequence
 
@@ -1151,7 +1125,6 @@ async def send_raw_request(host, port, data):
 
 @pytest.mark.asyncio
 async def test_server_handles_empty_request_line(server):
-    """Test server handles empty request line gracefully."""
     # Send just EOF without any request line
     _, writer = await asyncio.open_connection(server.host, server.port)
     writer.close()
@@ -1164,7 +1137,6 @@ async def test_server_handles_empty_request_line(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_http09_simple_request(server):
-    """Test server handles HTTP/0.9 simple request format (no version)."""
     # HTTP/0.9 simple request format: "GET /path\r\n"
     # httptools correctly parses this as HTTP/0.9
     await send_raw_request(
@@ -1183,7 +1155,6 @@ async def test_server_handles_http09_simple_request(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_eof_while_reading_headers(server):
-    """Test server handles EOF while reading headers."""
     # Send request line but close before sending complete headers
     _, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(b"GET / HTTP/1.1\r\n")
@@ -1199,12 +1170,6 @@ async def test_server_handles_eof_while_reading_headers(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_invalid_content_length(server):
-    """Test server handles non-numeric Content-Length.
-
-    httptools strictly validates HTTP headers per spec, so invalid
-    Content-Length values cause a parse failure. The connection is
-    closed without recording the request.
-    """
     response = await send_raw_request(
         server.host,
         server.port,
@@ -1223,7 +1188,6 @@ async def test_server_handles_invalid_content_length(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_invalid_chunk_size(server):
-    """Test server handles invalid chunk size in chunked encoding."""
     await send_raw_request(
         server.host,
         server.port,
@@ -1241,7 +1205,6 @@ async def test_server_handles_invalid_chunk_size(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_eof_in_chunked_body(server):
-    """Test server handles EOF while reading chunked body."""
     _, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(
         b"POST / HTTP/1.1\r\n"
@@ -1260,7 +1223,6 @@ async def test_server_handles_eof_in_chunked_body(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_eof_in_chunk_trailers(server):
-    """Test server handles EOF while reading chunk trailers."""
     _, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(
         b"POST / HTTP/1.1\r\n"
@@ -1280,7 +1242,6 @@ async def test_server_handles_eof_in_chunk_trailers(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_invalid_status_code():
-    """Test server handles invalid status codes gracefully."""
     async with AsyncHTTPTestServer() as server:
         # Set response with invalid status code
         server.set_json_response({"test": "value"}, status=999)
@@ -1301,7 +1262,6 @@ async def test_server_handles_invalid_status_code():
 
 @pytest.mark.asyncio
 async def test_next_request_without_timeout(server):
-    """Test next_request() waits indefinitely without timeout."""
 
     async def make_request():
         await asyncio.sleep(0.1)
@@ -1327,7 +1287,6 @@ async def test_next_request_without_timeout(server):
 
 @pytest.mark.asyncio
 async def test_next_request_with_timeout_success(server):
-    """Test next_request() with timeout that completes in time."""
 
     async def make_request():
         await asyncio.sleep(0.05)
@@ -1352,7 +1311,6 @@ async def test_next_request_with_timeout_success(server):
 
 @pytest.mark.asyncio
 async def test_next_request_with_timeout_expires():
-    """Test next_request() raises TimeoutError when timeout expires."""
     async with AsyncHTTPTestServer() as server:
         server.set_json_response({"test": "ok"})
 
@@ -1385,7 +1343,6 @@ async def test_next_exchange_nowait_returns_queued_exchange(server, client):
 
 @pytest.mark.asyncio
 async def test_server_handles_exception_during_request_processing():
-    """Test server handles exceptions during request processing."""
     async with AsyncHTTPTestServer() as server:
 
         def failing_handler(request):
@@ -1410,7 +1367,6 @@ async def test_server_handles_exception_during_request_processing():
 
 @pytest.mark.asyncio
 async def test_server_handles_writer_close_exception():
-    """Test server handles exceptions when closing writer."""
 
     async with AsyncHTTPTestServer() as server:
         server.set_json_response({"test": "ok"})
@@ -1435,7 +1391,6 @@ async def test_server_handles_writer_close_exception():
 
 @pytest.mark.asyncio
 async def test_server_handles_immediate_eof_in_request_line(server):
-    """Test server handles immediate EOF (no data at all)."""
     _, writer = await asyncio.open_connection(server.host, server.port)
     # Close immediately without sending anything
     writer.close()
@@ -1447,7 +1402,6 @@ async def test_server_handles_immediate_eof_in_request_line(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_eof_after_chunk_size(server):
-    """Test server handles EOF right after reading chunk size line."""
     _, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(
         b"POST / HTTP/1.1\r\n"
@@ -1465,7 +1419,6 @@ async def test_server_handles_eof_after_chunk_size(server):
 
 @pytest.mark.asyncio
 async def test_server_closes_connection_on_connection_close_header(server):
-    """Test server closes connection when Connection: close is sent."""
     reader, writer = await asyncio.open_connection(server.host, server.port)
 
     # Send request with Connection: close
@@ -1500,7 +1453,6 @@ async def test_server_closes_connection_on_connection_close_header(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_chunked_with_trailer_headers(server):
-    """Test server handles chunked encoding with trailing headers."""
     reader, writer = await asyncio.open_connection(server.host, server.port)
     writer.write(
         b"POST / HTTP/1.1\r\n"
@@ -1528,7 +1480,6 @@ async def test_server_handles_chunked_with_trailer_headers(server):
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_slows_response(server, client):
-    """Test ThrottledTransmission delays response body transmission."""
     response_data = b"x" * 10000  # 10KB of data
 
     server.set_raw_response(response_data)
@@ -1555,7 +1506,6 @@ async def test_throttled_transmission_slows_response(server, client):
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_large_chunks():
-    """Test throttled transmission with larger chunk size."""
     async with AsyncHTTPTestServer() as server:
         response_data = b"y" * 50000  # 50KB
 
@@ -1576,7 +1526,6 @@ async def test_throttled_transmission_large_chunks():
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_small_body(server, client):
-    """Test throttled transmission with body smaller than chunk size."""
     small_data = b"small response"
 
     server.set_raw_response(small_data)
@@ -1595,7 +1544,6 @@ async def test_throttled_transmission_small_body(server, client):
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_json_response(server, client):
-    """Test throttled transmission works with JSON responses."""
     json_data = {"data": "x" * 5000}  # Large JSON
 
     server.set_json_response(json_data)
@@ -1614,7 +1562,6 @@ async def test_throttled_transmission_json_response(server, client):
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_with_handler(server, client):
-    """Test throttled transmission works with custom handlers."""
 
     def handler(request):
         return HTTPResponse.raw(b"handler response" * 1000)
@@ -1636,7 +1583,6 @@ async def test_throttled_transmission_with_handler(server, client):
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_with_multiple_requests(server, client):
-    """Test throttled transmission applies to all requests."""
     server.set_raw_response(b"x" * 5000)
     server.set_transmission_strategy(
         ThrottledTransmission(chunk_size=1000, delay=0.02)
@@ -1657,7 +1603,6 @@ async def test_throttled_transmission_with_multiple_requests(server, client):
 
 @pytest.mark.asyncio
 async def test_default_transmission_is_immediate(server, client):
-    """Test that default transmission (without throttling) is fast."""
     response_data = b"z" * 10000
 
     server.set_raw_response(response_data)
@@ -1674,11 +1619,6 @@ async def test_default_transmission_is_immediate(server, client):
 
 @pytest.mark.asyncio
 async def test_server_handles_pipelined_requests(server):
-    """Test server handles pipelined HTTP requests on same connection.
-
-    When a client sends multiple HTTP requests back-to-back without waiting
-    for responses (HTTP pipelining), the server should record all of them.
-    """
     # Send two pipelined requests in one write
     pipelined_requests = (
         b"GET /first HTTP/1.1\r\n"
@@ -1712,7 +1652,6 @@ async def test_server_handles_pipelined_requests(server):
 
 @pytest.mark.asyncio
 async def test_server_handles_pipelined_requests_with_body(server):
-    """Test server handles pipelined POST requests with bodies."""
     # Two POST requests with bodies, pipelined
     pipelined_requests = (
         b"POST /first HTTP/1.1\r\n"

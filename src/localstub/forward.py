@@ -37,6 +37,18 @@ LOG = logging.getLogger(__name__)
 WireLog = Callable[[str, bytes], None]
 
 
+class ClientWriter(Protocol):
+    """Minimal writer interface required for relaying responses."""
+
+    def write(self, data: bytes) -> None: ...
+
+    async def drain(self) -> None: ...
+
+    def close(self) -> None: ...
+
+    async def wait_closed(self) -> None: ...
+
+
 class OverrideResponse(Protocol):
     """Protocol for response objects that can override an upstream response."""
 
@@ -153,7 +165,7 @@ class Forwarder:
         host: str,
         port: int,
         request_wire_bytes: bytes,
-        client_writer: asyncio.StreamWriter,
+        client_writer: ClientWriter,
         request_method: str | None = None,
         upstream_tls: bool = False,
         upstream_id: str | None = None,
@@ -253,7 +265,7 @@ class Forwarder:
     async def read_and_relay_responses(
         self,
         upstream_reader: asyncio.StreamReader,
-        client_writer: asyncio.StreamWriter,
+        client_writer: ClientWriter,
         request_method: str | None,
         *,
         upstream_id: str | None = None,
@@ -324,7 +336,7 @@ class Forwarder:
         header_wire_bytes: bytes,
         remaining_buffer: bytearray,
         client_reader: asyncio.StreamReader,
-        client_writer: asyncio.StreamWriter,
+        client_writer: ClientWriter,
         upstream_reader: asyncio.StreamReader,
         upstream_writer: asyncio.StreamWriter,
         request_method: str | None,
@@ -430,7 +442,7 @@ class Forwarder:
         *,
         parsed: ParsedResponse,
         wire_bytes: bytes,
-        client_writer: asyncio.StreamWriter,
+        client_writer: ClientWriter,
         client_label: str,
     ) -> ForwardResult:
         headers = headers_to_message(parsed.headers)
