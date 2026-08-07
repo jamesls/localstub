@@ -334,5 +334,5 @@ async def test_compose_headers_short_circuit() -> None:
     )
 
     should_continue = await app(ctx)
-    assert should_continue is False
+    assert not should_continue
     assert seen == ["a", "stop", "send"]

@@ -1,5 +1,3 @@
-"""Integration tests for HTTP forward proxy functionality."""
-
 from __future__ import annotations
 
 import asyncio
@@ -238,7 +236,7 @@ class TestProxyRequestRecording:
             # Verify the request was recorded with full URI
             assert server.last_request is not None
             assert server.last_request.path == "http://example.com/api/users"
-            assert server.last_request.is_proxy_request is True
+            assert server.last_request.is_proxy_request
 
     @pytest.mark.asyncio
     async def test_effective_path_for_routing(self) -> None:
