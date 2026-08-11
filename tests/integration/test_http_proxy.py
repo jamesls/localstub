@@ -9,7 +9,8 @@ import pytest
 import pytest_asyncio
 
 from localstub.cli import parse_args, run_http_proxy
-from localstub.forward import Forwarder
+from localstub.forward import RawForwarder
+from localstub.http.clients.httpx import HttpxClient
 from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
 
@@ -137,7 +138,7 @@ async def test_http_proxy_mode_handles_expect_100_continue_client(
 
             assert b"HTTP/1.1 200 OK" in final_response
             upstream_request = await upstream_server.next_request(timeout=0.5)
-            assert upstream_request.body_bytes == body
+            assert upstream_request.body == body
         finally:
             writer.close()
             await writer.wait_closed()
@@ -235,7 +236,7 @@ class TestProxyRequestRecording:
 
             # Verify the request was recorded with full URI
             assert server.last_request is not None
-            assert server.last_request.path == "http://example.com/api/users"
+            assert server.last_request.target == "http://example.com/api/users"
             assert server.last_request.is_proxy_request
 
     @pytest.mark.asyncio
@@ -287,7 +288,9 @@ class TestProxyForwarding:
 
             async with (
                 httpx.AsyncClient() as upstream_client,
-                AsyncHTTPTestServer(proxy_forwarder=upstream_client) as proxy,
+                AsyncHTTPTestServer(
+                    upstream_client=HttpxClient(upstream_client)
+                ) as proxy,
                 httpx.AsyncClient(proxy=proxy.url) as downstream_client,
             ):
                 response = await downstream_client.get(
@@ -303,7 +306,9 @@ class TestProxyForwarding:
     ) -> None:
         async with (
             httpx.AsyncClient() as http_client,
-            AsyncHTTPTestServer(proxy_forwarder=http_client) as proxy,
+            AsyncHTTPTestServer(
+                upstream_client=HttpxClient(http_client)
+            ) as proxy,
         ):
             # Send request through the proxy
             reader, writer = await asyncio.open_connection(
@@ -369,7 +374,9 @@ class TestProxyForwarding:
             body = b"\xff\xfe\xfd\x00abc"
             async with (
                 httpx.AsyncClient() as http_client,
-                AsyncHTTPTestServer(proxy_forwarder=http_client) as proxy,
+                AsyncHTTPTestServer(
+                    upstream_client=HttpxClient(http_client)
+                ) as proxy,
             ):
                 reader, writer = await asyncio.open_connection(
                     proxy.host, proxy.port
@@ -430,7 +437,9 @@ class TestProxyForwarding:
     ) -> None:
         async with (
             httpx.AsyncClient() as http_client,
-            AsyncHTTPTestServer(proxy_forwarder=http_client) as proxy,
+            AsyncHTTPTestServer(
+                upstream_client=HttpxClient(http_client)
+            ) as proxy,
         ):
             # Set a response sequence
             proxy.set_response_sequence([
@@ -465,7 +474,9 @@ class TestProxyForwarding:
     ) -> None:
         async with (
             httpx.AsyncClient() as http_client,
-            AsyncHTTPTestServer(proxy_forwarder=http_client) as proxy,
+            AsyncHTTPTestServer(
+                upstream_client=HttpxClient(http_client)
+            ) as proxy,
         ):
             proxy.set_json_response({"local": True})
 
@@ -519,7 +530,7 @@ class TestRawForwarding:
         upstream_host, upstream_port = addr[0], addr[1]
 
         try:
-            forwarder = Forwarder(verify_upstream=False)
+            forwarder = RawForwarder(verify_upstream=False)
             async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
                 reader, writer = await asyncio.open_connection(
                     proxy.host, proxy.port
@@ -570,14 +581,14 @@ class TestRawForwarding:
         upstream_host, upstream_port = addr[0], addr[1]
 
         try:
-            forwarder = Forwarder(verify_upstream=False)
+            forwarder = RawForwarder(verify_upstream=False)
             async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
 
                 async def rewrite_body(
                     ctx: ResponderContext,
                     call_next: ResponderNext,
                 ) -> ResponseSpec:
-                    ctx2 = ctx.clone_request(body_bytes=b"HELLO")
+                    ctx2 = ctx.clone_request(body=b"HELLO")
                     return await call_next(ctx=ctx2)
 
                 proxy.responder_middlewares.append(rewrite_body)
@@ -634,7 +645,7 @@ class TestRawForwarding:
         upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
 
         try:
-            forwarder = Forwarder(verify_upstream=False)
+            forwarder = RawForwarder(verify_upstream=False)
             async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
 
                 async def rewrite_content_length(
@@ -704,7 +715,7 @@ class TestRawForwarding:
         upstream_host, upstream_port = addr[0], addr[1]
 
         try:
-            forwarder = Forwarder(verify_upstream=False)
+            forwarder = RawForwarder(verify_upstream=False)
             async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
                 reader, writer = await asyncio.open_connection(
                     proxy.host, proxy.port
@@ -766,7 +777,7 @@ class TestRawForwarding:
         upstream_host, upstream_port = addr[0], addr[1]
 
         try:
-            forwarder = Forwarder(verify_upstream=False)
+            forwarder = RawForwarder(verify_upstream=False)
             async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
                 reader, writer = await asyncio.open_connection(
                     proxy.host, proxy.port
@@ -823,7 +834,7 @@ class TestRawForwarding:
         upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
 
         try:
-            forwarder = Forwarder(verify_upstream=False)
+            forwarder = RawForwarder(verify_upstream=False)
             async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
                 reader, writer = await asyncio.open_connection(
                     proxy.host,
@@ -876,7 +887,7 @@ class TestRawForwarding:
         upstream_host, upstream_port = addr[0], addr[1]
 
         try:
-            forwarder = Forwarder(verify_upstream=False)
+            forwarder = RawForwarder(verify_upstream=False)
             async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
                 reader, writer = await asyncio.open_connection(
                     proxy.host, proxy.port

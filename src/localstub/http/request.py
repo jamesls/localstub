@@ -15,7 +15,7 @@ from localstub.http.framing import (
     is_chunked_transfer,
     scan_chunked_body,
 )
-from localstub.http.headers import Headers
+from localstub.http.headers import HeaderItem, Headers
 from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_headers
 
@@ -28,92 +28,68 @@ class Writer(Protocol):
     def get_extra_info(self, name: str, default: Any | None = None) -> Any: ...
 
 
-@dataclass(frozen=True)
-class HTTPRequest:
-    """Snapshot of a single HTTP request.
+_FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
 
-    `body` is decoded as UTF-8 (like the original code).
-    `body_bytes` is the parsed body bytes (may differ from wire framing).
-    `wire_raw_bytes` is *exactly* what came off the wire, including:
-      - request line
-      - headers
-      - the blank line
-      - body bytes (including chunk framing for chunked requests)
+
+def _semantic_header_items(headers: Headers) -> tuple[HeaderItem, ...]:
+    """Header items with framing headers removed, for value equality."""
+    return tuple(
+        (name, value)
+        for name, value in headers.items()
+        if name.lower() not in _FRAMING_HEADERS
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class HTTPRequest:
+    """An HTTP request: what RFC 9110 says a request is, nothing else.
+
+    ``target`` is the request-target from the request line: origin-form
+    ("/v1/items?x=1") or absolute-form ("http://host/...").
+
+    ``body`` distinguishes no content (``None``, no content headers at
+    all) from empty content (``b""``, e.g. ``Content-Length: 0``).
+
+    Equality is semantic: the framing headers ``Content-Length`` and
+    ``Transfer-Encoding`` are excluded from comparison and hashing, so
+    two requests compare equal even if one arrived chunked and one with
+    Content-Length.  Framing evidence lives on ``RecordedHTTPRequest``.
     """
 
     method: str
-    path: str
-    http_version: str
+    target: str
     headers: Headers = field(default_factory=Headers.empty)
-    body: str = ""
-    body_bytes: bytes = b""
-    wire_raw_bytes: bytes = b""
-    client: tuple[str, int] | None = None
+    body: bytes | None = None
 
-    @classmethod
-    def from_parsed(
-        cls,
-        parsed: ParsedRequest,
-        wire_raw_bytes: bytes,
-        *,
-        client: tuple[str, int] | None = None,
-        writer: Writer | None = None,
-    ) -> HTTPRequest:
-        headers = headers_to_headers(parsed.headers)
-        body_bytes = parsed.body
-        body_text = body_bytes.decode("utf-8", errors="replace")
-        path = (
-            parsed.url.decode("ascii", errors="replace")
-            if parsed.url is not None
-            else ""
-        )
-        if client is None and writer is not None:
-            peer = writer.get_extra_info("peername")
-            if isinstance(peer, tuple) and len(peer) >= 2:
-                client = (peer[0], peer[1])
-
-        return cls(
-            method=parsed.method or "",
-            path=path,
-            http_version=parsed.http_version or "",
-            headers=headers,
-            body=body_text,
-            body_bytes=body_bytes,
-            wire_raw_bytes=wire_raw_bytes,
-            client=client,
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, HTTPRequest):
+            return NotImplemented
+        return (
+            self.method == other.method
+            and self.target == other.target
+            and self.body == other.body
+            and _semantic_header_items(self.headers)
+            == _semantic_header_items(other.headers)
         )
 
-    def with_path(self, path: str) -> HTTPRequest:
-        return replace(self, path=path)
-
-    def with_method(self, method: str) -> HTTPRequest:
-        return replace(self, method=method)
-
-    def with_headers(self, headers: Headers) -> HTTPRequest:
-        return replace(self, headers=headers)
+    def __hash__(self) -> int:
+        return hash((
+            self.method,
+            self.target,
+            self.body,
+            _semantic_header_items(self.headers),
+        ))
 
     @property
-    def wire_body_bytes(self) -> bytes:
-        """Return request body bytes as they appeared on the wire.
-
-        For chunked/aws-chunked uploads this includes the original chunk
-        framing and any trailer bytes.
-        """
-        if self.body_bytes:
-            body_fallback = self.body_bytes
-        elif self.body:
-            body_fallback = self.body.encode()
-        else:
-            body_fallback = b""
-        header_end = self.wire_raw_bytes.find(b"\r\n\r\n")
-        if header_end == -1:
-            return body_fallback
-
-        return self.wire_raw_bytes[header_end + 4 :]
+    def text(self) -> str:
+        """Return the body decoded as UTF-8 with replacement."""
+        if self.body is None:
+            return ""
+        return self.body.decode("utf-8", errors="replace")
 
     @property
     def json_body(self) -> Any:
-        if self.body == "":
+        if not self.body:
             return None
         return json.loads(self.body)
 
@@ -124,7 +100,7 @@ class HTTPRequest:
         Forward proxy requests have the full URL in the request line,
         e.g., GET http://example.com/path HTTP/1.1
         """
-        return self.path.startswith("http://") or self.path.startswith(
+        return self.target.startswith("http://") or self.target.startswith(
             "https://"
         )
 
@@ -136,7 +112,7 @@ class HTTPRequest:
             ParsedURI with scheme, host, port, path for absolute-form URIs,
             or None for origin-form URIs (e.g., "/path").
         """
-        return parse_absolute_uri(self.path)
+        return parse_absolute_uri(self.target)
 
     @property
     def effective_path(self) -> str:
@@ -145,18 +121,145 @@ class HTTPRequest:
         For absolute-form URIs (e.g., "http://example.com/foo?bar=1"),
         returns just the path and query string ("/foo?bar=1").
 
-        For origin-form URIs (e.g., "/foo"), returns the path as-is.
+        For origin-form URIs (e.g., "/foo"), returns the target as-is.
 
         This is useful for route matching where you want
         add_route("GET", "/foo", handler) to match both origin-form
         and absolute-form requests.
         """
-        if not self.path:
+        if not self.target:
             return "/"
         uri = self.target_uri
         if uri is not None:
             return uri.path
-        return self.path
+        return self.target
+
+
+def _parsed_body(parsed: ParsedRequest) -> bytes | None:
+    """Map a parsed body to HTTPRequest.body semantics (absent → None)."""
+    if parsed.body_parts:
+        return parsed.body
+    if is_chunked_transfer(parsed.headers):
+        return b""
+    if content_length(parsed.headers) is not None:
+        return b""
+    return None
+
+
+@dataclass(frozen=True)
+class RecordedHTTPRequest:
+    """An HTTPRequest we witnessed on the wire, plus the evidence.
+
+    ``request`` carries the current semantics (middleware rewrites
+    included); ``as_received`` carries the semantics exactly as parsed
+    off the wire.  ``wire_raw_bytes`` is *exactly* what came off the
+    wire, including:
+      - request line
+      - headers
+      - the blank line
+      - body bytes (including chunk framing for chunked requests)
+
+    Reads delegate to ``request``; writes (``with_method`` etc.) rebuild
+    ``request`` while ``as_received`` and the wire evidence never change
+    after construction.
+    """
+
+    request: HTTPRequest
+    as_received: HTTPRequest
+    wire_raw_bytes: bytes
+    http_version: str
+    client: tuple[str, int] | None = None
+
+    @classmethod
+    def from_parsed(
+        cls,
+        parsed: ParsedRequest,
+        wire_raw_bytes: bytes,
+        *,
+        client: tuple[str, int] | None = None,
+        writer: Writer | None = None,
+    ) -> RecordedHTTPRequest:
+        target = (
+            parsed.url.decode("ascii", errors="replace")
+            if parsed.url is not None
+            else ""
+        )
+        if client is None and writer is not None:
+            peer = writer.get_extra_info("peername")
+            if isinstance(peer, tuple) and len(peer) >= 2:
+                client = (peer[0], peer[1])
+
+        request = HTTPRequest(
+            method=parsed.method or "",
+            target=target,
+            headers=headers_to_headers(parsed.headers),
+            body=_parsed_body(parsed),
+        )
+        return cls(
+            request=request,
+            as_received=request,
+            wire_raw_bytes=wire_raw_bytes,
+            http_version=parsed.http_version or "",
+            client=client,
+        )
+
+    @property
+    def method(self) -> str:
+        return self.request.method
+
+    @property
+    def target(self) -> str:
+        return self.request.target
+
+    @property
+    def headers(self) -> Headers:
+        return self.request.headers
+
+    @property
+    def body(self) -> bytes | None:
+        return self.request.body
+
+    @property
+    def text(self) -> str:
+        return self.request.text
+
+    @property
+    def json_body(self) -> Any:
+        return self.request.json_body
+
+    @property
+    def is_proxy_request(self) -> bool:
+        return self.request.is_proxy_request
+
+    @property
+    def target_uri(self) -> ParsedURI | None:
+        return self.request.target_uri
+
+    @property
+    def effective_path(self) -> str:
+        return self.request.effective_path
+
+    def with_method(self, method: str) -> RecordedHTTPRequest:
+        return replace(self, request=replace(self.request, method=method))
+
+    def with_target(self, target: str) -> RecordedHTTPRequest:
+        return replace(self, request=replace(self.request, target=target))
+
+    def with_headers(self, headers: Headers) -> RecordedHTTPRequest:
+        return replace(self, request=replace(self.request, headers=headers))
+
+    @property
+    def wire_body_bytes(self) -> bytes:
+        """Return request body bytes as they appeared on the wire.
+
+        For chunked/aws-chunked uploads this includes the original chunk
+        framing and any trailer bytes.
+        """
+        header_end = self.wire_raw_bytes.find(b"\r\n\r\n")
+        if header_end == -1:
+            return self.as_received.body or b""
+
+        return self.wire_raw_bytes[header_end + 4 :]
 
 
 @dataclass(frozen=True)
@@ -623,7 +726,7 @@ class HTTPRequestReader:
         reader: asyncio.StreamReader,
         writer: Writer | None = None,
         connection_wire: bytearray | None = None,
-    ) -> HTTPRequest | None:
+    ) -> RecordedHTTPRequest | None:
         """Parse a complete HTTP request from the stream.
 
         Args:
@@ -632,7 +735,7 @@ class HTTPRequestReader:
             connection_wire: Optional buffer for connection-level tracking
 
         Returns:
-            HTTPRequest or None on EOF/parse error
+            RecordedHTTPRequest or None on EOF/parse error
         """
         parser = AsyncRequestParser(max_read=self._max_read)
         parsed, wire_bytes = await parser.parse(reader, connection_wire)
@@ -640,32 +743,6 @@ class HTTPRequestReader:
         if parsed is None:
             return None
 
-        return HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
-
-
-def parsed_body_bytes_from_wire_raw_bytes(
-    wire_raw_bytes: bytes,
-) -> bytes | None:
-    """Parse wire request bytes and return the decoded body bytes.
-
-    This returns the body bytes as produced by the HTTP parser. For chunked
-    uploads, this is the de-chunked body (it does not include chunk framing
-    or trailer bytes).
-
-    Returns None if the wire bytes cannot be parsed as a complete request.
-    """
-    if not wire_raw_bytes:
-        return None
-
-    protocol = RequestProtocol()
-    parser = httptools.HttpRequestParser(protocol)
-    protocol.set_parser(parser)
-    try:
-        parser.feed_data(wire_raw_bytes)
-    except httptools.HttpParserError:
-        return None
-
-    if not protocol.result.is_complete:
-        return None
-
-    return protocol.result.body
+        return RecordedHTTPRequest.from_parsed(
+            parsed, wire_bytes, writer=writer
+        )

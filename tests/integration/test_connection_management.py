@@ -3,7 +3,7 @@ import socket
 
 import pytest
 
-from localstub.forward import Forwarder
+from localstub.forward import RawForwarder
 from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
 from localstub.server import (
     AsyncHTTPTestServer,
@@ -253,7 +253,7 @@ async def test_bodyless_response_preserves_keep_alive_connection(
     throttled: bool,
 ) -> None:
     def handler(ctx: ResponderContext) -> HTTPResponse:
-        if ctx.request.path == "/bodyless":
+        if ctx.request.target == "/bodyless":
             return HTTPResponse(status=status, body=b"unexpected-body")
         return HTTPResponse.text("next-response")
 
@@ -350,7 +350,7 @@ async def test_raw_forwarder_drops_connection_scoped_headers():
     upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
 
     try:
-        forwarder = Forwarder(verify_upstream=False)
+        forwarder = RawForwarder(verify_upstream=False)
         async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
             reader, writer = await asyncio.open_connection(
                 proxy.host, proxy.port

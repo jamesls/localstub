@@ -1,31 +1,59 @@
 from __future__ import annotations
 
-import gzip
-from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
-import httpx
 import pytest
 
+from localstub.http.client import HTTPClientError
 from localstub.http.headers import Headers
-from localstub.http.proxy import build_origin_form_request, forward_via_httpx
-from localstub.http.request import HTTPRequest
+from localstub.http.proxy import (
+    build_origin_form_request,
+    forward_proxy_request,
+)
+from localstub.http.request import HTTPRequest, RecordedHTTPRequest
+from localstub.http.responsespec import HTTPResponse
 
 
-class AsyncResponseStream(httpx.AsyncByteStream):
-    def __init__(self, data: bytes = b"") -> None:
-        self._data = data
+@dataclass
+class StubHTTPClient:
+    response: HTTPResponse = field(default_factory=HTTPResponse)
+    requests: list[HTTPRequest] = field(default_factory=list)
 
-    async def __aiter__(self) -> AsyncIterator[bytes]:
-        yield self._data
+    async def send(self, request: HTTPRequest) -> HTTPResponse:
+        self.requests.append(request)
+        return self.response
 
 
-def _proxy_request(uri: str) -> HTTPRequest:
+@dataclass
+class FailingHTTPClient:
+    message: str
+
+    async def send(self, request: HTTPRequest) -> HTTPResponse:
+        raise HTTPClientError(self.message)
+
+
+def _recorded(
+    request: HTTPRequest,
+    *,
+    wire_raw_bytes: bytes = b"",
+    http_version: str = "1.1",
+) -> RecordedHTTPRequest:
+    return RecordedHTTPRequest(
+        request=request,
+        as_received=request,
+        wire_raw_bytes=wire_raw_bytes,
+        http_version=http_version,
+    )
+
+
+def _proxy_request(uri: str) -> RecordedHTTPRequest:
     host = uri.split("://", 1)[1].split("/", 1)[0]
-    return HTTPRequest(
-        method="GET",
-        path=uri,
-        http_version="1.1",
-        headers=Headers.from_items([("Host", host)]),
+    return _recorded(
+        HTTPRequest(
+            method="GET",
+            target=uri,
+            headers=Headers.from_items([("Host", host)]),
+        )
     )
 
 
@@ -82,10 +110,11 @@ def test_build_origin_form_request_omits_default_https_port() -> None:
 
 
 def test_build_origin_form_request_adds_host_when_missing() -> None:
-    request = HTTPRequest(
-        method="GET",
-        path="http://example.com:443/path",
-        http_version="1.1",
+    request = _recorded(
+        HTTPRequest(
+            method="GET",
+            target="http://example.com:443/path",
+        )
     )
     uri = request.target_uri
 
@@ -96,141 +125,171 @@ def test_build_origin_form_request_adds_host_when_missing() -> None:
     assert _host_header(wire) == "example.com:443"
 
 
-@pytest.mark.asyncio
-async def test_httpx_proxy_strips_dynamic_request_headers() -> None:
-    received_headers: httpx.Headers | None = None
-
-    def handle_request(request: httpx.Request) -> httpx.Response:
-        nonlocal received_headers
-        received_headers = request.headers
-        return httpx.Response(200, stream=AsyncResponseStream())
-
-    request = HTTPRequest(
-        method="GET",
-        path="http://example.com/path",
-        http_version="1.1",
-        headers=Headers.from_items([
-            ("Host", "example.com"),
-            ("Connection", "X-Hop"),
-            ("X-Hop", "request-only"),
-            ("X-End-To-End", "preserved"),
-        ]),
+def test_build_origin_form_request_keeps_prefixed_http_version() -> None:
+    request = _recorded(
+        HTTPRequest(
+            method="GET",
+            target="http://example.com/path",
+            headers=Headers.from_items([("Host", "example.com")]),
+        ),
+        http_version="HTTP/1.0",
     )
-    transport = httpx.MockTransport(handle_request)
+    uri = request.target_uri
 
-    async with httpx.AsyncClient(transport=transport) as client:
-        await forward_via_httpx(client, request)
+    assert uri is not None
 
-    assert received_headers is not None
-    assert "X-Hop" not in received_headers
-    assert received_headers["X-End-To-End"] == "preserved"
+    wire = build_origin_form_request(request, uri)
+
+    assert wire.startswith(b"GET /path HTTP/1.0\r\n")
+
+
+def test_build_origin_form_request_preserves_wire_body_framing() -> None:
+    chunked_body = b"4\r\nwiki\r\n0\r\n\r\n"
+    wire = (
+        b"POST http://example.com/upload HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n" + chunked_body
+    )
+    request = _recorded(
+        HTTPRequest(
+            method="POST",
+            target="http://example.com/upload",
+            headers=Headers.from_items([
+                ("Host", "example.com"),
+                ("Transfer-Encoding", "chunked"),
+            ]),
+            body=b"wiki",
+        ),
+        wire_raw_bytes=wire,
+    )
+    uri = request.target_uri
+
+    assert uri is not None
+
+    origin_wire = build_origin_form_request(request, uri)
+
+    assert origin_wire.startswith(b"POST /upload HTTP/1.1\r\n")
+    assert origin_wire.endswith(b"\r\n\r\n" + chunked_body)
 
 
 @pytest.mark.asyncio
-async def test_httpx_proxy_regenerates_content_length_after_body_rewrite() -> (
-    None
-):
-    received_request: httpx.Request | None = None
+async def test_forward_proxy_request_rejects_non_absolute_target() -> None:
+    client = StubHTTPClient()
+    recorded = _recorded(HTTPRequest(method="GET", target="/path"))
 
-    def handle_request(request: httpx.Request) -> httpx.Response:
-        nonlocal received_request
-        received_request = request
-        return httpx.Response(200, stream=AsyncResponseStream())
+    response = await forward_proxy_request(client, recorded)
 
+    assert response.status == 400
+    assert response.body == b"Bad Request: Not an absolute URI"
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_forward_proxy_request_strips_dynamic_request_headers() -> None:
+    client = StubHTTPClient()
+    recorded = _recorded(
+        HTTPRequest(
+            method="GET",
+            target="http://example.com/path",
+            headers=Headers.from_items([
+                ("Host", "example.com"),
+                ("Connection", "X-Hop"),
+                ("X-Hop", "request-only"),
+                ("Proxy-Authorization", "secret"),
+                ("X-End-To-End", "preserved"),
+            ]),
+        )
+    )
+
+    await forward_proxy_request(client, recorded)
+
+    assert len(client.requests) == 1
+    sent = client.requests[0]
+    assert sent.target == "http://example.com/path"
+    assert "Host" not in sent.headers
+    assert "Connection" not in sent.headers
+    assert "X-Hop" not in sent.headers
+    assert "Proxy-Authorization" not in sent.headers
+    assert sent.headers["X-End-To-End"] == "preserved"
+
+
+@pytest.mark.asyncio
+async def test_forward_proxy_request_drops_stale_content_length() -> None:
+    client = StubHTTPClient()
     rewritten_body = b"rewritten body"
-    request = HTTPRequest(
-        method="POST",
-        path="http://example.com/path",
-        http_version="1.1",
-        headers=Headers.from_items([
-            ("Host", "example.com"),
-            ("Content-Length", "4"),
-        ]),
-        body_bytes=rewritten_body,
-    )
-    transport = httpx.MockTransport(handle_request)
-
-    async with httpx.AsyncClient(transport=transport) as client:
-        response = await forward_via_httpx(client, request)
-
-    assert response.status == 200
-    assert received_request is not None
-    assert received_request.content == rewritten_body
-    assert received_request.headers["Content-Length"] == str(
-        len(rewritten_body)
+    recorded = _recorded(
+        HTTPRequest(
+            method="POST",
+            target="http://example.com/path",
+            headers=Headers.from_items([
+                ("Host", "example.com"),
+                ("Content-Length", "4"),
+            ]),
+            body=rewritten_body,
+        )
     )
 
+    await forward_proxy_request(client, recorded)
 
-@pytest.mark.asyncio
-async def test_httpx_proxy_strips_dynamic_response_headers() -> None:
-    def handle_request(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={
-                "Connection": "X-Hop",
-                "X-Hop": "response-only",
-                "X-End-To-End": "preserved",
-            },
-            stream=AsyncResponseStream(),
-        )
-
-    request = _proxy_request("http://example.com/path")
-    transport = httpx.MockTransport(handle_request)
-
-    async with httpx.AsyncClient(transport=transport) as client:
-        response = await forward_via_httpx(client, request)
-
-    response_headers = {
-        name.lower(): value for name, value in response.headers.items()
-    }
-    assert "connection" not in response_headers
-    assert "x-hop" not in response_headers
-    assert response_headers["x-end-to-end"] == "preserved"
+    assert len(client.requests) == 1
+    sent = client.requests[0]
+    assert sent.body == rewritten_body
+    assert "Content-Length" not in sent.headers
 
 
 @pytest.mark.asyncio
-async def test_httpx_proxy_with_hook_consumed_stream_returns_body() -> None:
-    body = b"hook consumed response"
-    compressed_body = gzip.compress(body)
+async def test_forward_proxy_request_maps_client_error_to_502() -> None:
+    client = FailingHTTPClient(message="boom")
+    recorded = _proxy_request("http://example.com/path")
 
-    def handle_request(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"Content-Encoding": "gzip"},
-            stream=AsyncResponseStream(compressed_body),
+    response = await forward_proxy_request(client, recorded)
+
+    assert response.status == 502
+    assert response.body == b"Bad Gateway: boom"
+
+
+@pytest.mark.asyncio
+async def test_forward_proxy_request_strips_dynamic_response_headers() -> None:
+    client = StubHTTPClient(
+        response=HTTPResponse(
+            status=200,
+            headers=Headers.from_items([
+                ("Connection", "X-Hop"),
+                ("X-Hop", "response-only"),
+                ("Transfer-Encoding", "chunked"),
+                ("X-End-To-End", "preserved"),
+            ]),
+            body=b"",
         )
+    )
+    recorded = _proxy_request("http://example.com/path")
 
-    async def read_body_hook(response: httpx.Response) -> None:
-        await response.aread()
+    response = await forward_proxy_request(client, recorded)
 
-    request = _proxy_request("http://example.com/path")
-    transport = httpx.MockTransport(handle_request)
+    names = {name.lower() for name, _ in response.headers.items()}
+    assert "connection" not in names
+    assert "x-hop" not in names
+    assert "transfer-encoding" not in names
+    assert response.headers["X-End-To-End"] == "preserved"
 
-    async with httpx.AsyncClient(
-        transport=transport,
-        event_hooks={"response": [read_body_hook]},
-    ) as client:
-        response = await forward_via_httpx(client, request)
+
+@pytest.mark.asyncio
+async def test_forward_proxy_request_preserves_duplicate_headers() -> None:
+    client = StubHTTPClient(
+        response=HTTPResponse(
+            status=200,
+            headers=Headers.from_items([
+                ("Set-Cookie", "a=1"),
+                ("Set-Cookie", "b=2"),
+            ]),
+            body=b"payload",
+        )
+    )
+    recorded = _proxy_request("http://example.com/path")
+
+    response = await forward_proxy_request(client, recorded)
 
     assert response.status == 200
-    assert response.body == body
-    response_header_names = {name.lower() for name in response.headers}
-    assert "content-encoding" not in response_header_names
-    assert "content-length" not in response_header_names
-
-
-@pytest.mark.asyncio
-async def test_httpx_proxy_forwards_response_built_from_content_bytes() -> (
-    None
-):
-    def handle_request(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"mock body")
-
-    request = _proxy_request("http://example.com/path")
-    transport = httpx.MockTransport(handle_request)
-
-    async with httpx.AsyncClient(transport=transport) as client:
-        response = await forward_via_httpx(client, request)
-
-    assert response.status == 200
-    assert response.body == b"mock body"
+    assert response.body == b"payload"
+    assert response.headers.get_all("Set-Cookie") == ["a=1", "b=2"]

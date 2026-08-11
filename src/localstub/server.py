@@ -13,23 +13,21 @@ from typing import (
     Self,
 )
 
-import httpx
-
-from localstub.forward import Forwarder
+from localstub.forward import RawForwarder
+from localstub.http.client import HTTPClient
 from localstub.http.connection import should_close_connection
 from localstub.http.exchange import RecordedExchange
 from localstub.http.request import (
     AsyncRequestParser,
-    HTTPRequest,
     HTTPRequestHeaders,
     ParsedRequest,
+    RecordedHTTPRequest,
 )
-from localstub.http.response import RecordedResponse
-from localstub.http.responsespec import HTTPResponse
+from localstub.http.response import RecordedHTTPResponse
+from localstub.http.responsespec import HeadersLike, HTTPResponse
 from localstub.http.utils import (
     headers_to_headers,
     maybe_await,
-    message_from_items,
     status_phrase,
 )
 from localstub.middleware import (
@@ -52,8 +50,8 @@ from localstub.middleware import (
     compose_sender,
 )
 from localstub.middleware.builtins import (
+    ForwardProxyMiddleware,
     HandlerMiddleware,
-    HttpxForwardProxyMiddleware,
     RawForwardProxyMiddleware,
     ResponseSequenceMiddleware,
     RouterMiddleware,
@@ -103,7 +101,7 @@ async def _drain_pending_accepts() -> None:
         await asyncio.sleep(0)
 
 
-def _default_throttle_key(_: HTTPRequest) -> str:
+def _default_throttle_key(_: RecordedHTTPRequest) -> str:
     return "global"
 
 
@@ -401,7 +399,8 @@ class AsyncHTTPTestServer:
 
     Features:
       * exposes .url (e.g. "http://127.0.0.1:12345/")
-      * records last_request (HTTPRequest) and a list of all requests
+      * records last_request (RecordedHTTPRequest) and a list of all
+        requests
       * `wire_raw_bytes` contains the *exact* bytes received, including
         chunked / aws-chunked framing and trailers.
       * configurable static response, or plug in responder middleware.
@@ -414,8 +413,8 @@ class AsyncHTTPTestServer:
         handler: ResponderHandler | None = None,
         default_response: HTTPResponse | None = None,
         on_headers_received: OnHeadersReceived | None = None,
-        proxy_forwarder: httpx.AsyncClient | None = None,
-        raw_forwarder: Forwarder | None = None,
+        upstream_client: HTTPClient | None = None,
+        raw_forwarder: RawForwarder | None = None,
         clock: Clock | None = None,
         timestamp_provider: TimestampProvider | None = None,
         recording_buffer_size: int | None = DEFAULT_RECORDING_BUFFER_SIZE,
@@ -433,7 +432,7 @@ class AsyncHTTPTestServer:
         )
         self.router = Router()
         self._on_headers_received = on_headers_received
-        self._proxy_forwarder = proxy_forwarder
+        self._upstream_client = upstream_client
         self._raw_forwarder = raw_forwarder
 
         self._throttle_middleware: ThrottleMiddleware | None = None
@@ -447,11 +446,9 @@ class AsyncHTTPTestServer:
             if raw_forwarder is not None
             else None
         )
-        self._httpx_forward_proxy_middleware: (
-            HttpxForwardProxyMiddleware | None
-        ) = (
-            HttpxForwardProxyMiddleware(proxy_forwarder)
-            if proxy_forwarder is not None
+        self._forward_proxy_middleware: ForwardProxyMiddleware | None = (
+            ForwardProxyMiddleware(upstream_client)
+            if upstream_client is not None
             else None
         )
 
@@ -479,17 +476,17 @@ class AsyncHTTPTestServer:
         # is consuming the records (e.g. the CLI's forward-proxy mode).
         self._recording_buffer_size = recording_buffer_size
 
-        self.last_request: HTTPRequest | None = None
-        self.requests: list[HTTPRequest] = []
-        self._request_queue: BoundedRecordQueue[HTTPRequest] = (
+        self.last_request: RecordedHTTPRequest | None = None
+        self.requests: list[RecordedHTTPRequest] = []
+        self._request_queue: BoundedRecordQueue[RecordedHTTPRequest] = (
             BoundedRecordQueue(recording_buffer_size, name="requests")
         )
-        self._response_queue: BoundedRecordQueue[RecordedResponse] = (
+        self._response_queue: BoundedRecordQueue[RecordedHTTPResponse] = (
             BoundedRecordQueue(recording_buffer_size, name="responses")
         )
 
-        self.last_response: RecordedResponse | None = None
-        self.responses: list[RecordedResponse] = []
+        self.last_response: RecordedHTTPResponse | None = None
+        self.responses: list[RecordedHTTPResponse] = []
 
         self.last_exchange: RecordedExchange | None = None
         self.exchanges: list[RecordedExchange] = []
@@ -563,7 +560,7 @@ class AsyncHTTPTestServer:
         obj: Any,
         *,
         status: int = 200,
-        headers: dict[str, str] | None = None,
+        headers: HeadersLike | None = None,
     ) -> None:
         """Configure a static JSON response returned for every request."""
         self._default_response = HTTPResponse.json(
@@ -576,7 +573,7 @@ class AsyncHTTPTestServer:
         text: str,
         *,
         status: int = 200,
-        headers: dict[str, str] | None = None,
+        headers: HeadersLike | None = None,
     ) -> None:
         self._default_response = HTTPResponse.text(
             text,
@@ -590,7 +587,7 @@ class AsyncHTTPTestServer:
         data: bytes,
         *,
         status: int = 200,
-        headers: dict[str, str] | None = None,
+        headers: HeadersLike | None = None,
     ) -> None:
         self._default_response = HTTPResponse.raw(
             data,
@@ -685,11 +682,11 @@ class AsyncHTTPTestServer:
         buf = self._connection_raw_bytes_sent.get(client)
         return bytes(buf) if buf is not None else None
 
-    def get_request_timestamp(self, request: HTTPRequest) -> float:
+    def get_request_timestamp(self, request: RecordedHTTPRequest) -> float:
         """Get the reception timestamp for a request.
 
         Args:
-            request: The HTTPRequest object to look up.
+            request: The RecordedHTTPRequest object to look up.
 
         Returns:
             Monotonic timestamp when the request was received.
@@ -800,7 +797,7 @@ class AsyncHTTPTestServer:
         if isinstance(response, HTTPResponse):
 
             def static(
-                _: HTTPRequest,
+                _: RecordedHTTPRequest,
                 __: ThrottleDecision,
                 *,
                 _response: HTTPResponse = response,
@@ -872,7 +869,9 @@ class AsyncHTTPTestServer:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose()
 
-    async def next_request(self, timeout: float | None = None) -> HTTPRequest:
+    async def next_request(
+        self, timeout: float | None = None
+    ) -> RecordedHTTPRequest:
         """Await and return the next request that hits this server."""
         if timeout is None:
             req = await self._request_queue.get()
@@ -885,7 +884,7 @@ class AsyncHTTPTestServer:
 
     async def next_response(
         self, timeout: float | None = None
-    ) -> RecordedResponse:
+    ) -> RecordedHTTPResponse:
         """Await and return the next response sent by this server."""
         if timeout is None:
             response = await self._response_queue.get()
@@ -928,8 +927,8 @@ class AsyncHTTPTestServer:
     def _record_exchange(
         self,
         *,
-        request: HTTPRequest,
-        response: RecordedResponse | None,
+        request: RecordedHTTPRequest,
+        response: RecordedHTTPResponse | None,
         request_timestamp: datetime,
         response_timestamp: datetime | None,
     ) -> None:
@@ -1005,8 +1004,8 @@ class AsyncHTTPTestServer:
             builtins.append(self._response_sequence_middleware)
         if self._raw_forward_proxy_middleware is not None:
             builtins.append(self._raw_forward_proxy_middleware)
-        if self._httpx_forward_proxy_middleware is not None:
-            builtins.append(self._httpx_forward_proxy_middleware)
+        if self._forward_proxy_middleware is not None:
+            builtins.append(self._forward_proxy_middleware)
         builtins.append(RouterMiddleware(self.router))
         builtins.append(HandlerMiddleware(lambda: self._handler))
 
@@ -1027,7 +1026,7 @@ class AsyncHTTPTestServer:
             and self._throttle_middleware is None
             and self._response_sequence_middleware is None
             and self._raw_forward_proxy_middleware is None
-            and self._httpx_forward_proxy_middleware is None
+            and self._forward_proxy_middleware is None
             and not self.router.has_routes
             and self._handler is None
         )
@@ -1035,7 +1034,7 @@ class AsyncHTTPTestServer:
     async def _send_response(
         self,
         recording_writer: RecordingStreamWriter,
-        request: HTTPRequest,
+        request: RecordedHTTPRequest,
         response: ResponseSpec,
     ) -> SendResult:
         writer = recording_writer
@@ -1134,7 +1133,7 @@ class AsyncHTTPTestServer:
 
     def _record_request(
         self,
-        request: HTTPRequest,
+        request: RecordedHTTPRequest,
     ) -> tuple[datetime, float]:
         received_monotonic = self._clock.now()
         self.last_request = request
@@ -1152,7 +1151,7 @@ class AsyncHTTPTestServer:
     async def _handle_request(
         self,
         *,
-        request: HTTPRequest,
+        request: RecordedHTTPRequest,
         request_timestamp: datetime,
         received_monotonic: float,
         state: dict[str, Any],
@@ -1302,7 +1301,7 @@ class AsyncHTTPTestServer:
         *,
         client: tuple[str, int] | None,
         connection_wire: bytearray | None = None,
-    ) -> tuple[HTTPRequest, dict[str, Any]] | None:
+    ) -> tuple[RecordedHTTPRequest, dict[str, Any]] | None:
         state: dict[str, Any] = {}
         parser = AsyncRequestParser()
 
@@ -1360,9 +1359,9 @@ class AsyncHTTPTestServer:
         parsed: ParsedRequest,
         wire_bytes: bytes,
         client: tuple[str, int] | None,
-    ) -> HTTPRequest:
-        """Build HTTPRequest from parsed data."""
-        return HTTPRequest.from_parsed(
+    ) -> RecordedHTTPRequest:
+        """Build RecordedHTTPRequest from parsed data."""
+        return RecordedHTTPRequest.from_parsed(
             parsed,
             wire_bytes,
             client=client,
@@ -1372,20 +1371,15 @@ class AsyncHTTPTestServer:
         self,
         response: HTTPResponse,
         wire_bytes: bytes,
-    ) -> RecordedResponse:
-        """Build RecordedResponse from response and wire bytes."""
-        reason = status_phrase(response.status)
-
-        body = self._normalize_body(response.body)
-        body_text = body.decode("utf-8", errors="replace") if body else None
-
-        headers = message_from_items(response.headers.items())
-
-        return RecordedResponse(
-            status=response.status,
-            reason=reason,
-            headers=headers,
-            body=body_text,
+    ) -> RecordedHTTPResponse:
+        """Build RecordedHTTPResponse from response and wire bytes."""
+        return RecordedHTTPResponse(
+            response=HTTPResponse(
+                status=response.status,
+                headers=response.headers,
+                body=self._normalize_body(response.body),
+            ),
+            reason=status_phrase(response.status),
             wire_raw_bytes=wire_bytes,
         )
 
@@ -1404,7 +1398,7 @@ class AsyncHTTPTestServer:
         body = b"" if is_informational else self._normalize_body(response.body)
         headers = self._build_response_headers(response, body, False)
 
-        for name, value in headers.items():
+        for name, value in headers:
             header_line = f"{name}: {value}\r\n".encode("ascii")
             writer.write(header_line)
 
@@ -1433,31 +1427,30 @@ class AsyncHTTPTestServer:
         response: HTTPResponse,
         body: bytes,
         should_close: bool,
-    ) -> dict[str, str]:
-        """Build complete response headers dict."""
-        headers = dict(response.headers) if response.headers else {}
-        header_names = {k.lower() for k in headers}
+    ) -> tuple[tuple[str, str], ...]:
+        """Build the complete response header items, in order."""
+        items = list(response.headers.items())
+        header_names = {name.lower() for name, _ in items}
 
         if 100 <= response.status < 200 or response.status == 204:
-            headers = {
-                name: value
-                for name, value in headers.items()
+            items = [
+                (name, value)
+                for name, value in items
                 if name.lower() != "content-length"
-            }
-            header_names = {k.lower() for k in headers}
+            ]
         elif "content-length" not in header_names:
-            headers["Content-Length"] = str(len(body))
+            items.append(("Content-Length", str(len(body))))
 
         if "connection" not in header_names and should_close:
-            headers["Connection"] = "close"
+            items.append(("Connection", "close"))
 
-        return headers
+        return tuple(items)
 
     async def _write_response(
         self,
         writer: Writer,
         response: HTTPResponse,
-        request: HTTPRequest,
+        request: RecordedHTTPRequest,
     ) -> bool:
         body = self._normalize_body(response.body)
         body_allowed = request.method.upper() != "HEAD" and not (
@@ -1471,7 +1464,7 @@ class AsyncHTTPTestServer:
         headers = self._build_response_headers(response, body, should_close)
         head = _serialize_response_head(
             response.status,
-            tuple(headers.items()),
+            headers,
         )
 
         if isinstance(self._transmission_strategy, ImmediateTransmission):

@@ -61,6 +61,49 @@ def test_parse_absolute_uri_empty_string_returns_none() -> None:
     assert parse_absolute_uri("") is None
 
 
+def test_parsed_uri_authority_omits_default_http_port() -> None:
+    result = parse_absolute_uri("http://example.com/path")
+
+    assert result is not None
+    assert result.authority == "example.com"
+
+
+def test_parsed_uri_authority_omits_default_https_port() -> None:
+    result = parse_absolute_uri("https://example.com/path")
+
+    assert result is not None
+    assert result.authority == "example.com"
+
+
+def test_parsed_uri_authority_keeps_explicit_port() -> None:
+    result = parse_absolute_uri("http://example.com:8080/path")
+
+    assert result is not None
+    assert result.authority == "example.com:8080"
+
+
+def test_parsed_uri_authority_keeps_other_schemes_default_port() -> None:
+    result = parse_absolute_uri("http://example.com:443/path")
+
+    assert result is not None
+    assert result.authority == "example.com:443"
+
+
+def test_parsed_uri_authority_brackets_ipv6_host_with_port() -> None:
+    result = parse_absolute_uri("http://[::1]:8080/path")
+
+    assert result is not None
+    assert result.host == "::1"
+    assert result.authority == "[::1]:8080"
+
+
+def test_parsed_uri_authority_brackets_ipv6_host_default_port() -> None:
+    result = parse_absolute_uri("http://[::1]/path")
+
+    assert result is not None
+    assert result.authority == "[::1]"
+
+
 def test_parsed_uri_is_frozen() -> None:
     result = parse_absolute_uri("http://example.com/path")
 
