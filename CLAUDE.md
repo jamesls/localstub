@@ -8,7 +8,7 @@ localstub is a Python library providing an asyncio-based HTTP test server for te
 
 ## Development Environment
 
-- **Python Version**: 3.12 (strictly, not 3.13+)
+- **Python Version**: 3.12 through 3.14 (CI tests all three)
 - **Package Manager**: [uv](https://github.com/astral-sh/uv)
 - **Task Runner**: [Poe the Poet](https://github.com/nat-n/poethepoet)
 
