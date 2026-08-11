@@ -4,14 +4,14 @@ import base64
 import io
 import json
 from datetime import UTC, datetime
-from email.message import Message
 
 import pytest
 
 from localstub.http.exchange import RecordedExchange
 from localstub.http.headers import Headers
-from localstub.http.request import HTTPRequest
-from localstub.http.response import RecordedResponse
+from localstub.http.request import HTTPRequest, RecordedHTTPRequest
+from localstub.http.response import RecordedHTTPResponse
+from localstub.http.responsespec import HTTPResponse
 from localstub.server import AsyncHTTPTestServer
 from localstub.traffic_jsonl import (
     JSONLTrafficWriter,
@@ -20,26 +20,47 @@ from localstub.traffic_jsonl import (
 )
 
 
-def test_exchange_to_json_obj_encodes_wire_bytes_and_timestamps() -> None:
-    req_headers = Headers.from_items([("Host", "example.com")])
+def _recorded_request(
+    method: str,
+    target: str,
+    *,
+    headers: Headers | None = None,
+    body: bytes | None = None,
+    wire_raw_bytes: bytes = b"",
+    client: tuple[str, int] | None = None,
+) -> RecordedHTTPRequest:
     request = HTTPRequest(
-        method="GET",
-        path="/example",
+        method=method,
+        target=target,
+        headers=headers if headers is not None else Headers.empty(),
+        body=body,
+    )
+    return RecordedHTTPRequest(
+        request=request,
+        as_received=request,
+        wire_raw_bytes=wire_raw_bytes,
         http_version="1.1",
-        headers=req_headers,
-        body="",
-        body_bytes=b"",
+        client=client,
+    )
+
+
+def test_exchange_to_json_obj_encodes_wire_bytes_and_timestamps() -> None:
+    request = _recorded_request(
+        "GET",
+        "/example",
+        headers=Headers.from_items([("Host", "example.com")]),
+        body=b"",
         wire_raw_bytes=b"GET /example HTTP/1.1\r\n\r\n",
         client=("127.0.0.1", 12345),
     )
 
-    resp_headers = Message()
-    resp_headers["Content-Type"] = "text/plain"
-    response = RecordedResponse(
-        status=200,
+    response = RecordedHTTPResponse(
+        response=HTTPResponse(
+            status=200,
+            headers=Headers.from_items([("Content-Type", "text/plain")]),
+            body=b"hello",
+        ),
         reason="OK",
-        headers=resp_headers,
-        body="hello",
         wire_raw_bytes=b"HTTP/1.1 200 OK\r\n\r\nhello",
     )
 
@@ -81,21 +102,15 @@ def test_exchange_to_json_obj_encodes_wire_bytes_and_timestamps() -> None:
 
 
 def test_exchange_to_json_obj_handles_decode_errors() -> None:
-    request = HTTPRequest(
-        method="POST",
-        path="/binary",
-        http_version="1.1",
-        headers=Headers.empty(),
-        body="",
-        body_bytes=b"\xff",
+    request = _recorded_request(
+        "POST",
+        "/binary",
+        body=b"\xff",
         wire_raw_bytes=b"POST /binary HTTP/1.1\r\n\r\n\xff",
-        client=None,
     )
-    response = RecordedResponse(
-        status=200,
+    response = RecordedHTTPResponse(
+        response=HTTPResponse(status=200),
         reason="OK",
-        headers=None,
-        body=None,
         wire_raw_bytes=b"HTTP/1.1 200 OK\r\n\r\n\xff",
     )
 
@@ -112,16 +127,11 @@ def test_exchange_to_json_obj_handles_decode_errors() -> None:
     assert obj["request"]["client"] is None
 
 
-def test_exchange_to_json_obj_includes_proxy_fields() -> None:
-    request = HTTPRequest(
-        method="GET",
-        path="http://example.com/foo?bar=1",
-        http_version="1.1",
-        headers=Headers.empty(),
-        body="",
-        body_bytes=b"",
-        wire_raw_bytes=b"",
-        client=None,
+def test_exchange_to_json_obj_none_body_serializes_as_null() -> None:
+    request = _recorded_request(
+        "GET",
+        "/no-body",
+        wire_raw_bytes=b"GET /no-body HTTP/1.1\r\n\r\n",
     )
     exchange = RecordedExchange(
         request=request,
@@ -132,22 +142,33 @@ def test_exchange_to_json_obj_includes_proxy_fields() -> None:
 
     obj = exchange_to_json_obj(exchange)
     req_obj = obj["request"]
+    assert isinstance(req_obj, dict)
+    assert req_obj["body"] is None
+
+
+def test_exchange_to_json_obj_includes_proxy_fields() -> None:
+    request = _recorded_request(
+        "GET",
+        "http://example.com/foo?bar=1",
+        body=b"",
+    )
+    exchange = RecordedExchange(
+        request=request,
+        response=None,
+        request_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
+        response_timestamp=None,
+    )
+
+    obj = exchange_to_json_obj(exchange)
+    req_obj = obj["request"]
+    assert req_obj["path"] == "http://example.com/foo?bar=1"
     assert req_obj["target_host"] == "example.com"
     assert req_obj["target_port"] == 80
     assert req_obj["effective_path"] == "/foo?bar=1"
 
 
 def test_jsonl_writer_writes_single_line() -> None:
-    request = HTTPRequest(
-        method="GET",
-        path="/",
-        http_version="1.1",
-        headers=Headers.empty(),
-        body="",
-        body_bytes=b"",
-        wire_raw_bytes=b"",
-        client=None,
-    )
+    request = _recorded_request("GET", "/", body=b"")
     exchange = RecordedExchange(
         request=request,
         response=None,
@@ -168,13 +189,13 @@ def test_jsonl_writer_writes_single_line() -> None:
 def test_dump_server_traffic_jsonl_supports_start_end(tmp_path) -> None:
     server = AsyncHTTPTestServer()
     exchange1 = RecordedExchange(
-        request=HTTPRequest(method="GET", path="/a", http_version="1.1"),
+        request=_recorded_request("GET", "/a"),
         response=None,
         request_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
         response_timestamp=None,
     )
     exchange2 = RecordedExchange(
-        request=HTTPRequest(method="GET", path="/b", http_version="1.1"),
+        request=_recorded_request("GET", "/b"),
         response=None,
         request_timestamp=datetime(2026, 1, 27, tzinfo=UTC),
         response_timestamp=None,

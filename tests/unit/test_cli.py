@@ -18,10 +18,32 @@ from localstub.cli import (
 )
 from localstub.http.exchange import RecordedExchange
 from localstub.http.headers import Headers
-from localstub.http.request import HTTPRequest
+from localstub.http.request import HTTPRequest, RecordedHTTPRequest
+from localstub.http.response import RecordedHTTPResponse
 from localstub.middleware import ResponderContext
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
-from localstub.tlsproxy import RecordedResponse
+
+
+def _recorded_request(
+    method: str,
+    target: str,
+    *,
+    headers: Headers | None = None,
+    wire_raw_bytes: bytes = b"",
+    client: tuple[str, int] | None = None,
+) -> RecordedHTTPRequest:
+    request = HTTPRequest(
+        method=method,
+        target=target,
+        headers=headers if headers is not None else Headers.empty(),
+    )
+    return RecordedHTTPRequest(
+        request=request,
+        as_received=request,
+        wire_raw_bytes=wire_raw_bytes,
+        http_version="1.1",
+        client=client,
+    )
 
 
 class TestParseArgs:
@@ -104,12 +126,10 @@ class TestProcessTrafficNoResponse:
         # Prepare a single recorded request that will have no corresponding
         # recorded response from the proxy.
         headers = Headers.from_items([("Host", "example.com")])
-        request = HTTPRequest(
-            method="GET",
-            path="/no-upstream",
-            http_version="1.1",
+        request = _recorded_request(
+            "GET",
+            "/no-upstream",
             headers=headers,
-            body="",
             wire_raw_bytes=b"GET /no-upstream HTTP/1.1\r\n\r\n",
             client=("127.0.0.1", 55555),
         )
@@ -175,12 +195,10 @@ class TestProcessTrafficShutdownDrain:
         headers = Headers.from_items([("Host", "example.com")])
         exchanges = [
             RecordedExchange(
-                request=HTTPRequest(
-                    method="GET",
-                    path=f"/queued-{i}",
-                    http_version="1.1",
+                request=_recorded_request(
+                    "GET",
+                    f"/queued-{i}",
                     headers=headers,
-                    body="",
                     wire_raw_bytes=(
                         f"GET /queued-{i} HTTP/1.1\r\n\r\n".encode()
                     ),
@@ -262,20 +280,16 @@ class TestProcessTrafficTimestamps:
         response_timestamp = datetime(2000, 1, 1, 0, 0, 1, tzinfo=UTC)
 
         headers = Headers.from_items([("Host", "example.com")])
-        request = HTTPRequest(
-            method="GET",
-            path="/delayed-response",
-            http_version="1.1",
+        request = _recorded_request(
+            "GET",
+            "/delayed-response",
             headers=headers,
-            body="",
             wire_raw_bytes=b"GET /delayed-response HTTP/1.1\r\n\r\n",
             client=("127.0.0.1", 55555),
         )
-        response = RecordedResponse(
-            status=200,
+        response = RecordedHTTPResponse(
+            response=HTTPResponse(status=200),
             reason="OK",
-            headers=None,
-            body=None,
             wire_raw_bytes=b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
         )
         exchange = RecordedExchange(
@@ -335,7 +349,7 @@ class TestProcessHttpProxyTrafficNoResponse:
             def now(self) -> datetime:
                 return self._ts
 
-        def _boom_handler(_: HTTPRequest) -> HTTPResponse:
+        def _boom_handler(_: ResponderContext) -> HTTPResponse:
             raise RuntimeError("boom")
 
         out = io.StringIO()
@@ -377,7 +391,7 @@ class TestProcessHttpProxyTrafficNoResponse:
         release_slow = asyncio.Event()
 
         async def handler(ctx: ResponderContext) -> HTTPResponse:
-            if ctx.request.path == "/slow":
+            if ctx.request.target == "/slow":
                 slow_started.set()
                 await release_slow.wait()
                 return HTTPResponse.text("slow-response")

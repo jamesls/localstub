@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from localstub.http.request import HTTPRequest
+from localstub.http.request import RecordedHTTPRequest
 from localstub.http.utils import maybe_await
 from localstub.middleware import ResponderContext, ResponseSpec
 
@@ -26,7 +26,7 @@ class Router:
     def add(self, method: str, path: str, handler: ResponderHandler) -> None:
         self._routes[(method.upper(), path)] = handler
 
-    def match(self, request: HTTPRequest) -> ResponderHandler | None:
+    def match(self, request: RecordedHTTPRequest) -> ResponderHandler | None:
         key = (
             request.method.upper() if request.method else "",
             request.effective_path,

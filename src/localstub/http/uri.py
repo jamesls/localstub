@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
 
 @dataclass(frozen=True)
 class ParsedURI:
@@ -18,6 +20,20 @@ class ParsedURI:
     host: str
     port: int
     path: str  # includes query string, e.g., "/foo?bar=1"
+
+    @property
+    def authority(self) -> str:
+        """Render the Host header value for this URI.
+
+        IPv6 literals are bracketed (``[::1]``) so the host cannot be
+        confused with a port.  The port is omitted only when it is the
+        default for the scheme, so ``http://example.com:443/`` keeps
+        its explicit port.
+        """
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        if self.port == _DEFAULT_PORTS.get(self.scheme):
+            return host
+        return f"{host}:{self.port}"
 
 
 def parse_absolute_uri(uri: str) -> ParsedURI | None:

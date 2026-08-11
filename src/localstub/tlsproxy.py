@@ -14,20 +14,20 @@ if TYPE_CHECKING:
 
 from localstub.ca import TLSProxyCA
 from localstub.forward import (
-    Forwarder,
     ForwardError,
+    RawForwarder,
     ResponseTransformer,
+    TransformContext,
     TransformResult,
-    UpstreamResponse,
 )
 from localstub.http.exchange import RecordedExchange
 from localstub.http.request import (
     AsyncRequestParser,
-    HTTPRequest,
     ParsedRequest,
+    RecordedHTTPRequest,
 )
 from localstub.http.response import (
-    RecordedResponse,
+    RecordedHTTPResponse,
 )
 from localstub.recording import (
     DEFAULT_RECORDING_BUFFER_SIZE,
@@ -127,17 +127,17 @@ class AsyncTLSInterceptProxy:
         verify_upstream: bool = True,
         upstream_tls: bool = True,
         response_transformer: ResponseTransformer | None = None,
-        forwarder: Forwarder | None = None,
+        forwarder: RawForwarder | None = None,
         recording_buffer_size: int | None = DEFAULT_RECORDING_BUFFER_SIZE,
     ) -> None:
         # Recording queues for forwarded traffic.  Bounded so memory stays
         # flat when a consumer never drains a stream (e.g. the CLI only
         # reads exchanges).  Created first so an invalid buffer size fails
         # before the CA default resolution generates keys and writes files.
-        self._recorded_requests: BoundedRecordQueue[HTTPRequest] = (
+        self._recorded_requests: BoundedRecordQueue[RecordedHTTPRequest] = (
             BoundedRecordQueue(recording_buffer_size, name="requests")
         )
-        self._recorded_responses: BoundedRecordQueue[RecordedResponse] = (
+        self._recorded_responses: BoundedRecordQueue[RecordedHTTPResponse] = (
             BoundedRecordQueue(recording_buffer_size, name="responses")
         )
         self._recorded_exchanges: BoundedRecordQueue[RecordedExchange] = (
@@ -152,7 +152,7 @@ class AsyncTLSInterceptProxy:
         self._default_mode = default_mode
         self._upstream_tls = upstream_tls
         if forwarder is None:
-            forwarder = Forwarder(
+            forwarder = RawForwarder(
                 max_read=max_read,
                 verify_upstream=verify_upstream,
                 response_transformer=response_transformer,
@@ -182,7 +182,9 @@ class AsyncTLSInterceptProxy:
     def ca(self) -> TLSProxyCA:
         return self._ca
 
-    async def next_request(self, timeout: float | None = None) -> HTTPRequest:
+    async def next_request(
+        self, timeout: float | None = None
+    ) -> RecordedHTTPRequest:
         if timeout is None:
             return await self._recorded_requests.get()
         return await asyncio.wait_for(
@@ -191,7 +193,7 @@ class AsyncTLSInterceptProxy:
 
     async def next_response(
         self, timeout: float | None = None
-    ) -> RecordedResponse:
+    ) -> RecordedHTTPResponse:
         if timeout is None:
             return await self._recorded_responses.get()
         return await asyncio.wait_for(
@@ -625,18 +627,20 @@ class AsyncTLSInterceptProxy:
         parsed: ParsedRequest,
         wire_bytes: bytes,
         writer: asyncio.StreamWriter,
-    ) -> tuple[HTTPRequest, datetime]:
-        """Build and record an HTTPRequest."""
+    ) -> tuple[RecordedHTTPRequest, datetime]:
+        """Build and record a RecordedHTTPRequest."""
         request_timestamp = datetime.now(UTC)
-        request = HTTPRequest.from_parsed(parsed, wire_bytes, writer=writer)
+        request = RecordedHTTPRequest.from_parsed(
+            parsed, wire_bytes, writer=writer
+        )
         self._recorded_requests.put(request)
         return request, request_timestamp
 
     def _record_exchange(
         self,
-        request: HTTPRequest,
+        request: RecordedHTTPRequest,
         request_timestamp: datetime,
-        response: RecordedResponse | None,
+        response: RecordedHTTPResponse | None,
     ) -> None:
         response_timestamp = (
             datetime.now(UTC) if response is not None else None
@@ -652,16 +656,16 @@ class AsyncTLSInterceptProxy:
 
     def _record_response(
         self,
-        request: HTTPRequest,
+        request: RecordedHTTPRequest,
         request_timestamp: datetime,
-        response: RecordedResponse,
+        response: RecordedHTTPResponse,
     ) -> None:
         self._recorded_responses.put(response)
         self._record_exchange(request, request_timestamp, response)
 
     async def _record_failure_and_close(
         self,
-        request: HTTPRequest,
+        request: RecordedHTTPRequest,
         request_timestamp: datetime,
         writer: asyncio.StreamWriter,
         status_line: bytes,
@@ -716,8 +720,8 @@ def fault_step_transformer(
         )
     """
 
-    def transform(upstream: UpstreamResponse) -> TransformResult:
-        body = upstream.body
+    def transform(context: TransformContext) -> TransformResult:
+        body = context.body
         total_delay = 0.0
         drop_after: int | None = None
 

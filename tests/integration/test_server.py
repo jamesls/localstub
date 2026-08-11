@@ -6,7 +6,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from localstub.http.request import HTTPRequest
+from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.middleware import (
     ResponderContext,
     ResponderNext,
@@ -75,7 +75,7 @@ async def test_server_receives_request_and_returns_json_response(
 
     assert server.last_request is not None
     assert server.last_request.method == "GET"
-    assert server.last_request.path == "/"
+    assert server.last_request.target == "/"
     assert len(server.requests) == 1
     assert len(server.responses) == 1
     assert server.last_response is server.responses[0]
@@ -223,7 +223,7 @@ async def test_server_throttle_key_isolated_per_path(server, client):
     clock = ManualClock()
     server.set_throttle(
         rate_per_second=1.0,
-        key=lambda request: request.path or "",
+        key=lambda request: request.target,
         clock=clock,
     )
 
@@ -267,15 +267,15 @@ async def test_server_records_multiple_requests(server, client):
     assert len(server.requests) == 3
 
     assert server.requests[0].method == "GET"
-    assert server.requests[0].path == "/first"
+    assert server.requests[0].target == "/first"
 
     assert server.requests[1].method == "POST"
-    assert server.requests[1].path == "/second"
+    assert server.requests[1].target == "/second"
     assert server.requests[1].json_body == {"data": "test"}
 
     assert server.requests[2].method == "PUT"
-    assert server.requests[2].path == "/third"
-    assert server.requests[2].body == "raw data"
+    assert server.requests[2].target == "/third"
+    assert server.requests[2].body == b"raw data"
 
     assert server.last_request is server.requests[2]
     assert server.last_request.method == "PUT"
@@ -314,10 +314,10 @@ async def test_server_tracks_requests_by_client(server):
 
     assert len(server.requests) == 4
 
-    assert server.requests[0].path == "/client1_A"
-    assert server.requests[1].path == "/client2_A"
-    assert server.requests[2].path == "/client1_B"
-    assert server.requests[3].path == "/client2_B"
+    assert server.requests[0].target == "/client1_A"
+    assert server.requests[1].target == "/client2_A"
+    assert server.requests[2].target == "/client1_B"
+    assert server.requests[3].target == "/client2_B"
 
     client1_addr = server.requests[0].client
     client2_addr = server.requests[1].client
@@ -334,16 +334,16 @@ async def test_server_tracks_requests_by_client(server):
     ]
 
     assert len(client1_requests) == 2
-    assert client1_requests[0].path == "/client1_A"
+    assert client1_requests[0].target == "/client1_A"
     assert client1_requests[0].method == "GET"
-    assert client1_requests[1].path == "/client1_B"
+    assert client1_requests[1].target == "/client1_B"
     assert client1_requests[1].method == "POST"
     assert client1_requests[1].json_body == {"id": 1}
 
     assert len(client2_requests) == 2
-    assert client2_requests[0].path == "/client2_A"
+    assert client2_requests[0].target == "/client2_A"
     assert client2_requests[0].method == "GET"
-    assert client2_requests[1].path == "/client2_B"
+    assert client2_requests[1].target == "/client2_B"
     assert client2_requests[1].method == "POST"
     assert client2_requests[1].json_body == {"id": 2}
 
@@ -361,7 +361,7 @@ async def test_clear_requests_resets_state(server, client):
     assert len(server.responses) == 2
     assert len(server.exchanges) == 2
     assert server.last_request is not None
-    assert server.last_request.path == "/second"
+    assert server.last_request.target == "/second"
     assert server.last_response is not None
     assert server.last_exchange is not None
 
@@ -384,21 +384,21 @@ async def test_clear_requests_allows_multiple_cycles(server, client):
     # Cycle 1
     await client.get(f"{server.url}cycle1")
     assert len(server.requests) == 1
-    assert server.requests[0].path == "/cycle1"
+    assert server.requests[0].target == "/cycle1"
 
     server.clear_requests()
 
     # Cycle 2
     await client.get(f"{server.url}cycle2")
     assert len(server.requests) == 1
-    assert server.requests[0].path == "/cycle2"
+    assert server.requests[0].target == "/cycle2"
 
     server.clear_requests()
 
     # Cycle 3
     await client.get(f"{server.url}cycle3")
     assert len(server.requests) == 1
-    assert server.requests[0].path == "/cycle3"
+    assert server.requests[0].target == "/cycle3"
 
 
 @pytest.mark.asyncio
@@ -466,7 +466,7 @@ async def test_session_scoped_server_pattern():
         response = await client.get(server.url)
         assert response.json() == {"test": 2}
         assert len(server.requests) == 1
-        assert server.requests[0].path == "/"
+        assert server.requests[0].target == "/"
 
         # Clear state between tests
         server.clear_requests()
@@ -476,8 +476,8 @@ async def test_session_scoped_server_pattern():
         await client.get(f"{server.url}a")
         await client.get(f"{server.url}b")
         assert len(server.requests) == 2
-        assert server.requests[0].path == "/a"
-        assert server.requests[1].path == "/b"
+        assert server.requests[0].target == "/a"
+        assert server.requests[1].target == "/b"
 
 
 @pytest.mark.asyncio
@@ -716,7 +716,7 @@ async def test_server_receives_chunked_request_body(server, client):
 
     assert response.status_code == 200
     assert server.last_request is not None
-    assert server.last_request.body == "hello world"
+    assert server.last_request.body == b"hello world"
     assert server.last_request.headers is not None
     assert (
         "chunked"
@@ -738,7 +738,7 @@ async def test_server_handles_multiple_chunks_varying_sizes(server, client):
 
     assert response.status_code == 200
     assert server.last_request is not None
-    assert server.last_request.body == "abbcccdddd"
+    assert server.last_request.body == b"abbcccdddd"
 
     # Verify raw wire bytes contain chunk size prefixes
     wire_bytes = server.last_request.wire_raw_bytes
@@ -766,9 +766,11 @@ async def test_server_receives_large_chunked_body(server, client):
 
     assert response.status_code == 200
     assert server.last_request is not None
-    assert len(server.last_request.body) == 100 * 1024
-    assert "chunk0:" in server.last_request.body
-    assert "chunk99:" in server.last_request.body
+    body = server.last_request.body
+    assert body is not None
+    assert len(body) == 100 * 1024
+    assert b"chunk0:" in body
+    assert b"chunk99:" in body
 
 
 @pytest.mark.asyncio
@@ -1149,7 +1151,7 @@ async def test_server_handles_http09_simple_request(server):
     await asyncio.sleep(0.1)
     assert len(server.requests) == 1
     assert server.requests[0].method == "GET"
-    assert server.requests[0].path == "/path"
+    assert server.requests[0].target == "/path"
     assert server.requests[0].http_version == "0.9"
 
 
@@ -1280,7 +1282,7 @@ async def test_next_request_without_timeout(server):
     # Wait for request without timeout
     request = await server.next_request(timeout=None)
     assert request.method == "GET"
-    assert request.path == "/"
+    assert request.target == "/"
 
     await request_task
 
@@ -1304,7 +1306,7 @@ async def test_next_request_with_timeout_success(server):
     # Wait with sufficient timeout
     request = await server.next_request(timeout=5.0)
     assert request.method == "GET"
-    assert request.path == "/test"
+    assert request.target == "/test"
 
     await request_task
 
@@ -1337,7 +1339,7 @@ async def test_next_exchange_nowait_returns_queued_exchange(server, client):
 
     exchange = server.next_exchange_nowait()
     assert exchange is not None
-    assert exchange.request.path == "/queued"
+    assert exchange.request.target == "/queued"
     assert server.next_exchange_nowait() is None
 
 
@@ -1475,7 +1477,7 @@ async def test_server_handles_chunked_with_trailer_headers(server):
 
     await asyncio.sleep(0.1)
     assert len(server.requests) == 1
-    assert server.last_request.body == "hello"
+    assert server.last_request.body == b"hello"
 
 
 @pytest.mark.asyncio
@@ -1643,8 +1645,8 @@ async def test_server_handles_pipelined_requests(server):
 
     # Both requests should be recorded
     assert len(server.requests) == 2
-    assert server.requests[0].path == "/first"
-    assert server.requests[1].path == "/second"
+    assert server.requests[0].target == "/first"
+    assert server.requests[1].target == "/second"
 
     # Should have received two HTTP responses
     assert response.count(b"HTTP/1.1") == 2
@@ -1679,10 +1681,10 @@ async def test_server_handles_pipelined_requests_with_body(server):
 
     # Both requests should be recorded with correct bodies
     assert len(server.requests) == 2
-    assert server.requests[0].path == "/first"
-    assert server.requests[0].body == "first!"
-    assert server.requests[1].path == "/second"
-    assert server.requests[1].body == "second!"
+    assert server.requests[0].target == "/first"
+    assert server.requests[0].body == b"first!"
+    assert server.requests[1].target == "/second"
+    assert server.requests[1].body == b"second!"
 
     # Should have received two HTTP responses
     assert response.count(b"HTTP/1.1") == 2
@@ -1714,7 +1716,7 @@ async def test_on_headers_received_sends_100_continue():
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
         assert server.last_request is not None
-        assert server.last_request.body == "test body content"
+        assert server.last_request.body == b"test body content"
 
 
 @pytest.mark.asyncio
@@ -1793,7 +1795,7 @@ async def test_on_headers_received_not_called_without_hook(server, client):
     # Normal behavior - no 100-continue handling
     assert response.status_code == 200
     assert server.last_request is not None
-    assert server.last_request.body == "test body"
+    assert server.last_request.body == b"test body"
 
 
 @pytest.mark.asyncio
@@ -1850,8 +1852,8 @@ async def test_on_headers_received_rejection_stops_body_read():
 
     async with AsyncHTTPTestServer(on_headers_received=reject_all) as server:
 
-        def track_handler(request):
-            body_received.append(request.body)
+        def track_handler(ctx):
+            body_received.append(ctx.request.body)
             return HTTPResponse.json({"tracked": True})
 
         server.handler = track_handler
@@ -1999,7 +2001,13 @@ async def test_request_timestamps_with_manual_clock():
 
 @pytest.mark.asyncio
 async def test_get_request_timestamp_not_found(server):
-    fake_request = HTTPRequest(method="GET", path="/fake", http_version="1.1")
+    request = HTTPRequest(method="GET", target="/fake")
+    fake_request = RecordedHTTPRequest(
+        request=request,
+        as_received=request,
+        wire_raw_bytes=b"GET /fake HTTP/1.1\r\n\r\n",
+        http_version="1.1",
+    )
     with pytest.raises(ValueError, match="not found"):
         server.get_request_timestamp(fake_request)
 
@@ -2022,7 +2030,7 @@ async def test_recording_buffer_size_caps_history_and_queues():
             for i in range(3):
                 await client.get(f"{server.url}path-{i}")
 
-        assert [req.path for req in server.requests] == [
+        assert [req.target for req in server.requests] == [
             "/path-1",
             "/path-2",
         ]
@@ -2033,7 +2041,7 @@ async def test_recording_buffer_size_caps_history_and_queues():
         assert server.dropped_exchanges == 1
 
         oldest = await server.next_request(timeout=1.0)
-        assert oldest.path == "/path-1"
+        assert oldest.target == "/path-1"
 
 
 @pytest.mark.asyncio
@@ -2063,7 +2071,7 @@ async def test_clear_requests_preserves_recording_buffer_size():
             await client.get(f"{server.url}third")
             await client.get(f"{server.url}fourth")
 
-        assert [req.path for req in server.requests] == ["/fourth"]
+        assert [req.target for req in server.requests] == ["/fourth"]
         assert server.dropped_requests == 1
 
 

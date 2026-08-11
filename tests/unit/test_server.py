@@ -4,13 +4,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from localstub.middleware import ResponderContext
 from localstub.server import (
     AsyncHTTPTestServer,
     ByteFlip,
     Delay,
     DropConnection,
     FaultyTransmission,
-    HTTPRequest,
     HTTPResponse,
     ImmediateTransmission,
     RecordingStreamWriter,
@@ -26,8 +26,8 @@ def test_server_url_raises_when_not_started() -> None:
 
 
 def test_server_handler_getter() -> None:
-    def handler(req: HTTPRequest) -> HTTPResponse:
-        _ = req
+    def handler(ctx: ResponderContext) -> HTTPResponse:
+        _ = ctx
         return HTTPResponse.json({"test": "value"})
 
     server = AsyncHTTPTestServer(handler=handler)
