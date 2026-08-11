@@ -7,7 +7,7 @@ from typing import overload
 HeaderItem = tuple[str, str]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Headers:
     """Immutable, persistent HTTP headers.
 
@@ -18,12 +18,22 @@ class Headers:
     - Header name lookup is case-insensitive.
     - Duplicate headers are preserved for iteration and get_all().
     - patch_set() overrides all previous values for a header name.
+    - Equality is value equality over items(); two header sets with the
+      same items compare equal regardless of patch history.
     """
 
     _parent: Headers | None
     _items: tuple[HeaderItem, ...]
     _set_items: tuple[HeaderItem, ...]
     _set_lowers: frozenset[str]
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Headers):
+            return NotImplemented
+        return tuple(self.items()) == tuple(other.items())
+
+    def __hash__(self) -> int:
+        return hash(tuple(self.items()))
 
     @classmethod
     def empty(cls) -> Headers:

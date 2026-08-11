@@ -5,12 +5,38 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from localstub.http.headers import Headers
 from localstub.http.response import (
     AsyncMultiResponseParser,
     AsyncResponseParser,
     ParsedResponse,
+    RecordedHTTPResponse,
     ResponseProtocol,
 )
+from localstub.http.responsespec import HTTPResponse
+
+
+def test_recorded_http_response_delegates_to_response_value() -> None:
+    recorded = RecordedHTTPResponse(
+        response=HTTPResponse(
+            status=201,
+            headers=Headers.from_items([
+                ("Content-Type", "text/plain"),
+                ("Set-Cookie", "a=1"),
+                ("Set-Cookie", "b=2"),
+            ]),
+            body=b"created",
+        ),
+        reason="Created",
+        wire_raw_bytes=b"HTTP/1.1 201 Created\r\n\r\ncreated",
+    )
+
+    assert recorded.status == 201
+    assert recorded.headers["Content-Type"] == "text/plain"
+    assert recorded.headers.get_all("Set-Cookie") == ["a=1", "b=2"]
+    assert recorded.body == b"created"
+    assert recorded.reason == "Created"
+    assert recorded.wire_raw_bytes == b"HTTP/1.1 201 Created\r\n\r\ncreated"
 
 
 def test_parsed_response_default_values() -> None:

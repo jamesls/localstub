@@ -1,8 +1,8 @@
 """Shared HTTP forwarding logic for proxy modes.
 
-This module provides the Forwarder class which handles forwarding HTTP
-requests to upstream servers and relaying responses back to clients,
-preserving exact wire bytes including Transfer-Encoding.
+This module provides the RawForwarder class which handles forwarding
+HTTP requests to upstream servers and relaying responses back to
+clients, preserving exact wire bytes including Transfer-Encoding.
 """
 
 from __future__ import annotations
@@ -19,12 +19,14 @@ from typing import Protocol
 
 import truststore
 
+from localstub.http.headers import Headers
 from localstub.http.request import AsyncRequestParser, ParsedRequest
 from localstub.http.response import (
     AsyncMultiResponseParser,
     ParsedResponse,
-    RecordedResponse,
+    RecordedHTTPResponse,
 )
+from localstub.http.responsespec import HTTPResponse
 from localstub.http.utils import (
     decode_status_text,
     headers_to_message,
@@ -35,6 +37,38 @@ from localstub.http.utils import (
 LOG = logging.getLogger(__name__)
 
 WireLog = Callable[[str, bytes], None]
+
+
+def upstream_ssl_context(verify: bool) -> ssl.SSLContext:
+    """Build the TLS context used for upstream connections.
+
+    Verified contexts use system trust (truststore); unverified
+    contexts disable certificate and hostname checks entirely.
+    """
+    if verify:
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    return ssl_ctx
+
+
+async def open_upstream_connection(
+    host: str,
+    port: int,
+    *,
+    use_tls: bool,
+    verify: bool = True,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Open a TCP (optionally TLS) stream connection to *host*:*port*.
+
+    Raises OSError (including ssl.SSLError) on connection failure.
+    """
+    ssl_ctx = upstream_ssl_context(verify) if use_tls else None
+    server_hostname = host if use_tls else None
+    return await asyncio.open_connection(
+        host, port, ssl=ssl_ctx, server_hostname=server_hostname
+    )
 
 
 class ClientWriter(Protocol):
@@ -49,17 +83,9 @@ class ClientWriter(Protocol):
     async def wait_closed(self) -> None: ...
 
 
-class OverrideResponse(Protocol):
-    """Protocol for response objects that can override an upstream response."""
-
-    status: int
-    headers: dict[str, str]
-    body: bytes | str | None
-
-
 @dataclass
-class UpstreamResponse:
-    """Upstream response context provided to transformers."""
+class TransformContext:
+    """Upstream response handed to a ResponseTransformer."""
 
     status: int
     reason: str | None
@@ -73,13 +99,13 @@ class TransformResult:
     """Result of transforming an upstream response."""
 
     body: bytes | None = None
-    override_response: OverrideResponse | None = None
+    override_response: HTTPResponse | None = None
     delay_before: float = 0.0
     drop_after: int | None = None
 
 
 ResponseTransformer = Callable[
-    [UpstreamResponse],
+    [TransformContext],
     TransformResult | Awaitable[TransformResult],
 ]
 
@@ -98,13 +124,15 @@ class ForwardResult:
     def to_recorded_response(
         self,
         wire_raw_bytes: bytes | None = None,
-    ) -> RecordedResponse:
-        """Convert to a RecordedResponse for recording."""
-        return RecordedResponse(
-            status=self.status,
+    ) -> RecordedHTTPResponse:
+        """Convert to a RecordedHTTPResponse for recording."""
+        return RecordedHTTPResponse(
+            response=HTTPResponse(
+                status=self.status,
+                headers=Headers.from_items(self.headers.items()),
+                body=self.body,
+            ),
             reason=self.reason,
-            headers=self.headers,
-            body=self.body.decode("utf-8", errors="replace"),
             wire_raw_bytes=(
                 wire_raw_bytes
                 if wire_raw_bytes is not None
@@ -130,11 +158,13 @@ class ForwardedRequest:
     error: ForwardError | None = None
 
 
-class Forwarder:
+class RawForwarder:
     """Forwards HTTP requests to upstream servers and relays responses.
 
     This class provides raw socket-based forwarding that preserves exact
     wire bytes, including Transfer-Encoding headers and chunked framing.
+    It is a wire-fidelity socket relay; HTTP-level forwarding goes
+    through an ``HTTPClient`` instead.
     """
 
     def __init__(
@@ -238,19 +268,12 @@ class Forwarder:
         Returns:
             Tuple of (reader, writer), or None on failure.
         """
-        ssl_ctx: ssl.SSLContext | None = None
-        server_hostname: str | None = None
-        if use_tls:
-            if self._verify_upstream:
-                ssl_ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            else:
-                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
-            server_hostname = host
         try:
-            return await asyncio.open_connection(
-                host, port, ssl=ssl_ctx, server_hostname=server_hostname
+            return await open_upstream_connection(
+                host,
+                port,
+                use_tls=use_tls,
+                verify=self._verify_upstream,
             )
         except Exception as e:
             LOG.warning(
@@ -449,7 +472,7 @@ class Forwarder:
         body_bytes = self._maybe_decompress(headers, parsed.body)
         reason = decode_status_text(parsed.status_text)
 
-        upstream = UpstreamResponse(
+        context = TransformContext(
             status=parsed.status_code or 0,
             reason=reason,
             headers=headers,
@@ -458,7 +481,7 @@ class Forwarder:
         )
 
         assert self._response_transformer is not None
-        result = await maybe_await(self._response_transformer(upstream))
+        result = await maybe_await(self._response_transformer(context))
 
         if result.delay_before > 0:
             await asyncio.sleep(result.delay_before)
@@ -533,23 +556,21 @@ class Forwarder:
         header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n"
         return header_bytes + new_body
 
-    def _build_override_wire_bytes(self, response: OverrideResponse) -> bytes:
+    def _build_override_wire_bytes(self, response: HTTPResponse) -> bytes:
         reason = status_phrase(response.status, "UNKNOWN")
 
         lines = [f"HTTP/1.1 {response.status} {reason}"]
 
         if isinstance(response.body, str):
             body = response.body.encode("utf-8")
-        elif response.body is None:
-            body = b""
         else:
             body = response.body
 
-        headers = dict(response.headers)
-        if "Content-Length" not in headers and "content-length" not in headers:
-            headers["Content-Length"] = str(len(body))
+        items = list(response.headers.items())
+        if "Content-Length" not in response.headers:
+            items.append(("Content-Length", str(len(body))))
 
-        for name, value in headers.items():
+        for name, value in items:
             lines.append(f"{name}: {value}")
 
         lines.append("")

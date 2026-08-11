@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
-import httpx
-
+from localstub.http.client import HTTPClient, HTTPClientError
 from localstub.http.connection import (
     connection_tokens_from_headers,
     parse_connection_tokens,
 )
-from localstub.http.request import HTTPRequest
+from localstub.http.headers import Headers
+from localstub.http.request import RecordedHTTPRequest
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.uri import ParsedURI
 
 LOG = logging.getLogger(__name__)
-
-_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 _HOP_BY_HOP_HEADERS = frozenset({
     "connection",
@@ -29,22 +28,14 @@ _HOP_BY_HOP_HEADERS = frozenset({
 })
 
 
-def _authority(uri: ParsedURI) -> str:
-    """Render the Host header value for *uri*.
-
-    The port is omitted only when it is the default for the scheme, so
-    ``http://example.com:443/`` keeps its explicit port.
-    """
-    if uri.port == _DEFAULT_PORTS.get(uri.scheme):
-        return uri.host
-    return f"{uri.host}:{uri.port}"
-
-
-def build_origin_form_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
+def build_origin_form_request(
+    recorded: RecordedHTTPRequest,
+    uri: ParsedURI,
+) -> bytes:
     """Convert absolute-form proxy request to origin-form for upstream."""
-    path = request.effective_path or "/"
-    method = request.method or "GET"
-    version_value = request.http_version or "1.1"
+    path = recorded.effective_path or "/"
+    method = recorded.method or "GET"
+    version_value = recorded.http_version or "1.1"
     if version_value.startswith("HTTP/"):
         version = version_value
     else:
@@ -57,12 +48,12 @@ def build_origin_form_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
         "proxy-authenticate",
         "proxy-authorization",
     }
-    connection_tokens = connection_tokens_from_headers(request.headers)
+    connection_tokens = connection_tokens_from_headers(recorded.headers)
     remove_headers = hop_by_hop | {"connection"} | connection_tokens
-    authority = _authority(uri)
+    authority = uri.authority
     host_added = False
 
-    for name, value in request.headers.items():
+    for name, value in recorded.headers.items():
         name_lower = name.lower()
         if name_lower == "host":
             lines.append(f"Host: {authority}")
@@ -76,89 +67,55 @@ def build_origin_form_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
         lines.append(f"Host: {authority}")
 
     header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n\r\n"
-    return header_bytes + request.wire_body_bytes
+    return header_bytes + recorded.wire_body_bytes
 
 
-async def _read_upstream_body(
-    upstream_response: httpx.Response,
-) -> tuple[bytes, bool]:
-    """Read the upstream body, returning it and whether it is decoded."""
-    try:
-        body = bytearray()
-        async for chunk in upstream_response.aiter_raw():
-            body.extend(chunk)
-        return bytes(body), False
-    except httpx.StreamConsumed:
-        # A response hook (or a mock transport response built from
-        # ``content=``) already consumed the raw stream. httpx caches
-        # only the decoded body, so the upstream encoding and length
-        # headers no longer describe it.
-        return upstream_response.content, True
-
-
-def _forwarded_response_headers(
-    upstream_response: httpx.Response,
-    *,
-    body_is_decoded: bool,
-) -> dict[str, str]:
-    drop_headers = set(_HOP_BY_HOP_HEADERS)
-    for value in upstream_response.headers.get_list("Connection"):
-        drop_headers.update(parse_connection_tokens(value))
-    if body_is_decoded:
-        drop_headers.update({"content-encoding", "content-length"})
-
-    response_headers: dict[str, str] = {}
-    for name, value in upstream_response.headers.items():
-        if name.lower() not in drop_headers:
-            response_headers[name] = value
-    return response_headers
-
-
-async def forward_via_httpx(
-    client: httpx.AsyncClient,
-    request: HTTPRequest,
+async def forward_proxy_request(
+    client: HTTPClient,
+    recorded: RecordedHTTPRequest,
 ) -> HTTPResponse:
-    """Forward an absolute-form proxy request using httpx."""
-    uri = request.target_uri
+    """Forward an absolute-form proxy request via *client*.
+
+    The upstream request is built from the recorded request's value
+    (which middleware may have rewritten) with hop-by-hop headers,
+    Host, and Content-Length removed; the adapter regenerates framing.
+    """
+    uri = recorded.target_uri
     if uri is None:
         return HTTPResponse(
             status=400,
             body=b"Bad Request: Not an absolute URI",
         )
 
-    upstream_url = request.path or "/"
-
-    # The upstream body is reserialized from ``request.body_bytes``, which
-    # middleware may have rewritten, so the original Content-Length no
-    # longer describes it. Drop it and let httpx regenerate the framing.
     drop_request_headers = (
         _HOP_BY_HOP_HEADERS
-        | connection_tokens_from_headers(request.headers)
-        | {"content-length"}
+        | connection_tokens_from_headers(recorded.headers)
+        | {"content-length", "host"}
     )
-    headers: dict[str, str] = {}
-    for name, value in request.headers.items():
-        if name.lower() not in drop_request_headers:
-            headers[name] = value
+    request = replace(
+        recorded.request,
+        headers=Headers.from_items(
+            (name, value)
+            for name, value in recorded.headers.items()
+            if name.lower() not in drop_request_headers
+        ),
+    )
 
     try:
-        async with client.stream(
-            method=request.method or "GET",
-            url=upstream_url,
-            headers=headers,
-            content=request.body_bytes or None,
-        ) as upstream_response:
-            body, body_is_decoded = await _read_upstream_body(
-                upstream_response
-            )
-            return HTTPResponse(
-                status=upstream_response.status_code,
-                headers=_forwarded_response_headers(
-                    upstream_response,
-                    body_is_decoded=body_is_decoded,
-                ),
-                body=body,
-            )
-    except httpx.RequestError as exc:
+        response = await client.send(request)
+    except HTTPClientError as exc:
         LOG.warning("Upstream request failed: %s", exc)
         return HTTPResponse(status=502, body=f"Bad Gateway: {exc}".encode())
+
+    drop_response_headers = set(_HOP_BY_HOP_HEADERS)
+    for value in response.headers.get_all("Connection", []):
+        drop_response_headers.update(parse_connection_tokens(value))
+    return HTTPResponse(
+        status=response.status,
+        headers=Headers.from_items(
+            (name, value)
+            for name, value in response.headers.items()
+            if name.lower() not in drop_response_headers
+        ),
+        body=response.body,
+    )

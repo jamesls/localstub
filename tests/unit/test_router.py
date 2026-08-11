@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from localstub.http.request import HTTPRequest
+from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.http.responsespec import HTTPResponse
 from localstub.middleware import (
     ConnectionMeta,
@@ -12,9 +12,19 @@ from localstub.middleware import (
 from localstub.router import Router
 
 
-def _ctx(method: str, path: str) -> ResponderContext:
+def _recorded(method: str, target: str) -> RecordedHTTPRequest:
+    request = HTTPRequest(method=method, target=target)
+    return RecordedHTTPRequest(
+        request=request,
+        as_received=request,
+        wire_raw_bytes=f"{method} {target} HTTP/1.1\r\n\r\n".encode(),
+        http_version="1.1",
+    )
+
+
+def _ctx(method: str, target: str) -> ResponderContext:
     return ResponderContext(
-        request=HTTPRequest(method=method, path=path, http_version="1.1"),
+        request=_recorded(method, target),
         connection=ConnectionMeta(client=None),
         services=ServerServices(),
     )
@@ -64,3 +74,15 @@ async def test_router_handle_returns_response_spec() -> None:
     result = await router.handle(_ctx("GET", "/"))
     assert isinstance(result, HTTPResponse)
     assert result.body == b"ok"
+
+
+def test_router_match_uses_effective_path_for_absolute_target() -> None:
+    router = Router()
+
+    def handler(_: ResponderContext) -> HTTPResponse:
+        return HTTPResponse.text("ok")
+
+    router.add("GET", "/foo", handler)
+
+    matched = router.match(_recorded("GET", "http://example.com/foo"))
+    assert matched is handler

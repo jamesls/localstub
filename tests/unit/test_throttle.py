@@ -1,11 +1,21 @@
 import pytest
 
-from localstub.http.request import HTTPRequest
+from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.throttle import (
     MonotonicClock,
     TokenBucket,
     TokenBucketThrottler,
 )
+
+
+def _recorded(method: str, target: str) -> RecordedHTTPRequest:
+    request = HTTPRequest(method=method, target=target)
+    return RecordedHTTPRequest(
+        request=request,
+        as_received=request,
+        wire_raw_bytes=f"{method} {target} HTTP/1.1\r\n\r\n".encode(),
+        http_version="1.1",
+    )
 
 
 class ManualClock:
@@ -90,7 +100,7 @@ def test_token_bucket_throttler_default_burst_for_low_rate_is_one():
     assert throttler.burst == 1.0
     assert throttler.rate_per_second == 0.5
 
-    req = HTTPRequest(method="GET", path="/", http_version="1.1")
+    req = _recorded("GET", "/")
     assert throttler.check(req).allowed
 
     decision = throttler.check(req)
@@ -126,21 +136,15 @@ def test_token_bucket_throttler_isolated_per_key():
     clock = ManualClock()
     throttler = TokenBucketThrottler(
         rate_per_second=1.0,
-        key=lambda request: request.path or "",
+        key=lambda request: request.target,
         burst=1.0,
         clock=clock,
     )
 
-    assert throttler.check(
-        HTTPRequest(method="GET", path="/a", http_version="1.1")
-    ).allowed
-    assert throttler.check(
-        HTTPRequest(method="GET", path="/b", http_version="1.1")
-    ).allowed
+    assert throttler.check(_recorded("GET", "/a")).allowed
+    assert throttler.check(_recorded("GET", "/b")).allowed
 
-    decision = throttler.check(
-        HTTPRequest(method="GET", path="/a", http_version="1.1")
-    )
+    decision = throttler.check(_recorded("GET", "/a"))
     assert not decision.allowed
     assert decision.retry_after_seconds == pytest.approx(1.0)
 
@@ -154,7 +158,7 @@ def test_token_bucket_throttler_reset_clears_state():
         clock=clock,
     )
 
-    req = HTTPRequest(method="GET", path="/", http_version="1.1")
+    req = _recorded("GET", "/")
     assert throttler.check(req).allowed
     assert not throttler.check(req).allowed
 

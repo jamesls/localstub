@@ -3,14 +3,24 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import Enum, auto
 from typing import Any, Protocol, cast
 
-from localstub.forward import Forwarder
-from localstub.http.request import HTTPRequest, HTTPRequestHeaders
-from localstub.http.response import RecordedResponse
+from localstub.forward import RawForwarder
+from localstub.http.request import HTTPRequestHeaders, RecordedHTTPRequest
+from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.utils import maybe_await
 from localstub.throttle import Clock, MonotonicClock
+
+
+class _Unset(Enum):
+    """Sentinel distinguishing an omitted argument from an explicit None."""
+
+    TOKEN = auto()
+
+
+_UNSET = _Unset.TOKEN
 
 
 class TimestampProvider(Protocol):
@@ -37,34 +47,41 @@ class ServerServices:
 
 @dataclass(frozen=True)
 class ResponderContext:
-    request: HTTPRequest
+    request: RecordedHTTPRequest
     connection: ConnectionMeta
     services: ServerServices
     state: dict[str, Any] = field(default_factory=dict)
     received_monotonic: float = 0.0
 
-    def with_request(self, request: HTTPRequest) -> ResponderContext:
+    def with_request(
+        self,
+        request: RecordedHTTPRequest,
+    ) -> ResponderContext:
         return replace(self, request=request)
 
     def clone_request(
         self,
         *,
         method: str | None = None,
-        path: str | None = None,
-        http_version: str | None = None,
+        target: str | None = None,
         headers: Mapping[str, str] | None = None,
-        body_bytes: bytes | None = None,
+        body: bytes | None | _Unset = _UNSET,
     ) -> ResponderContext:
+        """Return a copy of this context with request fields replaced.
+
+        ``body=None`` explicitly clears the body (no content); omitting
+        ``body`` keeps the existing one.
+        """
         if (
             method is None
-            and path is None
-            and http_version is None
+            and target is None
             and not headers
-            and body_bytes is None
+            and body is _UNSET
         ):
             return self
 
-        request = self.request
+        recorded = self.request
+        request = recorded.request
 
         next_headers = (
             request.headers
@@ -72,30 +89,19 @@ class ResponderContext:
             else request.headers.patch_set(headers)
         )
 
-        if body_bytes is None:
-            next_body_bytes = request.body_bytes
-            next_body = request.body
-        else:
-            next_body_bytes = body_bytes
-            next_body = body_bytes.decode("utf-8", errors="replace")
-
         next_request = replace(
             request,
             method=request.method if method is None else method,
-            path=request.path if path is None else path,
-            http_version=(
-                request.http_version if http_version is None else http_version
-            ),
+            target=request.target if target is None else target,
             headers=next_headers,
-            body=next_body,
-            body_bytes=next_body_bytes,
+            body=request.body if body is _UNSET else body,
         )
-        return replace(self, request=next_request)
+        return replace(self, request=replace(recorded, request=next_request))
 
 
 @dataclass(frozen=True)
 class SenderContext:
-    request: HTTPRequest
+    request: RecordedHTTPRequest
     connection: ConnectionMeta
     services: ServerServices
     state: dict[str, Any] = field(default_factory=dict)
@@ -108,7 +114,7 @@ class ForwardProxyResponse:
     upstream_tls: bool
     request_wire_bytes: bytes
     request_method: str | None
-    forwarder: Forwarder
+    forwarder: RawForwarder
 
 
 type ResponseSpec = HTTPResponse | ForwardProxyResponse
@@ -178,7 +184,7 @@ def compose_responder(
 
 @dataclass(frozen=True)
 class SendResult:
-    recorded: RecordedResponse
+    recorded: RecordedHTTPResponse
     should_close: bool
 
 

@@ -10,8 +10,8 @@ from typing import Literal, TextIO
 
 from localstub.http.exchange import RecordedExchange
 from localstub.http.headers import Headers
-from localstub.http.request import HTTPRequest
-from localstub.http.response import RecordedResponse
+from localstub.http.request import RecordedHTTPRequest
+from localstub.http.response import RecordedHTTPResponse
 from localstub.server import AsyncHTTPTestServer
 
 
@@ -33,7 +33,7 @@ def _isoformat_utc(ts: datetime) -> str:
 
 
 def _request_client_json(
-    request: HTTPRequest,
+    request: RecordedHTTPRequest,
 ) -> dict[str, object] | None:
     if request.client is None:
         return None
@@ -49,13 +49,15 @@ def _headers_json(
     return {str(k): str(v) for k, v in headers.items()}
 
 
-def _request_body_json(request: HTTPRequest) -> str | None:
-    if request.body_bytes:
-        return _safe_utf8_decode(request.body_bytes)
-    return request.body
+def _request_body_json(request: RecordedHTTPRequest) -> str | None:
+    if request.body is None:
+        return None
+    if not request.body:
+        return ""
+    return _safe_utf8_decode(request.body)
 
 
-def _response_body_json(response: RecordedResponse) -> str | None:
+def _response_body_json(response: RecordedHTTPResponse) -> str | None:
     boundary = b"\r\n\r\n"
     wire = response.wire_raw_bytes
     idx = wire.find(boundary)
@@ -67,11 +69,11 @@ def _response_body_json(response: RecordedResponse) -> str | None:
 
 def exchange_to_json_obj(exchange: RecordedExchange) -> dict[str, object]:
     request = exchange.request
-    request_wire = request.wire_raw_bytes or b""
+    request_wire = request.wire_raw_bytes
 
     request_obj: dict[str, object] = {
         "method": request.method,
-        "path": request.path,
+        "path": request.target,
         "client": _request_client_json(request),
         "headers": _headers_json(request.headers),
         "body": _request_body_json(request),

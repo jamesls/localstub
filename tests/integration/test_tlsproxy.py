@@ -18,8 +18,8 @@ from localstub.server import (
 )
 from localstub.tlsproxy import (
     AsyncTLSInterceptProxy,
+    TransformContext,
     TransformResult,
-    UpstreamResponse,
     fault_step_transformer,
 )
 
@@ -48,7 +48,7 @@ async def test_tls_proxy_intercepts_https_request_to_localstub():
 
         # The intercepted request should be recorded by the underlying server
         request = await server.next_request(timeout=1.0)
-        assert request.path == "/"
+        assert request.target == "/"
         assert request.headers is not None
         assert request.headers["host"] == "example.com"
 
@@ -132,7 +132,7 @@ async def test_tls_proxy_parses_ipv6_connect_target():
         assert response.text == "ipv6"
 
         request = await server.next_request(timeout=1.0)
-        assert request.path == "/ipv6"
+        assert request.target == "/ipv6"
         assert request.headers is not None
         assert "2001:db8::1" in request.headers["host"]
 
@@ -198,7 +198,7 @@ async def test_next_exchange_nowait_returns_queued_exchange():
 
     exchange = proxy.next_exchange_nowait()
     assert exchange is not None
-    assert exchange.request.path == "/queued"
+    assert exchange.request.target == "/queued"
     assert proxy.next_exchange_nowait() is None
 
 
@@ -400,7 +400,7 @@ async def test_forward_returns_502_when_upstream_connection_fails():
     # The client request should still be recorded even though no upstream
     # connection could be established.
     recorded_request = await proxy.next_request(timeout=1.0)
-    assert recorded_request.path == "/unreachable"
+    assert recorded_request.target == "/unreachable"
     assert recorded_request.headers is not None
     assert "127.0.0.1" in recorded_request.headers["host"]
 
@@ -454,10 +454,10 @@ async def test_forward_returns_502_on_connect_fail_with_expect_100_continue():
 
     recorded_request = await proxy.next_request(timeout=1.0)
     assert recorded_request.method == "PUT"
-    assert recorded_request.path == "/unreachable-continue"
+    assert recorded_request.target == "/unreachable-continue"
     assert recorded_request.headers is not None
     assert recorded_request.headers["expect"] == "100-continue"
-    assert recorded_request.body == ""
+    assert recorded_request.body == b""
 
     # No upstream response should be recorded.
     with pytest.raises(asyncio.TimeoutError):
@@ -517,10 +517,10 @@ async def test_forward_records_chunked_response_with_trailer():
         assert response.text == "peekboo"
 
         recorded = await proxy.next_response(timeout=1.0)
-        assert recorded.body == "peekboo"
+        assert recorded.body == b"peekboo"
         assert b"X-Trail: done" in recorded.wire_raw_bytes
         exchange = await proxy.next_exchange(timeout=1.0)
-        assert exchange.request.path == "/chunked"
+        assert exchange.request.target == "/chunked"
         assert exchange.response is recorded
     finally:
         server.close()
@@ -582,7 +582,7 @@ async def test_forward_decompresses_gzip_response():
         assert response.text == "hello gzip"
 
         recorded = await proxy.next_response(timeout=1.0)
-        assert recorded.body == "hello gzip"
+        assert recorded.body == b"hello gzip"
     finally:
         server.close()
         await server.wait_closed()
@@ -621,7 +621,7 @@ async def test_forward_returns_raw_body_when_gzip_invalid():
                     )
 
         recorded = await proxy.next_response(timeout=1.0)
-        assert recorded.body == "not gzipped"
+        assert recorded.body == b"not gzipped"
     finally:
         server.close()
         await server.wait_closed()
@@ -695,7 +695,7 @@ async def test_forward_handles_zero_and_invalid_content_length():
         assert invalid_response.status_code == 502
 
         first_recorded = await proxy.next_response(timeout=1.0)
-        assert first_recorded.body == ""
+        assert first_recorded.body == b""
 
         with pytest.raises(asyncio.TimeoutError):
             await proxy.next_response(timeout=0.1)
@@ -736,7 +736,7 @@ async def test_forward_to_plain_http_when_tls_disabled():
                 )
 
         recorded = await upstream.next_request(timeout=1.0)
-        assert recorded.path == "/forward"
+        assert recorded.target == "/forward"
         assert response.status_code == 200
         assert response.json() == {"upstream": True}
 
@@ -800,7 +800,7 @@ async def test_forward_uses_tls_when_verify_disabled_custom_port():
 
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.status == 200
-        assert recorded_response.body == "tls-ok"
+        assert recorded_response.body == b"tls-ok"
     finally:
         server.close()
         await server.wait_closed()
@@ -848,7 +848,7 @@ async def test_forward_preserves_close_delimited_response_bodies():
         assert response.text == "streamed close body"
 
         recorded_response = await proxy.next_response(timeout=1.0)
-        assert recorded_response.body == "streamed close body"
+        assert recorded_response.body == b"streamed close body"
     finally:
         server.close()
         await server.wait_closed()
@@ -874,14 +874,14 @@ async def test_proxy_records_request_and_response_when_forwarding_to_real():
     assert "Example Domain" in response.text
 
     recorded_request = await proxy.next_request(timeout=2.0)
-    assert recorded_request.path == "/"
+    assert recorded_request.target == "/"
     assert recorded_request.headers is not None
     assert recorded_request.headers["host"] == "example.com"
 
     recorded_response = await proxy.next_response(timeout=2.0)
     assert recorded_response.status == 200
     assert recorded_response.body is not None
-    assert "Example Domain" in recorded_response.body
+    assert b"Example Domain" in recorded_response.body
 
 
 @pytest.mark.asyncio
@@ -946,12 +946,12 @@ async def test_forward_handles_head_request_with_content_length():
 
         recorded_request = await proxy.next_request(timeout=1.0)
         assert recorded_request.method == "HEAD"
-        assert recorded_request.path == "/authors.html"
+        assert recorded_request.target == "/authors.html"
 
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.status == 200
         # The recorded response body should be empty for HEAD
-        assert recorded_response.body == ""
+        assert recorded_response.body == b""
     finally:
         server.close()
         await server.wait_closed()
@@ -1013,11 +1013,11 @@ async def test_forward_handles_client_closing_connection_early():
 
         # The proxy should have recorded the request and response
         recorded_request = await proxy.next_request(timeout=1.0)
-        assert recorded_request.path == "/test"
+        assert recorded_request.target == "/test"
 
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.status == 200
-        assert recorded_response.body == "hello"
+        assert recorded_response.body == b"hello"
     finally:
         server.close()
         await server.wait_closed()
@@ -1087,12 +1087,12 @@ async def test_forward_handles_100_continue_before_final_response():
 
         recorded_request = await proxy.next_request(timeout=1.0)
         assert recorded_request.method == "PUT"
-        assert recorded_request.path == "/upload"
+        assert recorded_request.target == "/upload"
 
         # Only the final response should be recorded
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.status == 200
-        assert recorded_response.body == "upload accepted"
+        assert recorded_response.body == b"upload accepted"
     finally:
         server.close()
         await server.wait_closed()
@@ -1479,7 +1479,7 @@ async def test_forward_client_waits_for_100_continue_before_sending_body():
 
             recorded_request = await proxy.next_request(timeout=1.0)
             assert recorded_request.method == "PUT"
-            assert recorded_request.path == "/upload"
+            assert recorded_request.target == "/upload"
 
     finally:
         upstream_server.close()
@@ -1559,12 +1559,12 @@ async def test_forward_preserves_final_response_when_100_and_200_coalesce():
 
         recorded_request = await proxy.next_request(timeout=1.0)
         assert recorded_request.method == "PUT"
-        assert recorded_request.path == "/coalesced"
-        assert recorded_request.body == ""
+        assert recorded_request.target == "/coalesced"
+        assert recorded_request.body == b""
 
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.status == 200
-        assert recorded_response.body == "OK"
+        assert recorded_response.body == b"OK"
     finally:
         upstream_server.close()
         await upstream_server.wait_closed()
@@ -1636,12 +1636,12 @@ async def test_forward_handles_multiple_informational_responses():
 
         recorded_request = await proxy.next_request(timeout=1.0)
         assert recorded_request.method == "POST"
-        assert recorded_request.path == "/long-operation"
+        assert recorded_request.target == "/long-operation"
 
         # Only the final response should be recorded
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.status == 201
-        assert recorded_response.body == "done"
+        assert recorded_response.body == b"done"
     finally:
         server.close()
         await server.wait_closed()
@@ -1712,11 +1712,11 @@ async def test_forward_handles_100_continue_with_chunked_response():
 
         recorded_request = await proxy.next_request(timeout=1.0)
         assert recorded_request.method == "PUT"
-        assert recorded_request.path == "/bucket/key"
+        assert recorded_request.target == "/bucket/key"
 
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.status == 200
-        assert recorded_response.body == "<Success/>\n"
+        assert recorded_response.body == b"<Success/>\n"
     finally:
         server.close()
         await server.wait_closed()
@@ -1782,7 +1782,7 @@ async def test_forward_transforms_response_body_with_byteflip():
 
         # The recorded response should contain the original body
         recorded = await proxy.next_response(timeout=1.0)
-        assert recorded.body == '{"message":"hello","count":42}'
+        assert recorded.body == b'{"message":"hello","count":42}'
     finally:
         server.close()
         await server.wait_closed()
@@ -1791,7 +1791,7 @@ async def test_forward_transforms_response_body_with_byteflip():
 @pytest.mark.asyncio
 async def test_forward_transformer_delay_before():
 
-    def delay_transformer(upstream: UpstreamResponse) -> TransformResult:
+    def delay_transformer(upstream: TransformContext) -> TransformResult:
         return TransformResult(body=upstream.body, delay_before=0.1)
 
     server = await asyncio.start_server(
@@ -1836,12 +1836,12 @@ async def test_forward_transformer_delay_before():
 @pytest.mark.asyncio
 async def test_forward_transformer_override_response():
 
-    def override_transformer(upstream: UpstreamResponse) -> TransformResult:
+    def override_transformer(upstream: TransformContext) -> TransformResult:
         return TransformResult(
-            override_response=HTTPResponse(
+            override_response=HTTPResponse.text(
+                "Service Unavailable",
                 status=503,
                 headers={"Content-Type": "text/plain"},
-                body="Service Unavailable",
             )
         )
 
@@ -1881,7 +1881,7 @@ async def test_forward_transformer_override_response():
         # The recorded response should contain the original upstream response
         recorded = await proxy.next_response(timeout=1.0)
         assert recorded.status == 200
-        assert recorded.body == '{"message":"hello","count":42}'
+        assert recorded.body == b'{"message":"hello","count":42}'
     finally:
         server.close()
         await server.wait_closed()
@@ -1890,7 +1890,7 @@ async def test_forward_transformer_override_response():
 @pytest.mark.asyncio
 async def test_forward_async_transformer():
 
-    async def async_transformer(upstream: UpstreamResponse) -> TransformResult:
+    async def async_transformer(upstream: TransformContext) -> TransformResult:
         # Simulate some async work
         await asyncio.sleep(0.01)
         # Uppercase the body
@@ -1983,7 +1983,7 @@ async def test_fault_step_transformer_chains_multiple_steps():
 @pytest.mark.asyncio
 async def test_forward_transformer_passthrough_when_none_returned():
 
-    def passthrough_transformer(upstream: UpstreamResponse) -> TransformResult:
+    def passthrough_transformer(upstream: TransformContext) -> TransformResult:
         # Return empty result - should passthrough original
         return TransformResult()
 
@@ -2027,7 +2027,7 @@ async def test_forward_transformer_passthrough_when_none_returned():
 @pytest.mark.asyncio
 async def test_forward_transformer_conditional_based_on_content_type():
 
-    def conditional_transformer(upstream: UpstreamResponse) -> TransformResult:
+    def conditional_transformer(upstream: TransformContext) -> TransformResult:
         content_type = ""
         if upstream.headers:
             content_type = upstream.headers.get("Content-Type", "")
@@ -2125,9 +2125,9 @@ async def test_forward_recording_buffer_evicts_oldest_when_full():
         assert proxy.dropped_exchanges == 1
 
         oldest = await proxy.next_request(timeout=1.0)
-        assert oldest.path == "/path-1"
+        assert oldest.target == "/path-1"
         exchange = await proxy.next_exchange(timeout=1.0)
-        assert exchange.request.path == "/path-1"
+        assert exchange.request.target == "/path-1"
     finally:
         server.close()
         await server.wait_closed()

@@ -12,8 +12,8 @@ from localstub.http.request import (
     HTTPRequestHeaders,
     HTTPRequestReader,
     ParsedRequest,
+    RecordedHTTPRequest,
     RequestProtocol,
-    parsed_body_bytes_from_wire_raw_bytes,
 )
 
 
@@ -44,7 +44,7 @@ def test_parsed_request_body_property_multiple_parts() -> None:
     assert request.body == b"hello world"
 
 
-def test_http_request_from_parsed_prefers_explicit_client() -> None:
+def test_recorded_request_from_parsed_prefers_explicit_client() -> None:
     parsed = ParsedRequest(
         method="GET",
         url=b"/",
@@ -52,7 +52,7 @@ def test_http_request_from_parsed_prefers_explicit_client() -> None:
     )
     writer = Mock(spec=asyncio.StreamWriter)
 
-    request = HTTPRequest.from_parsed(
+    request = RecordedHTTPRequest.from_parsed(
         parsed,
         b"GET / HTTP/1.1\r\n\r\n",
         client=("127.0.0.1", 54321),
@@ -731,7 +731,7 @@ async def test_http_request_reader_read_request_simple_get() -> None:
 
     assert request is not None
     assert request.method == "GET"
-    assert request.path == "/api/test"
+    assert request.target == "/api/test"
     assert request.http_version == "1.1"
     assert request.wire_raw_bytes == request_data
 
@@ -754,7 +754,8 @@ async def test_http_request_reader_read_request_with_body() -> None:
 
     assert request is not None
     assert request.method == "POST"
-    assert request.body == "Hello, World!"
+    assert request.body == b"Hello, World!"
+    assert request.text == "Hello, World!"
 
 
 @pytest.mark.asyncio
@@ -879,62 +880,114 @@ async def test_http_request_reader_with_custom_max_read() -> None:
     assert request.method == "GET"
 
 
-def test_http_request_json_body_returns_none_for_empty_body() -> None:
-    request = HTTPRequest(method="GET", path="/", http_version="1.1")
+def test_http_request_json_body_returns_none_for_missing_body() -> None:
+    request = HTTPRequest(method="GET", target="/")
     assert request.json_body is None
 
 
-def test_http_request_json_body_returns_none_for_empty_string() -> None:
-    request = HTTPRequest(
-        method="GET",
-        path="/",
-        http_version="1.1",
-        body="",
-    )
+def test_http_request_json_body_returns_none_for_empty_body() -> None:
+    request = HTTPRequest(method="GET", target="/", body=b"")
     assert request.json_body is None
 
 
 def test_http_request_json_body_parses_json() -> None:
     request = HTTPRequest(
         method="GET",
-        path="/",
-        http_version="1.1",
-        body='{"key": "value"}',
+        target="/",
+        body=b'{"key": "value"}',
     )
     assert request.json_body == {"key": "value"}
 
 
-def test_http_request_with_method_returns_updated_copy() -> None:
-    request = HTTPRequest(method="GET", path="/", http_version="1.1")
+def test_http_request_equality_ignores_framing_headers() -> None:
+    chunked = HTTPRequest(
+        method="POST",
+        target="/upload",
+        headers=Headers.from_items([
+            ("Transfer-Encoding", "chunked"),
+            ("X-Api", "1"),
+        ]),
+        body=b"data",
+    )
+    sized = HTTPRequest(
+        method="POST",
+        target="/upload",
+        headers=Headers.from_items([("Content-Length", "4"), ("X-Api", "1")]),
+        body=b"data",
+    )
 
-    updated = request.with_method("POST")
+    assert chunked == sized
+    assert hash(chunked) == hash(sized)
+
+
+def test_http_request_equality_compares_semantic_headers() -> None:
+    first = HTTPRequest(
+        method="POST",
+        target="/upload",
+        headers=Headers.from_items([("X-Api", "1")]),
+    )
+    second = HTTPRequest(
+        method="POST",
+        target="/upload",
+        headers=Headers.from_items([("X-Api", "2")]),
+    )
+
+    assert first != second
+
+
+def test_http_request_equality_distinguishes_absent_and_empty_body() -> None:
+    absent = HTTPRequest(method="POST", target="/upload")
+    empty = HTTPRequest(method="POST", target="/upload", body=b"")
+
+    assert absent != empty
+
+
+def test_http_request_equality_with_other_type_returns_not_equal() -> None:
+    request = HTTPRequest(method="GET", target="/")
+
+    assert request != "GET /"
+
+
+def test_recorded_request_with_method_returns_updated_copy() -> None:
+    request = HTTPRequest(method="GET", target="/")
+    recorded = _make_recorded(request)
+
+    updated = recorded.with_method("POST")
 
     assert updated.method == "POST"
-    assert updated.path == "/"
-    assert request.method == "GET"
+    assert updated.target == "/"
+    assert updated.as_received == request
+    assert updated.wire_raw_bytes == recorded.wire_raw_bytes
+    assert recorded.method == "GET"
 
 
-def test_http_request_with_path_returns_updated_copy() -> None:
-    request = HTTPRequest(method="GET", path="/", http_version="1.1")
+def test_recorded_request_with_target_returns_updated_copy() -> None:
+    request = HTTPRequest(method="GET", target="/")
+    recorded = _make_recorded(request)
 
-    updated = request.with_path("/updated")
+    updated = recorded.with_target("/updated")
 
-    assert updated.path == "/updated"
+    assert updated.target == "/updated"
     assert updated.method == "GET"
-    assert request.path == "/"
+    assert updated.as_received == request
+    assert updated.wire_raw_bytes == recorded.wire_raw_bytes
+    assert recorded.target == "/"
 
 
-def test_http_request_with_headers_returns_updated_copy() -> None:
-    request = HTTPRequest(method="GET", path="/", http_version="1.1")
+def test_recorded_request_with_headers_returns_updated_copy() -> None:
+    request = HTTPRequest(method="GET", target="/")
+    recorded = _make_recorded(request)
     headers = Headers.from_items([("X-Test", "value")])
 
-    updated = request.with_headers(headers)
+    updated = recorded.with_headers(headers)
 
     assert updated.headers == headers
-    assert request.headers == Headers.empty()
+    assert updated.as_received == request
+    assert updated.wire_raw_bytes == recorded.wire_raw_bytes
+    assert recorded.headers == Headers.empty()
 
 
-def test_http_request_wire_body_bytes_returns_body_from_wire_bytes() -> None:
+def test_recorded_request_wire_body_bytes_returns_wire_body() -> None:
     wire_raw_bytes = (
         b"POST /upload HTTP/1.1\r\n"
         b"Host: localhost\r\n"
@@ -945,59 +998,44 @@ def test_http_request_wire_body_bytes_returns_body_from_wire_bytes() -> None:
     )
     request = HTTPRequest(
         method="POST",
-        path="/upload",
-        http_version="1.1",
-        body="hello",
-        body_bytes=b"hello",
-        wire_raw_bytes=wire_raw_bytes,
+        target="/upload",
+        body=b"hello",
     )
+    recorded = _make_recorded(request, wire_raw_bytes)
 
-    assert request.wire_body_bytes == b"5\r\nhello\r\n0\r\n\r\n"
+    assert recorded.wire_body_bytes == b"5\r\nhello\r\n0\r\n\r\n"
 
 
-def test_http_request_wire_body_bytes_falls_back_to_body_bytes() -> None:
+def test_recorded_request_wire_body_bytes_falls_back_to_body() -> None:
     request = HTTPRequest(
         method="POST",
-        path="/upload",
-        http_version="1.1",
-        body_bytes=b"hello",
-        wire_raw_bytes=b"not an http request",
+        target="/upload",
+        body=b"hello",
     )
+    recorded = _make_recorded(request, b"not an http request")
 
-    assert request.wire_body_bytes == b"hello"
-
-
-def test_http_request_wire_body_bytes_falls_back_to_encoded_body_text() -> (
-    None
-):
-    request = HTTPRequest(
-        method="POST",
-        path="/upload",
-        http_version="1.1",
-        body="hello",
-        wire_raw_bytes=b"not an http request",
-    )
-
-    assert request.wire_body_bytes == b"hello"
+    assert recorded.wire_body_bytes == b"hello"
 
 
-def test_http_request_wire_body_bytes_falls_back_to_empty_bytes() -> None:
-    request = HTTPRequest(
-        method="POST",
-        path="/upload",
-        http_version="1.1",
-        wire_raw_bytes=b"not an http request",
-    )
+def test_recorded_request_wire_body_bytes_empty_body_fallback() -> None:
+    request = HTTPRequest(method="POST", target="/upload", body=b"")
+    recorded = _make_recorded(request, b"not an http request")
 
-    assert request.wire_body_bytes == b""
+    assert recorded.wire_body_bytes == b""
+
+
+def test_recorded_request_wire_body_bytes_missing_body_fallback() -> None:
+    request = HTTPRequest(method="POST", target="/upload")
+    recorded = _make_recorded(request, b"not an http request")
+
+    assert recorded.wire_body_bytes == b""
 
 
 def test_http_request_exposes_immutable_headers() -> None:
     headers = Headers.from_items([("X-Test", "a")])
     request = HTTPRequest(
         method="GET",
-        path="/",
-        http_version="1.1",
+        target="/",
         headers=headers,
     )
 
@@ -1029,8 +1067,7 @@ def test_http_request_headers_are_immutable() -> None:
 def test_http_request_is_proxy_request_true_for_http() -> None:
     request = HTTPRequest(
         method="GET",
-        path="http://example.com/path",
-        http_version="1.1",
+        target="http://example.com/path",
     )
     assert request.is_proxy_request
 
@@ -1038,27 +1075,25 @@ def test_http_request_is_proxy_request_true_for_http() -> None:
 def test_http_request_is_proxy_request_true_for_https() -> None:
     request = HTTPRequest(
         method="GET",
-        path="https://example.com/path",
-        http_version="1.1",
+        target="https://example.com/path",
     )
     assert request.is_proxy_request
 
 
 def test_http_request_is_proxy_request_false_for_origin_form() -> None:
-    request = HTTPRequest(method="GET", path="/path", http_version="1.1")
+    request = HTTPRequest(method="GET", target="/path")
     assert not request.is_proxy_request
 
 
-def test_http_request_is_proxy_request_false_for_empty_path() -> None:
-    request = HTTPRequest(method="GET", path="", http_version="1.1")
+def test_http_request_is_proxy_request_false_for_empty_target() -> None:
+    request = HTTPRequest(method="GET", target="")
     assert not request.is_proxy_request
 
 
 def test_http_request_target_uri_returns_parsed_for_absolute_uri() -> None:
     request = HTTPRequest(
         method="GET",
-        path="http://example.com:8080/api?key=val",
-        http_version="1.1",
+        target="http://example.com:8080/api?key=val",
     )
     uri = request.target_uri
 
@@ -1070,20 +1105,19 @@ def test_http_request_target_uri_returns_parsed_for_absolute_uri() -> None:
 
 
 def test_http_request_target_uri_returns_none_for_origin_form() -> None:
-    request = HTTPRequest(method="GET", path="/path", http_version="1.1")
+    request = HTTPRequest(method="GET", target="/path")
     assert request.target_uri is None
 
 
-def test_http_request_target_uri_returns_none_for_empty_path() -> None:
-    request = HTTPRequest(method="GET", path="", http_version="1.1")
+def test_http_request_target_uri_returns_none_for_empty_target() -> None:
+    request = HTTPRequest(method="GET", target="")
     assert request.target_uri is None
 
 
 def test_http_request_effective_path_extracts_absolute_path() -> None:
     request = HTTPRequest(
         method="GET",
-        path="http://example.com/api/users?limit=10",
-        http_version="1.1",
+        target="http://example.com/api/users?limit=10",
     )
     assert request.effective_path == "/api/users?limit=10"
 
@@ -1091,33 +1125,43 @@ def test_http_request_effective_path_extracts_absolute_path() -> None:
 def test_http_request_effective_path_returns_origin_form_path() -> None:
     request = HTTPRequest(
         method="GET",
-        path="/api/users",
-        http_version="1.1",
+        target="/api/users",
     )
     assert request.effective_path == "/api/users"
 
 
-def test_http_request_effective_path_returns_slash_for_empty_path() -> None:
-    request = HTTPRequest(method="GET", path="", http_version="1.1")
+def test_http_request_effective_path_returns_slash_for_empty_target() -> None:
+    request = HTTPRequest(method="GET", target="")
     assert request.effective_path == "/"
 
 
-def test_parsed_body_bytes_empty_wire_returns_none() -> None:
-    assert parsed_body_bytes_from_wire_raw_bytes(b"") is None
+def test_wire_body_bytes_with_empty_wire_returns_empty() -> None:
+    request = HTTPRequest(method="POST", target="/upload")
+    recorded = _make_recorded(request, b"")
+
+    assert recorded.wire_body_bytes == b""
 
 
-def test_parsed_body_bytes_returns_none_for_bad_request() -> None:
-    assert parsed_body_bytes_from_wire_raw_bytes(b"\x00") is None
+def test_wire_body_bytes_with_bad_request_wire_returns_empty() -> None:
+    request = HTTPRequest(method="POST", target="/upload")
+    recorded = _make_recorded(request, b"\x00")
+
+    assert recorded.wire_body_bytes == b""
 
 
-def test_parsed_body_bytes_returns_none_for_incomplete_request() -> None:
-    request_bytes = b"POST /upload HTTP/1.1\r\nHost: localhost\r\n"
+def test_wire_body_bytes_with_incomplete_request_returns_empty() -> None:
+    request = HTTPRequest(method="POST", target="/upload")
+    recorded = _make_recorded(
+        request,
+        b"POST /upload HTTP/1.1\r\nHost: localhost\r\n",
+    )
 
-    assert parsed_body_bytes_from_wire_raw_bytes(request_bytes) is None
+    assert recorded.wire_body_bytes == b""
 
 
-def test_parsed_body_bytes_dechunks_wire_body() -> None:
-    request_bytes = (
+@pytest.mark.asyncio
+async def test_wire_body_bytes_preserves_chunked_wire_framing() -> None:
+    request_data = (
         b"POST /upload HTTP/1.1\r\n"
         b"Host: localhost\r\n"
         b"Transfer-Encoding: chunked\r\n"
@@ -1126,13 +1170,31 @@ def test_parsed_body_bytes_dechunks_wire_body() -> None:
         b"6\r\n World\r\n"
         b"0\r\n\r\n"
     )
+    reader = asyncio.StreamReader()
+    reader.feed_data(request_data)
+    reader.feed_eof()
 
-    assert (
-        parsed_body_bytes_from_wire_raw_bytes(request_bytes) == b"Hello World"
-    )
+    http_reader = HTTPRequestReader()
+    request = await http_reader.read_request(reader)
+
+    assert request is not None
+    assert request.body == b"Hello World"
+    assert request.wire_body_bytes == b"5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n"
 
 
 def _create_mock_reader(data_chunks: list[bytes]) -> asyncio.StreamReader:
     reader = AsyncMock(spec=asyncio.StreamReader)
     reader.read = AsyncMock(side_effect=data_chunks + [b""])
     return reader
+
+
+def _make_recorded(
+    request: HTTPRequest,
+    wire_raw_bytes: bytes = b"GET / HTTP/1.1\r\n\r\n",
+) -> RecordedHTTPRequest:
+    return RecordedHTTPRequest(
+        request=request,
+        as_received=request,
+        wire_raw_bytes=wire_raw_bytes,
+        http_version="1.1",
+    )

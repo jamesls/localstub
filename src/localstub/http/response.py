@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from email.message import Message
 
 import httptools
 
@@ -14,19 +13,36 @@ from localstub.http.framing import (
     is_chunked_transfer,
     scan_chunked_body,
 )
+from localstub.http.headers import Headers
+from localstub.http.responsespec import HTTPResponse
 
 LOG = logging.getLogger(__name__)
 
 
-@dataclass
-class RecordedResponse:
-    """Captured HTTP response for recording/display purposes."""
+@dataclass(frozen=True)
+class RecordedHTTPResponse:
+    """An HTTPResponse we witnessed on the wire, plus the evidence.
 
-    status: int
+    ``response`` carries the RFC 9110 semantics; the reason phrase and
+    the exact wire bytes are observation facts about this encounter.
+    Reads delegate to ``response``.
+    """
+
+    response: HTTPResponse
     reason: str | None
-    headers: Message | None
-    body: str | None
     wire_raw_bytes: bytes
+
+    @property
+    def status(self) -> int:
+        return self.response.status
+
+    @property
+    def headers(self) -> Headers:
+        return self.response.headers
+
+    @property
+    def body(self) -> bytes | str:
+        return self.response.body
 
 
 @dataclass

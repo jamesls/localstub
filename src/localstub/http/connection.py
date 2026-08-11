@@ -3,7 +3,7 @@ from __future__ import annotations
 from email.message import Message
 
 from localstub.http.headers import Headers
-from localstub.http.request import HTTPRequest
+from localstub.http.request import RecordedHTTPRequest
 
 
 def parse_connection_tokens(value: str) -> set[str]:
@@ -35,16 +35,16 @@ def _connection_tokens_from_dict(headers: dict[str, str]) -> set[str]:
     return set()
 
 
-def _is_http10(request: HTTPRequest) -> bool:
+def _is_http10(request: RecordedHTTPRequest) -> bool:
     return request.http_version == "1.0"
 
 
-def _is_http11(request: HTTPRequest) -> bool:
+def _is_http11(request: RecordedHTTPRequest) -> bool:
     return request.http_version == "1.1"
 
 
 def should_close_connection(
-    request: HTTPRequest,
+    request: RecordedHTTPRequest,
     *,
     response_headers: Headers | Message | dict[str, str] | None,
 ) -> bool:

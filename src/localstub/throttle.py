@@ -5,7 +5,7 @@ from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import Protocol
 
-from localstub.http.request import HTTPRequest
+from localstub.http.request import RecordedHTTPRequest
 
 
 class Clock(Protocol):
@@ -26,7 +26,7 @@ class ThrottleDecision:
 
 
 class RequestThrottler(Protocol):
-    def check(self, request: HTTPRequest) -> ThrottleDecision: ...
+    def check(self, request: RecordedHTTPRequest) -> ThrottleDecision: ...
 
     def reset(self) -> None: ...
 
@@ -76,7 +76,7 @@ class TokenBucket:
         self._last_timestamp = timestamp
 
 
-ThrottleKeyFunc = Callable[[HTTPRequest], Hashable]
+ThrottleKeyFunc = Callable[[RecordedHTTPRequest], Hashable]
 
 
 class TokenBucketThrottler:
@@ -113,7 +113,7 @@ class TokenBucketThrottler:
     def reset(self) -> None:
         self._buckets.clear()
 
-    def check(self, request: HTTPRequest) -> ThrottleDecision:
+    def check(self, request: RecordedHTTPRequest) -> ThrottleDecision:
         key = self._key(request)
         bucket = self._buckets.get(key)
         if bucket is None:
