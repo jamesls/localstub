@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import socket
+import struct
 
 import httpx
 import pytest
@@ -491,6 +492,71 @@ class TestRawForwarding:
     """Tests for raw socket forwarding that preserves Transfer-Encoding."""
 
     @pytest.mark.asyncio
+    async def test_relays_switching_protocols_response(self) -> None:
+        async def switching_protocols_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Upgrade: websocket\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+            await reader.read()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(
+            switching_protocols_handler,
+            "127.0.0.1",
+            0,
+        )
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+
+        try:
+            forwarder = RawForwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                reader, writer = await asyncio.open_connection(
+                    proxy.host,
+                    proxy.port,
+                )
+                try:
+                    request = (
+                        f"GET http://{upstream_host}:{upstream_port}/chat "
+                        "HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Connection: Upgrade\r\n"
+                        "Upgrade: websocket\r\n"
+                        "\r\n"
+                    ).encode()
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await asyncio.wait_for(
+                        reader.readuntil(b"\r\n\r\n"),
+                        timeout=0.5,
+                    )
+
+                    assert response == (
+                        b"HTTP/1.1 101 Switching Protocols\r\n"
+                        b"Connection: Upgrade\r\n"
+                        b"Upgrade: websocket\r\n"
+                        b"\r\n"
+                    )
+                    recorded = await proxy.next_response(timeout=0.5)
+                    assert recorded.status == 101
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+    @pytest.mark.asyncio
     async def test_preserves_chunked_request_framing(self) -> None:
         captured_headers = b""
         captured_body = b""
@@ -546,6 +612,68 @@ class TestRawForwarding:
 
         assert b"Transfer-Encoding: chunked" in captured_headers
         assert captured_body.startswith(b"5\r\n")
+
+    @pytest.mark.asyncio
+    async def test_rejects_connection_nominated_content_length(self) -> None:
+        smuggled_request_received = asyncio.Event()
+
+        async def upstream_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                second_request = await reader.readuntil(b"\r\n\r\n")
+                if second_request.startswith(b"GET /admin HTTP/1.1\r\n"):
+                    smuggled_request_received.set()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        upstream = await asyncio.start_server(
+            upstream_handler,
+            "127.0.0.1",
+            0,
+        )
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+        hidden_request = (
+            b"GET /admin HTTP/1.1\r\n"
+            + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+            + b"\r\n"
+        )
+
+        try:
+            forwarder = RawForwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                reader, writer = await asyncio.open_connection(
+                    proxy.host,
+                    proxy.port,
+                )
+                try:
+                    request = (
+                        f"POST http://{upstream_host}:{upstream_port}/submit "
+                        "HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Connection: Content-Length\r\n"
+                        f"Content-Length: {len(hidden_request)}\r\n"
+                        "\r\n"
+                    ).encode() + hidden_request
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await _read_http_response_bytes(reader)
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert response.startswith(b"HTTP/1.1 400 Bad Request")
+        assert not smuggled_request_received.is_set()
 
     @pytest.mark.asyncio
     async def test_rejects_body_rewrites(self) -> None:
@@ -847,6 +975,64 @@ class TestRawForwarding:
             await upstream.wait_closed()
 
         assert body in response
+
+    @pytest.mark.asyncio
+    async def test_returns_bad_gateway_after_reset_during_eof_body(
+        self,
+    ) -> None:
+        async def reset_during_body_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npartial"
+            )
+            await writer.drain()
+            upstream_socket = writer.get_extra_info("socket")
+            assert upstream_socket is not None
+            upstream_socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_LINGER,
+                struct.pack("ii", 1, 0),
+            )
+            writer.close()
+
+        upstream = await asyncio.start_server(
+            reset_during_body_handler,
+            "127.0.0.1",
+            0,
+        )
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+
+        try:
+            forwarder = RawForwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                reader, writer = await asyncio.open_connection(
+                    proxy.host,
+                    proxy.port,
+                )
+                try:
+                    request = (
+                        f"GET http://{upstream_host}:{upstream_port}/reset "
+                        "HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                    ).encode()
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await _read_http_response_bytes(reader)
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert response.startswith(b"HTTP/1.1 502 Bad Gateway")
 
     @pytest.mark.asyncio
     async def test_recorded_response_has_wire_bytes(self) -> None:

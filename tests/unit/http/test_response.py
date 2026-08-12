@@ -271,6 +271,25 @@ async def test_async_response_parser_parse_with_read_exception() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_response_parser_reset_during_eof_body_returns_none(
+    response_with_partial_eof_body: bytes,
+) -> None:
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.read = AsyncMock(
+        side_effect=[
+            response_with_partial_eof_body,
+            ConnectionResetError("Connection reset"),
+        ]
+    )
+
+    parser = AsyncResponseParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is None
+    assert wire_bytes == response_with_partial_eof_body
+
+
+@pytest.mark.asyncio
 async def test_async_response_parser_head_completes_after_headers() -> None:
     response_data = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n"
     reader = _create_mock_reader([response_data])
@@ -375,6 +394,25 @@ async def test_multi_response_parser_buffers_large_body_parts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multi_response_parser_parses_switching_protocols() -> None:
+    response = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: websocket\r\n"
+        b"\r\n"
+    )
+    reader = _create_mock_reader([response])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is not None
+    assert parsed.status_code == 101
+    assert parsed.is_complete
+    assert wire == response
+
+
+@pytest.mark.asyncio
 async def test_multi_response_parser_streams_content_length_segments() -> None:
     headers = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n"
     reader = _create_mock_reader([headers + b"abc", b"def"])
@@ -435,6 +473,25 @@ async def test_multi_response_parser_reads_close_delimited_body() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multi_response_parser_reset_during_eof_body_returns_none(
+    response_with_partial_eof_body: bytes,
+) -> None:
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.read = AsyncMock(
+        side_effect=[
+            response_with_partial_eof_body,
+            ConnectionResetError("Connection reset"),
+        ]
+    )
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is None
+    assert wire == response_with_partial_eof_body
+
+
+@pytest.mark.asyncio
 async def test_multi_response_parser_head_retains_next_response() -> None:
     head_response = b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n"
     next_response = b"HTTP/1.1 204 No Content\r\n\r\n"
@@ -474,6 +531,11 @@ async def test_multi_response_parser_invalid_chunk_size_returns_none() -> None:
 
     assert parsed is None
     assert wire == headers + b"Z"
+
+
+@pytest.fixture
+def response_with_partial_eof_body() -> bytes:
+    return b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npartial"
 
 
 def _create_mock_reader(data_chunks: list[bytes]) -> asyncio.StreamReader:

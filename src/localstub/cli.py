@@ -5,7 +5,8 @@ import asyncio
 import json
 import logging
 import signal
-from contextlib import AsyncExitStack
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -201,34 +202,35 @@ async def run_http_proxy(args: argparse.Namespace) -> None:
         elif config.single_response:
             server.set_default_response(config.single_response)
 
-    async with server:
-        console.print()
-        console.print(
-            f"[bold cyan]lstub[/] HTTP proxy listening on "
-            f"[bold]{server.host}:{server.port}[/]"
-        )
-        console.print(f"[dim]Mode:[/] {mode_label}")
-        console.print("[dim]Press Ctrl+C to stop[/]")
-        console.print()
-
-        shutdown_event = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        try:
-            loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
-            loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
-        except (NotImplementedError, RuntimeError):
-            pass
-
-        async with AsyncExitStack() as output_stack:
-            output_file: TrafficOutput | None = None
-            if args.output:
-                output_file = await output_stack.enter_async_context(
-                    await anyio.open_file(args.output, "a", encoding="utf-8")
-                )
-
-            await process_http_proxy_traffic(
-                server, output_file, shutdown_event
+    async with AsyncExitStack() as output_stack:
+        output_file: TrafficOutput | None = None
+        if args.output:
+            output_file = await output_stack.enter_async_context(
+                await anyio.open_file(args.output, "a", encoding="utf-8")
             )
+
+        async with (
+            _process_traffic_until_source_closes(server, output_file),
+            server,
+        ):
+            console.print()
+            console.print(
+                f"[bold cyan]lstub[/] HTTP proxy listening on "
+                f"[bold]{server.host}:{server.port}[/]"
+            )
+            console.print(f"[dim]Mode:[/] {mode_label}")
+            console.print("[dim]Press Ctrl+C to stop[/]")
+            console.print()
+
+            shutdown_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            try:
+                loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
+                loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+
+            await shutdown_event.wait()
 
 
 async def run_tls_proxy(args: argparse.Namespace) -> None:
@@ -256,39 +258,41 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
         upstream_tls=True,
     )
 
-    async with proxy:
-        host, port = proxy.address
-        console.print()
-        console.print(
-            f"[bold cyan]lstub[/] listening on [bold]{host}:{port}[/]"
-        )
-        console.print(f"[dim]CA certificate:[/] {proxy.ca.ca_pem_path()}")
-        console.print(f"[dim]Keystore:[/] {proxy.ca.ca_pkcs12_path()}")
-        console.print("[dim]Press Ctrl+C to stop[/]")
-        console.print()
+    traffic_source = proxy if server is None else server
+    async with AsyncExitStack() as output_stack:
+        output_file: TrafficOutput | None = None
+        if args.output:
+            output_file = await output_stack.enter_async_context(
+                await anyio.open_file(args.output, "a", encoding="utf-8")
+            )
 
-        shutdown_event = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        try:
-            loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
-            loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
-        except (NotImplementedError, RuntimeError):
-            # Signal handlers may be unsupported (e.g. on Windows)
-            pass
+        async with (
+            _process_traffic_until_source_closes(
+                traffic_source,
+                output_file,
+            ),
+            proxy,
+        ):
+            host, port = proxy.address
+            console.print()
+            console.print(
+                f"[bold cyan]lstub[/] listening on [bold]{host}:{port}[/]"
+            )
+            console.print(f"[dim]CA certificate:[/] {proxy.ca.ca_pem_path()}")
+            console.print(f"[dim]Keystore:[/] {proxy.ca.ca_pkcs12_path()}")
+            console.print("[dim]Press Ctrl+C to stop[/]")
+            console.print()
 
-        async with AsyncExitStack() as output_stack:
-            output_file: TrafficOutput | None = None
-            if args.output:
-                output_file = await output_stack.enter_async_context(
-                    await anyio.open_file(args.output, "a", encoding="utf-8")
-                )
+            shutdown_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            try:
+                loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
+                loop.add_signal_handler(signal.SIGTERM, shutdown_event.set)
+            except (NotImplementedError, RuntimeError):
+                # Signal handlers may be unsupported (e.g. on Windows)
+                pass
 
-            if server is None:
-                await process_traffic(proxy, output_file, shutdown_event)
-            else:
-                await process_http_proxy_traffic(
-                    server, output_file, shutdown_event
-                )
+            await shutdown_event.wait()
 
 
 class _TrafficSource(Protocol):
@@ -359,6 +363,22 @@ async def _process_traffic(
             f"[yellow]{source.dropped_exchanges} exchange(s) were "
             "dropped before they could be recorded[/]"
         )
+
+
+@asynccontextmanager
+async def _process_traffic_until_source_closes(
+    source: _TrafficSource,
+    output_file: TrafficOutput | None,
+) -> AsyncIterator[None]:
+    source_stopped = asyncio.Event()
+    traffic_task = asyncio.create_task(
+        _process_traffic(source, output_file, source_stopped)
+    )
+    try:
+        yield
+    finally:
+        source_stopped.set()
+        await traffic_task
 
 
 async def process_traffic(

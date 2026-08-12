@@ -130,11 +130,16 @@ class RawForwardProxyMiddleware:
                 "rewrites.",
                 status=500,
             )
+        try:
+            request_wire_bytes = build_origin_form_request(recorded, uri)
+        except ValueError as exc:
+            return HTTPResponse.text(f"Bad Request: {exc}", status=400)
+
         return ForwardProxyResponse(
             host=uri.host,
             port=uri.port,
             upstream_tls=(uri.scheme == "https"),
-            request_wire_bytes=build_origin_form_request(recorded, uri),
+            request_wire_bytes=request_wire_bytes,
             request_method=recorded.method,
             forwarder=self.forwarder,
         )

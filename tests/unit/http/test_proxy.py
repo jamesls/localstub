@@ -173,6 +173,37 @@ def test_build_origin_form_request_preserves_wire_body_framing() -> None:
     assert origin_wire.endswith(b"\r\n\r\n" + chunked_body)
 
 
+@pytest.mark.parametrize(
+    ("framing_name", "framing_value"),
+    [
+        ("Content-Length", "1"),
+        ("Transfer-Encoding", "chunked"),
+    ],
+)
+def test_build_origin_form_request_rejects_connection_nominated_framing(
+    framing_name: str,
+    framing_value: str,
+) -> None:
+    request = _recorded(
+        HTTPRequest(
+            method="POST",
+            target="http://example.com/upload",
+            headers=Headers.from_items([
+                ("Host", "example.com"),
+                ("Connection", framing_name),
+                (framing_name, framing_value),
+            ]),
+            body=b"x",
+        ),
+        wire_raw_bytes=b"POST /upload HTTP/1.1\r\n\r\nx",
+    )
+    uri = request.target_uri
+    assert uri is not None
+
+    with pytest.raises(ValueError, match="Connection header"):
+        build_origin_form_request(request, uri)
+
+
 @pytest.mark.asyncio
 async def test_forward_proxy_request_rejects_non_absolute_target() -> None:
     client = StubHTTPClient()

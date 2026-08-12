@@ -15,6 +15,8 @@ from localstub.http.uri import ParsedURI
 
 LOG = logging.getLogger(__name__)
 
+_REQUEST_FRAMING_HEADERS = {"content-length", "transfer-encoding"}
+
 _HOP_BY_HOP_HEADERS = frozenset({
     "connection",
     "keep-alive",
@@ -49,6 +51,12 @@ def build_origin_form_request(
         "proxy-authorization",
     }
     connection_tokens = connection_tokens_from_headers(recorded.headers)
+    nominated_framing = connection_tokens & _REQUEST_FRAMING_HEADERS
+    if nominated_framing:
+        names = ", ".join(sorted(nominated_framing))
+        raise ValueError(
+            f"Connection header must not nominate request framing: {names}"
+        )
     remove_headers = hop_by_hop | {"connection"} | connection_tokens
     authority = uri.authority
     host_added = False

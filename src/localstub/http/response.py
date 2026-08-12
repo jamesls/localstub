@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from enum import Enum, auto
 
 import httptools
 
@@ -17,6 +18,12 @@ from localstub.http.headers import Headers
 from localstub.http.responsespec import HTTPResponse
 
 LOG = logging.getLogger(__name__)
+
+
+class _ReadStatus(Enum):
+    DATA = auto()
+    EOF = auto()
+    ERROR = auto()
 
 
 @dataclass(frozen=True)
@@ -179,7 +186,7 @@ class AsyncResponseParser:
                 data = await reader.read(self._max_read)
             except Exception:
                 LOG.debug("Failed to read response data", exc_info=True)
-                break
+                return None, bytes(self._wire)
 
             if not data:
                 try:
@@ -263,6 +270,8 @@ class AsyncMultiResponseParser:
         header_wire = bytes(self._buffer[:header_end])
         try:
             parser.feed_data(header_wire)
+        except httptools.HttpParserUpgrade:
+            pass
         except httptools.HttpParserError:
             error_offset = self._precise_error_offset(header_wire)
             wire = bytes(self._buffer[:error_offset])
@@ -304,18 +313,21 @@ class AsyncMultiResponseParser:
             wire,
         )
 
-    async def _read_more(self, reader: asyncio.StreamReader) -> bool:
+    async def _read_more(
+        self,
+        reader: asyncio.StreamReader,
+    ) -> _ReadStatus:
         try:
             data = await reader.read(self._max_read)
         except Exception:
             LOG.debug("Failed to read response data", exc_info=True)
-            return False
+            return _ReadStatus.ERROR
 
         if not data:
-            return False
+            return _ReadStatus.EOF
 
         self._buffer.extend(data)
-        return True
+        return _ReadStatus.DATA
 
     async def _read_headers(
         self,
@@ -325,7 +337,7 @@ class AsyncMultiResponseParser:
             header_end = self._buffer.find(HEADER_TERMINATOR)
             if header_end != -1:
                 return header_end + len(HEADER_TERMINATOR)
-            if not await self._read_more(reader):
+            if await self._read_more(reader) is not _ReadStatus.DATA:
                 return None
 
     def _precise_error_offset(self, data: bytes) -> int:
@@ -355,7 +367,10 @@ class AsyncMultiResponseParser:
         remaining = content_length
 
         while remaining > 0:
-            if not self._buffer and not await self._read_more(reader):
+            if (
+                not self._buffer
+                and await self._read_more(reader) is not _ReadStatus.DATA
+            ):
                 return None, bytes(wire)
 
             segment_length = min(remaining, len(self._buffer))
@@ -404,7 +419,7 @@ class AsyncMultiResponseParser:
                 return protocol.result, bytes(wire)
 
             scan_from = scan.resume_from
-            if not await self._read_more(reader):
+            if await self._read_more(reader) is not _ReadStatus.DATA:
                 wire.extend(self._buffer)
                 self._buffer.clear()
                 return None, bytes(wire)
@@ -426,8 +441,12 @@ class AsyncMultiResponseParser:
                 wire.extend(segment)
                 self._buffer.clear()
 
-            if not await self._read_more(reader):
+            read_status = await self._read_more(reader)
+            if read_status is not _ReadStatus.DATA:
                 break
+
+        if read_status is _ReadStatus.ERROR:
+            return None, bytes(wire)
 
         if protocol.result.http_version is not None and _is_close_delimited(
             protocol.result.headers
