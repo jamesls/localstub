@@ -27,7 +27,6 @@ dependencies = [
   "cryptography>=46.0.3",
   "rich>=14.2.0",
   "truststore>=0.10.0",
-  "httpx>=0.28.0",
   "anyio>=4.11.0",
 ]
 
@@ -35,6 +34,7 @@ dependencies = [
 dev = [
   "ast-grep-cli",
   "aiohttp",
+  "httpx>=0.28.0",
   "pytest>=8.4.2",
   "pytest-asyncio",
   "pytest-cov>=7.0.0",
