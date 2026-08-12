@@ -44,9 +44,7 @@ class AsyncioClient:
     response parser.  No third-party HTTP client library.
 
     One TCP (+TLS) handshake per ``send()``; no connection pooling,
-    redirects, retries, cookies, or content decoding.  Inject
-    ``HttpxClient`` instead when forwarding heavy traffic that needs
-    pooling or HTTP/2.
+    redirects, retries, cookies, or content decoding.
     """
 
     def __init__(
