@@ -5,10 +5,10 @@ import json
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
-from weakref import WeakKeyDictionary
 
 import httptools
 
+from localstub.http import stream
 from localstub.http.framing import (
     HEADER_TERMINATOR,
     ChunkScanError,
@@ -21,9 +21,6 @@ from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_headers
 
 LOG = logging.getLogger(__name__)
-_UNREAD_BYTES_BY_READER: WeakKeyDictionary[asyncio.StreamReader, bytearray] = (
-    WeakKeyDictionary()
-)
 
 
 class Writer(Protocol):
@@ -377,22 +374,16 @@ class AsyncRequestParser:
 
     This class combines asyncio stream reading with httptools parsing while
     preserving the exact bytes received on the wire. It correctly handles
-    pipelined requests by retaining unread bytes ahead of future stream
-    reads.
+    pipelined requests by returning bytes read past the end of the
+    current request to the stream via ``localstub.http.stream``, where
+    any later consumer of the reader picks them up in order.
     """
 
-    def __init__(
-        self,
-        max_read: int = 8192,
-        unread_bytes: bytearray | None = None,
-    ) -> None:
+    def __init__(self, max_read: int = 8192) -> None:
         self._protocol, self._parser = _build_request_parser()
         self._wire = bytearray()
         self._connection_wire_offset = 0
         self._max_read = max_read
-        self._unread_bytes = (
-            unread_bytes if unread_bytes is not None else bytearray()
-        )
 
     async def parse(
         self,
@@ -412,9 +403,10 @@ class AsyncRequestParser:
 
         Note:
             This method parses headers and bodies in buffered segments while
-            preserving exact wire bytes. Any bytes belonging to a subsequent
-            pipelined requests are retained in ``unread_bytes`` for the next
-            parser on the connection.
+            preserving exact wire bytes. Any bytes belonging to subsequent
+            pipelined requests are returned to the stream with
+            ``localstub.http.stream.unread_data()`` for the next consumer
+            of the reader.
         """
         parsed, wire_bytes, remaining = await self.parse_headers(
             reader,
@@ -424,7 +416,7 @@ class AsyncRequestParser:
             return None, wire_bytes
 
         if parsed.is_complete:
-            self._prepend_unread(remaining)
+            stream.unread_data(reader, remaining)
             return parsed, wire_bytes
 
         return await self.continue_parse_body(
@@ -484,7 +476,7 @@ class AsyncRequestParser:
                 )
                 self._wire.extend(buffer[:error_offset])
                 self._sync_connection_wire(connection_wire)
-                self._prepend_unread(buffer[error_offset:])
+                stream.unread_data(reader, buffer[error_offset:])
                 return None, bytes(self._wire), bytearray()
 
             fed = feed_end
@@ -526,7 +518,7 @@ class AsyncRequestParser:
         buffer = remaining_buffer
 
         if self._protocol.result.is_complete:
-            self._prepend_unread(buffer)
+            stream.unread_data(reader, buffer)
             self._sync_connection_wire(connection_wire)
             return self._protocol.result, bytes(self._wire)
 
@@ -571,7 +563,7 @@ class AsyncRequestParser:
             self._sync_connection_wire(connection_wire)
             return None, bytes(self._wire)
 
-        self._prepend_unread(buffer)
+        stream.unread_data(reader, buffer)
         self._sync_connection_wire(connection_wire)
         return self._protocol.result, bytes(self._wire)
 
@@ -580,14 +572,8 @@ class AsyncRequestParser:
         reader: asyncio.StreamReader,
         buffer: bytearray,
     ) -> bool:
-        if self._unread_bytes:
-            read_size = min(self._max_read, len(self._unread_bytes))
-            buffer.extend(self._unread_bytes[:read_size])
-            del self._unread_bytes[:read_size]
-            return True
-
         try:
-            data = await reader.read(self._max_read)
+            data = await stream.read(reader, self._max_read)
         except Exception:
             LOG.debug("Failed to read request data", exc_info=True)
             return False
@@ -610,13 +596,6 @@ class AsyncRequestParser:
 
         connection_wire.extend(self._wire[self._connection_wire_offset :])
         self._connection_wire_offset = len(self._wire)
-
-    def _prepend_unread(
-        self,
-        buffer: bytes | bytearray,
-    ) -> None:
-        if buffer:
-            self._unread_bytes[:0] = bytes(buffer)
 
     def _precise_error_offset(self, data: bytes) -> int:
         protocol, parser = _build_request_parser()
@@ -644,7 +623,7 @@ class AsyncRequestParser:
         body_offset = max(0, error_offset - len(self._wire))
         self._wire.extend(buffer[:body_offset])
         self._sync_connection_wire(connection_wire)
-        self._prepend_unread(buffer[body_offset:])
+        stream.unread_data(reader, buffer[body_offset:])
         return None, bytes(self._wire)
 
     async def _parse_content_length_body(
@@ -673,7 +652,7 @@ class AsyncRequestParser:
             )
 
         self._wire.extend(body)
-        self._prepend_unread(buffer[content_length:])
+        stream.unread_data(reader, buffer[content_length:])
         self._sync_connection_wire(connection_wire)
 
         if not self._protocol.result.is_complete:
@@ -694,7 +673,7 @@ class AsyncRequestParser:
             except ChunkScanError as exc:
                 self._wire.extend(buffer[: exc.offset])
                 self._sync_connection_wire(connection_wire)
-                self._prepend_unread(buffer[exc.offset :])
+                stream.unread_data(reader, buffer[exc.offset :])
                 return None, bytes(self._wire)
 
             if scan.end is not None:
@@ -711,7 +690,7 @@ class AsyncRequestParser:
                     )
 
                 self._wire.extend(chunked_body)
-                self._prepend_unread(buffer[chunked_end:])
+                stream.unread_data(reader, buffer[chunked_end:])
                 self._sync_connection_wire(connection_wire)
 
                 if not self._protocol.result.is_complete:
@@ -753,18 +732,8 @@ class HTTPRequestReader:
         Returns:
             RecordedHTTPRequest or None on EOF/parse error
         """
-        unread_bytes = _UNREAD_BYTES_BY_READER.setdefault(
-            reader,
-            bytearray(),
-        )
-        parser = AsyncRequestParser(
-            max_read=self._max_read,
-            unread_bytes=unread_bytes,
-        )
+        parser = AsyncRequestParser(max_read=self._max_read)
         parsed, wire_bytes = await parser.parse(reader, connection_wire)
-
-        if not unread_bytes:
-            _UNREAD_BYTES_BY_READER.pop(reader, None)
 
         if parsed is None:
             return None
