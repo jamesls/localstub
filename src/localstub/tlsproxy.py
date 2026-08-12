@@ -36,6 +36,21 @@ from localstub.recording import (
 from localstub.server import AsyncHTTPTestServer
 
 LOG = logging.getLogger(__name__)
+_SHUTDOWN_DRAIN_TURNS = 8
+
+
+def _pause_listener_accepts(listener: asyncio.Server) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        for sock in listener.sockets:
+            loop.remove_reader(sock.fileno())
+    except NotImplementedError:
+        listener.close()
+
+
+async def _drain_pending_accepts() -> None:
+    for _ in range(_SHUTDOWN_DRAIN_TURNS):
+        await asyncio.sleep(0)
 
 
 def _hexdump(data: bytes, bytes_per_line: int = 32) -> str:
@@ -164,6 +179,8 @@ class AsyncTLSInterceptProxy:
         self._listener: asyncio.base_events.Server | None = None
         self._host: str | None = None
         self._port: int | None = None
+        self._closing = False
+        self._client_writers: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
 
     @property
@@ -230,6 +247,7 @@ class AsyncTLSInterceptProxy:
     async def start(self) -> None:
         if self._listener is not None:
             return
+        self._closing = False
         self._listener = await asyncio.start_server(
             self._client_connected,
             self._listen_host,
@@ -240,23 +258,51 @@ class AsyncTLSInterceptProxy:
         self._host, self._port = sockname[0], sockname[1]
 
     async def aclose(self) -> None:
-        if self._listener is None:
+        listener = self._listener
+        if listener is None:
             return
-        self._listener.close()
-        # Let callbacks for connections accepted before close register their
-        # client tasks before taking the shutdown snapshot.
-        await asyncio.sleep(0)
-        # Wait for in-flight client handlers to finish; cancel any that linger.
-        pending = [t for t in self._client_tasks if not t.done()]
+        self._closing = True
+        shutdown_task = asyncio.create_task(self._finish_close(listener))
+        try:
+            await asyncio.shield(shutdown_task)
+        except asyncio.CancelledError:
+            await shutdown_task
+            raise
+        finally:
+            listener.close()
+            if self._listener is listener:
+                self._listener = None
+            self._closing = False
+
+    async def _finish_close(self, listener: asyncio.Server) -> None:
+        _pause_listener_accepts(listener)
+        await _drain_pending_accepts()
+        listener.close()
+
+        client_tasks = tuple(self._client_tasks)
+        pending: set[asyncio.Task[None]] = set()
+        if client_tasks:
+            _, pending = await asyncio.wait(client_tasks, timeout=1.0)
+
+        writers = tuple(self._client_writers)
+        for writer in writers:
+            writer.close()
+        for task in pending:
+            task.cancel()
         if pending:
-            _, pending = await asyncio.wait(pending, timeout=1.0)
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-        await self._listener.wait_closed()
+            await asyncio.gather(*pending, return_exceptions=True)
+        for writer in writers:
+            try:
+                await writer.wait_closed()
+            except Exception:
+                LOG.debug(
+                    "Failed to close TLS proxy client writer",
+                    exc_info=True,
+                )
+
+        await listener.wait_closed()
         self._client_tasks.clear()
-        self._listener = None
+        self._client_writers.clear()
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -320,7 +366,7 @@ class AsyncTLSInterceptProxy:
                         exc_info=True,
                     )
                 return
-            active_writer = tls_writer
+            active_writer = self._replace_client_writer(writer, tls_writer)
 
             if self._default_mode == "forward":
                 await self._forward(
@@ -363,15 +409,38 @@ class AsyncTLSInterceptProxy:
                     "Failed to close client writer after proxy error",
                     exc_info=True,
                 )
+        finally:
+            self._client_writers.discard(writer)
+            self._client_writers.discard(active_writer)
+
+    def _replace_client_writer(
+        self,
+        current: asyncio.StreamWriter,
+        replacement: asyncio.StreamWriter,
+    ) -> asyncio.StreamWriter:
+        self._client_writers.add(replacement)
+        self._client_writers.discard(current)
+        return replacement
 
     def _client_connected(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        if self._closing:
+            writer.close()
+            return
+        self._client_writers.add(writer)
         task = asyncio.create_task(self._handle_client(reader, writer))
         self._client_tasks.add(task)
-        task.add_done_callback(self._client_tasks.discard)
+
+        def release_client(done_task: asyncio.Task[None]) -> None:
+            self._client_tasks.discard(done_task)
+            if writer in self._client_writers:
+                writer.close()
+                self._client_writers.discard(writer)
+
+        task.add_done_callback(release_client)
 
     async def _parse_connect(
         self, reader: asyncio.StreamReader, client_id: str

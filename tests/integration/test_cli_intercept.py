@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import signal
 import socket
 import ssl
+import sys
 from pathlib import Path
 
 import httpx
@@ -74,6 +77,104 @@ async def test_cli_intercept_mode_writes_recorded_traffic(
         cli_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await cli_task
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="asyncio signal handlers are unavailable on Windows",
+)
+@pytest.mark.asyncio
+async def test_cli_writes_exchange_completed_during_shutdown(
+    tmp_path: Path,
+) -> None:
+    with socket.socket() as available_port:
+        available_port.bind(("127.0.0.1", 0))
+        port = available_port.getsockname()[1]
+
+    output_path = tmp_path / "traffic.jsonl"
+    ca_dir = tmp_path / "ca"
+    args = parse_args([
+        "--mode",
+        "intercept",
+        "--port",
+        str(port),
+        "--output",
+        str(output_path),
+        "--ca-dir",
+        str(ca_dir),
+    ])
+    cli_task = asyncio.create_task(run_tls_proxy(args))
+    loop = asyncio.get_running_loop()
+    writer: asyncio.StreamWriter | None = None
+
+    try:
+        ca_path = ca_dir / "ca.pem"
+        async with asyncio.timeout(2.0):
+            while not ca_path.exists():
+                await asyncio.sleep(0.01)
+
+        reader: asyncio.StreamReader | None = None
+        async with asyncio.timeout(2.0):
+            while writer is None:
+                try:
+                    reader, writer = await asyncio.open_connection(
+                        "127.0.0.1",
+                        port,
+                    )
+                except ConnectionRefusedError:
+                    await asyncio.sleep(0.01)
+
+        assert reader is not None
+        writer.write(
+            b"CONNECT example.com:443 HTTP/1.1\r\n"
+            b"Host: example.com:443\r\n"
+            b"\r\n"
+        )
+        await writer.drain()
+        assert (
+            await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"),
+                timeout=1.0,
+            )
+        ).startswith(b"HTTP/1.1 200")
+
+        verify_context = ssl.create_default_context(cafile=str(ca_path))
+        await writer.start_tls(
+            verify_context,
+            server_hostname="example.com",
+        )
+        writer.write(
+            b"POST /during-shutdown HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+            b"a"
+        )
+        await writer.drain()
+        await asyncio.sleep(0.05)
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.2)
+
+        writer.write(b"b")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(), timeout=1.0)
+        assert response.startswith(b"HTTP/1.1 200")
+        await asyncio.wait_for(cli_task, timeout=2.0)
+
+        records = output_path.read_text().splitlines()
+        assert len(records) == 1
+        assert json.loads(records[0])["request"]["path"] == "/during-shutdown"
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        if writer is not None:
+            writer.close()
+            await writer.wait_closed()
+        if not cli_task.done():
+            cli_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cli_task
 
 
 @pytest.mark.asyncio

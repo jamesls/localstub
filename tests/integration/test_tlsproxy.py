@@ -232,6 +232,37 @@ async def test_aclose_cancels_idle_client_connection() -> None:
         await proxy.aclose()
 
 
+@pytest.mark.parametrize("accept_progress_turns", [1, 2, 3, 4])
+@pytest.mark.asyncio
+async def test_aclose_closes_half_accepted_client_connection(
+    accept_progress_turns: int,
+) -> None:
+    proxy = AsyncTLSInterceptProxy()
+    await proxy.start()
+    host, port = proxy.address
+    sock = socket.create_connection((host, port))
+    sock.setblocking(False)
+
+    try:
+        for _ in range(accept_progress_turns):
+            await asyncio.sleep(0)
+
+        await asyncio.wait_for(proxy.aclose(), timeout=2.0)
+
+        loop = asyncio.get_running_loop()
+        try:
+            data = await asyncio.wait_for(
+                loop.sock_recv(sock, 1),
+                timeout=0.5,
+            )
+            assert data == b""
+        except ConnectionResetError:
+            pass
+    finally:
+        sock.close()
+        await proxy.aclose()
+
+
 @pytest.mark.asyncio
 async def test_aclose_cancels_forward_connection_after_tls_upgrade() -> None:
     request_received = asyncio.Event()
