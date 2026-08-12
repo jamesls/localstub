@@ -375,6 +375,25 @@ async def test_multi_response_parser_buffers_large_body_parts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multi_response_parser_parses_switching_protocols() -> None:
+    response = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: websocket\r\n"
+        b"\r\n"
+    )
+    reader = _create_mock_reader([response])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is not None
+    assert parsed.status_code == 101
+    assert parsed.is_complete
+    assert wire == response
+
+
+@pytest.mark.asyncio
 async def test_multi_response_parser_streams_content_length_segments() -> None:
     headers = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n"
     reader = _create_mock_reader([headers + b"abc", b"def"])

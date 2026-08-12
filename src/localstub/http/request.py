@@ -470,6 +470,8 @@ class AsyncRequestParser:
             segment = bytes(buffer[fed:feed_end])
             try:
                 self._parser.feed_data(segment)
+            except httptools.HttpParserUpgrade:
+                pass
             except httptools.HttpParserError:
                 error_offset = self._precise_error_offset(
                     bytes(buffer[:feed_end])

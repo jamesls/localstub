@@ -297,8 +297,8 @@ class RawForwarder:
     ) -> ForwardResult | None:
         """Read responses from upstream and relay to client.
 
-        Handles 1xx informational responses by relaying them and continuing
-        to read until a final (2xx+) response is received.
+        Relays informational responses until a final response or a 101
+        protocol switch is received.
 
         Args:
             upstream_reader: Stream reader for upstream connection.
@@ -326,6 +326,8 @@ class RawForwarder:
             if self._wire_log is not None:
                 self._wire_log(f"{upstream_label} --> lstub", wire_bytes)
 
+            is_final = status == 101 or status >= 200
+
             if self._response_transformer is not None and status >= 200:
                 return await self._apply_transformation_and_relay(
                     parsed=parsed,
@@ -340,8 +342,7 @@ class RawForwarder:
             client_writer.write(wire_bytes)
             await client_writer.drain()
 
-            # Check if this is a final response (not 1xx informational)
-            if status >= 200:
+            if is_final:
                 return self._build_result(parsed, wire_bytes)
 
             # For 1xx responses, continue reading for final response
@@ -377,10 +378,18 @@ class RawForwarder:
         upstream_writer.write(header_wire_bytes)
         await upstream_writer.drain()
 
-        interim, interim_wire = await resp_parser.next_response(
-            upstream_reader, request_method
+        (
+            parsed_response,
+            response_wire,
+        ) = await self._relay_until_continue_or_final(
+            parser=resp_parser,
+            upstream_reader=upstream_reader,
+            client_writer=client_writer,
+            request_method=request_method,
+            upstream_label=upstream_label,
+            client_label=client_label,
         )
-        if interim is None:
+        if parsed_response is None:
             return ForwardedRequest(
                 parsed_request=parsed_headers,
                 request_wire_bytes=(
@@ -390,14 +399,8 @@ class RawForwarder:
                 error=ForwardError.RESPONSE_PARSE_FAILED,
             )
 
-        status = interim.status_code or 0
-        if status < 200:
-            if self._wire_log is not None:
-                self._wire_log(f"{upstream_label} --> lstub", interim_wire)
-                self._wire_log(f"lstub --> {client_label}", interim_wire)
-            client_writer.write(interim_wire)
-            await client_writer.drain()
-
+        status = parsed_response.status_code or 0
+        if status == 100:
             final_parsed, full_wire = await parser.continue_parse_body(
                 client_reader, remaining_buffer
             )
@@ -438,20 +441,20 @@ class RawForwarder:
             )
 
         response: ForwardResult | None
-        if self._response_transformer is not None:
+        if self._response_transformer is not None and status >= 200:
             response = await self._apply_transformation_and_relay(
-                parsed=interim,
-                wire_bytes=interim_wire,
+                parsed=parsed_response,
+                wire_bytes=response_wire,
                 client_writer=client_writer,
                 client_label=client_label,
             )
         else:
             if self._wire_log is not None:
-                self._wire_log(f"{upstream_label} --> lstub", interim_wire)
-                self._wire_log(f"lstub --> {client_label}", interim_wire)
-            client_writer.write(interim_wire)
+                self._wire_log(f"{upstream_label} --> lstub", response_wire)
+                self._wire_log(f"lstub --> {client_label}", response_wire)
+            client_writer.write(response_wire)
             await client_writer.drain()
-            response = self._build_result(interim, interim_wire)
+            response = self._build_result(parsed_response, response_wire)
 
         request_wire_bytes = header_wire_bytes + bytes(remaining_buffer)
         return ForwardedRequest(
@@ -459,6 +462,37 @@ class RawForwarder:
             request_wire_bytes=request_wire_bytes,
             response=response,
         )
+
+    async def _relay_until_continue_or_final(
+        self,
+        *,
+        parser: AsyncMultiResponseParser,
+        upstream_reader: asyncio.StreamReader,
+        client_writer: ClientWriter,
+        request_method: str | None,
+        upstream_label: str,
+        client_label: str,
+    ) -> tuple[ParsedResponse | None, bytes]:
+        while True:
+            parsed, wire_bytes = await parser.next_response(
+                upstream_reader,
+                request_method,
+            )
+            if parsed is None:
+                return None, wire_bytes
+
+            status = parsed.status_code or 0
+            if status == 101 or status >= 200:
+                return parsed, wire_bytes
+
+            if self._wire_log is not None:
+                self._wire_log(f"{upstream_label} --> lstub", wire_bytes)
+                self._wire_log(f"lstub --> {client_label}", wire_bytes)
+            client_writer.write(wire_bytes)
+            await client_writer.drain()
+
+            if status == 100:
+                return parsed, wire_bytes
 
     async def _apply_transformation_and_relay(
         self,

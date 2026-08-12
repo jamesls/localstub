@@ -263,6 +263,8 @@ class AsyncMultiResponseParser:
         header_wire = bytes(self._buffer[:header_end])
         try:
             parser.feed_data(header_wire)
+        except httptools.HttpParserUpgrade:
+            pass
         except httptools.HttpParserError:
             error_offset = self._precise_error_offset(header_wire)
             wire = bytes(self._buffer[:error_offset])

@@ -491,6 +491,71 @@ class TestRawForwarding:
     """Tests for raw socket forwarding that preserves Transfer-Encoding."""
 
     @pytest.mark.asyncio
+    async def test_relays_switching_protocols_response(self) -> None:
+        async def switching_protocols_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Upgrade: websocket\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+            await reader.read()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream = await asyncio.start_server(
+            switching_protocols_handler,
+            "127.0.0.1",
+            0,
+        )
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+
+        try:
+            forwarder = RawForwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                reader, writer = await asyncio.open_connection(
+                    proxy.host,
+                    proxy.port,
+                )
+                try:
+                    request = (
+                        f"GET http://{upstream_host}:{upstream_port}/chat "
+                        "HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Connection: Upgrade\r\n"
+                        "Upgrade: websocket\r\n"
+                        "\r\n"
+                    ).encode()
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await asyncio.wait_for(
+                        reader.readuntil(b"\r\n\r\n"),
+                        timeout=0.5,
+                    )
+
+                    assert response == (
+                        b"HTTP/1.1 101 Switching Protocols\r\n"
+                        b"Connection: Upgrade\r\n"
+                        b"Upgrade: websocket\r\n"
+                        b"\r\n"
+                    )
+                    recorded = await proxy.next_response(timeout=0.5)
+                    assert recorded.status == 101
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+    @pytest.mark.asyncio
     async def test_preserves_chunked_request_framing(self) -> None:
         captured_headers = b""
         captured_body = b""

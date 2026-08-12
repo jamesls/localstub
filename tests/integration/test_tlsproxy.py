@@ -1129,6 +1129,117 @@ async def test_forward_handles_100_continue_before_final_response():
         await server.wait_closed()
 
 
+async def _early_hints_then_continue_handler(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    try:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 103 Early Hints\r\n"
+            b"Link: </style.css>; rel=preload\r\n"
+            b"\r\n"
+            b"HTTP/1.1 100 Continue\r\n"
+            b"\r\n"
+        )
+        await writer.drain()
+        body = await reader.readexactly(4)
+        assert body == b"data"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+            b"ok"
+        )
+        await writer.drain()
+    except asyncio.IncompleteReadError:
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_relays_early_hints_before_100_continue() -> None:
+    server = await asyncio.start_server(
+        _early_hints_then_continue_handler,
+        "127.0.0.1",
+        0,
+    )
+    assert server.sockets is not None
+    server_host, server_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await asyncio.open_connection(*proxy.address)
+            try:
+                writer.write(
+                    f"CONNECT {server_host}:{server_port} HTTP/1.1\r\n"
+                    f"Host: {server_host}:{server_port}\r\n"
+                    "\r\n".encode()
+                )
+                await writer.drain()
+                connect_response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"),
+                    timeout=0.5,
+                )
+                assert connect_response.startswith(b"HTTP/1.1 200")
+
+                verify_context = ssl.create_default_context(
+                    cafile=str(proxy.ca.ca_pem_path())
+                )
+                await writer.start_tls(
+                    verify_context,
+                    server_hostname=server_host,
+                )
+
+                writer.write(
+                    b"PUT /upload HTTP/1.1\r\n"
+                    + f"Host: {server_host}:{server_port}\r\n".encode()
+                    + b"Content-Length: 4\r\n"
+                    + b"Expect: 100-continue\r\n"
+                    + b"Connection: close\r\n"
+                    + b"\r\n"
+                )
+                await writer.drain()
+
+                early_hints = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"),
+                    timeout=0.5,
+                )
+                assert early_hints.startswith(b"HTTP/1.1 103")
+                continue_response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"),
+                    timeout=0.5,
+                )
+                assert continue_response == b"HTTP/1.1 100 Continue\r\n\r\n"
+
+                writer.write(b"data")
+                await writer.drain()
+                final_headers = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"),
+                    timeout=0.5,
+                )
+                final_body = await asyncio.wait_for(
+                    reader.readexactly(2),
+                    timeout=0.5,
+                )
+                assert final_headers.startswith(b"HTTP/1.1 200")
+                assert final_body == b"ok"
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
 async def _proper_expect_continue_handler(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
