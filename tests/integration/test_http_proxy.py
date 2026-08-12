@@ -614,6 +614,68 @@ class TestRawForwarding:
         assert captured_body.startswith(b"5\r\n")
 
     @pytest.mark.asyncio
+    async def test_rejects_connection_nominated_content_length(self) -> None:
+        smuggled_request_received = asyncio.Event()
+
+        async def upstream_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                second_request = await reader.readuntil(b"\r\n\r\n")
+                if second_request.startswith(b"GET /admin HTTP/1.1\r\n"):
+                    smuggled_request_received.set()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        upstream = await asyncio.start_server(
+            upstream_handler,
+            "127.0.0.1",
+            0,
+        )
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+        hidden_request = (
+            b"GET /admin HTTP/1.1\r\n"
+            + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+            + b"\r\n"
+        )
+
+        try:
+            forwarder = RawForwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                reader, writer = await asyncio.open_connection(
+                    proxy.host,
+                    proxy.port,
+                )
+                try:
+                    request = (
+                        f"POST http://{upstream_host}:{upstream_port}/submit "
+                        "HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Connection: Content-Length\r\n"
+                        f"Content-Length: {len(hidden_request)}\r\n"
+                        "\r\n"
+                    ).encode() + hidden_request
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await _read_http_response_bytes(reader)
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert response.startswith(b"HTTP/1.1 400 Bad Request")
+        assert not smuggled_request_received.is_set()
+
+    @pytest.mark.asyncio
     async def test_rejects_body_rewrites(self) -> None:
         request_received = asyncio.Event()
 
