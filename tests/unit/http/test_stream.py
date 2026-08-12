@@ -1,44 +1,54 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 
 import pytest
 
 from localstub.http.stream import read, take_unread_data, unread_data
 
 
-def test_take_unread_data_without_unread_returns_empty() -> None:
-    reader = asyncio.StreamReader()
+@pytest.fixture
+def reader() -> Iterator[asyncio.StreamReader]:
+    with asyncio.Runner():
+        yield asyncio.StreamReader()
 
+
+def test_take_unread_data_without_unread_returns_empty(
+    reader: asyncio.StreamReader,
+) -> None:
     assert take_unread_data(reader) == b""
 
 
-def test_unread_data_with_empty_data_holds_nothing() -> None:
-    reader = asyncio.StreamReader()
-
+def test_unread_data_with_empty_data_holds_nothing(
+    reader: asyncio.StreamReader,
+) -> None:
     unread_data(reader, b"")
 
     assert take_unread_data(reader) == b""
 
 
-def test_take_unread_data_returns_all_bytes_by_default() -> None:
-    reader = asyncio.StreamReader()
+def test_take_unread_data_returns_all_bytes_by_default(
+    reader: asyncio.StreamReader,
+) -> None:
     unread_data(reader, b"hello")
 
     assert take_unread_data(reader) == b"hello"
     assert take_unread_data(reader) == b""
 
 
-def test_take_unread_data_with_limit_keeps_remainder() -> None:
-    reader = asyncio.StreamReader()
+def test_take_unread_data_with_limit_keeps_remainder(
+    reader: asyncio.StreamReader,
+) -> None:
     unread_data(reader, b"hello world")
 
     assert take_unread_data(reader, 5) == b"hello"
     assert take_unread_data(reader) == b" world"
 
 
-def test_unread_data_prepends_ahead_of_earlier_unread() -> None:
-    reader = asyncio.StreamReader()
+def test_unread_data_prepends_ahead_of_earlier_unread(
+    reader: asyncio.StreamReader,
+) -> None:
     unread_data(reader, b"second")
     unread_data(reader, b"first")
 
@@ -54,6 +64,16 @@ async def test_read_returns_unread_bytes_before_stream_data() -> None:
 
     assert await read(reader, 1024) == b"held"
     assert await read(reader, 1024) == b"stream data"
+
+
+@pytest.mark.asyncio
+async def test_read_with_negative_size_returns_all_data_in_order() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"stream data")
+    reader.feed_eof()
+    unread_data(reader, b"held ")
+
+    assert await read(reader, -1) == b"held stream data"
 
 
 @pytest.mark.asyncio

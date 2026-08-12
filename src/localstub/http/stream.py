@@ -67,8 +67,12 @@ async def read(reader: asyncio.StreamReader, max_bytes: int) -> bytes:
 
     Drop-in replacement for ``reader.read(max_bytes)`` that yields
     bytes returned via :func:`unread_data` before reading from the
-    stream itself.
+    stream itself.  Negative ``max_bytes`` values read until EOF.
     """
+    if max_bytes < 0:
+        unread = take_unread_data(reader)
+        return unread + await reader.read(max_bytes)
+
     data = take_unread_data(reader, max_bytes)
     if data:
         return data
