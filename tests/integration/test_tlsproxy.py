@@ -10,6 +10,7 @@ import httpx
 import pytest
 import trustme
 
+from localstub.middleware import ResponderContext
 from localstub.server import (
     AsyncHTTPTestServer,
     ByteFlip,
@@ -311,6 +312,43 @@ async def test_aclose_cancels_forward_connection_after_tls_upgrade() -> None:
         await proxy.aclose()
         upstream.close()
         await upstream.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_aclose_called_from_request_handler_completes() -> None:
+    aclose_finished = asyncio.Event()
+
+    async with AsyncHTTPTestServer() as server:
+        proxy = AsyncTLSInterceptProxy(server=server)
+        await proxy.start()
+
+        async def shutdown_handler(_: ResponderContext) -> HTTPResponse:
+            await proxy.aclose()
+            aclose_finished.set()
+            return HTTPResponse.text("closing")
+
+        server.handler = shutdown_handler
+        proxy_host, proxy_port = proxy.address
+        verify_ctx = ssl.create_default_context(
+            cafile=str(proxy.ca.ca_pem_path())
+        )
+
+        try:
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                # Shutdown tears down the connection before the response
+                # is written, so the client sees a transport failure.
+                with pytest.raises(httpx.TransportError):
+                    await asyncio.wait_for(
+                        client.get("https://example.com/"),
+                        timeout=5.0,
+                    )
+            await asyncio.wait_for(aclose_finished.wait(), timeout=2.0)
+        finally:
+            await proxy.aclose()
 
 
 @pytest.mark.asyncio

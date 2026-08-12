@@ -262,7 +262,13 @@ class AsyncTLSInterceptProxy:
         if listener is None:
             return
         self._closing = True
-        shutdown_task = asyncio.create_task(self._finish_close(listener))
+        # aclose() may be called from inside a client task (e.g. a request
+        # handler shutting down the proxy); waiting on that task would
+        # deadlock, so it is excluded from the drain.
+        caller = asyncio.current_task()
+        shutdown_task = asyncio.create_task(
+            self._finish_close(listener, exclude=caller)
+        )
         try:
             await asyncio.shield(shutdown_task)
         except asyncio.CancelledError:
@@ -274,12 +280,18 @@ class AsyncTLSInterceptProxy:
                 self._listener = None
             self._closing = False
 
-    async def _finish_close(self, listener: asyncio.Server) -> None:
+    async def _finish_close(
+        self,
+        listener: asyncio.Server,
+        exclude: asyncio.Task[object] | None,
+    ) -> None:
         _pause_listener_accepts(listener)
         await _drain_pending_accepts()
         listener.close()
 
-        client_tasks = tuple(self._client_tasks)
+        client_tasks = tuple(
+            task for task in self._client_tasks if task is not exclude
+        )
         pending: set[asyncio.Task[None]] = set()
         if client_tasks:
             _, pending = await asyncio.wait(client_tasks, timeout=1.0)
