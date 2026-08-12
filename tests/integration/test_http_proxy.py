@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import socket
+import struct
 
 import httpx
 import pytest
@@ -912,6 +913,64 @@ class TestRawForwarding:
             await upstream.wait_closed()
 
         assert body in response
+
+    @pytest.mark.asyncio
+    async def test_returns_bad_gateway_after_reset_during_eof_body(
+        self,
+    ) -> None:
+        async def reset_during_body_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npartial"
+            )
+            await writer.drain()
+            upstream_socket = writer.get_extra_info("socket")
+            assert upstream_socket is not None
+            upstream_socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_LINGER,
+                struct.pack("ii", 1, 0),
+            )
+            writer.close()
+
+        upstream = await asyncio.start_server(
+            reset_during_body_handler,
+            "127.0.0.1",
+            0,
+        )
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+
+        try:
+            forwarder = RawForwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                reader, writer = await asyncio.open_connection(
+                    proxy.host,
+                    proxy.port,
+                )
+                try:
+                    request = (
+                        f"GET http://{upstream_host}:{upstream_port}/reset "
+                        "HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                    ).encode()
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await _read_http_response_bytes(reader)
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert response.startswith(b"HTTP/1.1 502 Bad Gateway")
 
     @pytest.mark.asyncio
     async def test_recorded_response_has_wire_bytes(self) -> None:

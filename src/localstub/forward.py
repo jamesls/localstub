@@ -240,7 +240,13 @@ class RawForwarder:
             )
         finally:
             upstream_writer.close()
-            await upstream_writer.wait_closed()
+            try:
+                await upstream_writer.wait_closed()
+            except OSError:
+                LOG.debug(
+                    "Failed to close upstream writer",
+                    exc_info=True,
+                )
 
     async def connect_upstream(
         self,
