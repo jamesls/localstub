@@ -252,14 +252,15 @@ async def test_async_request_parser_parse_with_connection_wire_pipeline() -> (
     reader = asyncio.StreamReader()
     reader.feed_data(first_request + second_request)
     connection_wire = bytearray()
+    unread_bytes = bytearray()
 
-    first_parser = AsyncRequestParser()
+    first_parser = AsyncRequestParser(unread_bytes=unread_bytes)
     first_parsed, first_wire = await first_parser.parse(
         reader,
         connection_wire,
     )
 
-    second_parser = AsyncRequestParser()
+    second_parser = AsyncRequestParser(unread_bytes=unread_bytes)
     second_parsed, second_wire = await second_parser.parse(
         reader,
         connection_wire,
@@ -301,13 +302,14 @@ async def test_async_request_parser_parse_malformed_single_byte_request() -> (
     None
 ):
     reader = _create_mock_reader([b"\x00"])
+    unread_bytes = bytearray()
 
-    parser = AsyncRequestParser()
+    parser = AsyncRequestParser(unread_bytes=unread_bytes)
     parsed, wire_bytes = await parser.parse(reader)
 
     assert parsed is None
     assert wire_bytes == b"\x00"
-    reader.feed_data.assert_not_called()
+    assert unread_bytes == bytearray()
 
 
 @pytest.mark.asyncio
@@ -329,8 +331,9 @@ async def test_async_request_parser_preserves_first_pipelined_request() -> (
     second_request = b"GET /second HTTP/1.1\r\nHost: second.com\r\n\r\n"
     reader = asyncio.StreamReader()
     reader.feed_data(first_request + second_request)
+    unread_bytes = bytearray()
 
-    parser1 = AsyncRequestParser()
+    parser1 = AsyncRequestParser(unread_bytes=unread_bytes)
     parsed1, wire_bytes1 = await parser1.parse(reader)
 
     assert parsed1 is not None
@@ -343,7 +346,7 @@ async def test_async_request_parser_preserves_first_pipelined_request() -> (
 
     reader.feed_eof()
 
-    parser2 = AsyncRequestParser()
+    parser2 = AsyncRequestParser(unread_bytes=unread_bytes)
     parsed2, wire_bytes2 = await parser2.parse(reader)
 
     assert parsed2 is not None
@@ -370,19 +373,18 @@ async def test_async_request_parser_parse_with_read_exception() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_request_parser_pushes_back_remaining_buffer() -> None:
+async def test_async_request_parser_preserves_remaining_buffer() -> None:
     reader = asyncio.StreamReader()
     malformed_with_extra = b"INVALID HTTP\x00\x01\x02extra data here"
     reader.feed_data(malformed_with_extra)
+    unread_bytes = bytearray()
 
-    parser = AsyncRequestParser()
+    parser = AsyncRequestParser(unread_bytes=unread_bytes)
     parsed, wire_bytes = await parser.parse(reader)
 
     assert parsed is None
     assert len(wire_bytes) > 0
-
-    remaining = await reader.read(100)
-    assert len(remaining) > 0
+    assert unread_bytes
 
 
 @pytest.mark.asyncio
@@ -574,14 +576,15 @@ async def test_async_request_parser_parse_headers_with_read_exception() -> (
 @pytest.mark.asyncio
 async def test_async_request_parser_parse_headers_malformed_byte() -> None:
     reader = _create_mock_reader([b"\x00"])
+    unread_bytes = bytearray()
 
-    parser = AsyncRequestParser()
+    parser = AsyncRequestParser(unread_bytes=unread_bytes)
     parsed, wire_bytes, remaining = await parser.parse_headers(reader)
 
     assert parsed is None
     assert wire_bytes == b"\x00"
     assert remaining == bytearray()
-    reader.feed_data.assert_not_called()
+    assert unread_bytes == bytearray()
 
 
 @pytest.mark.asyncio
@@ -610,9 +613,7 @@ async def test_async_request_parser_continue_body_eof_before_complete() -> (
 
 
 @pytest.mark.asyncio
-async def test_async_request_parser_continue_body_pushes_back_pipeline() -> (
-    None
-):
+async def test_async_request_parser_continue_body_preserves_pipeline() -> None:
     header_bytes = (
         b"POST /upload HTTP/1.1\r\n"
         b"Host: localhost\r\n"
@@ -624,8 +625,9 @@ async def test_async_request_parser_continue_body_pushes_back_pipeline() -> (
     reader.read = AsyncMock(
         side_effect=[header_bytes, b"hello" + next_request, b""]
     )
+    unread_bytes = bytearray()
 
-    parser = AsyncRequestParser()
+    parser = AsyncRequestParser(unread_bytes=unread_bytes)
     parsed, _, remaining = await parser.parse_headers(reader)
 
     assert parsed is not None
@@ -637,7 +639,7 @@ async def test_async_request_parser_continue_body_pushes_back_pipeline() -> (
     assert parsed.is_complete
     assert parsed.body == b"hello"
     assert wire_bytes == header_bytes + b"hello"
-    reader.feed_data.assert_called_once_with(next_request)
+    assert unread_bytes == next_request
 
 
 @pytest.mark.asyncio
@@ -667,7 +669,7 @@ async def test_async_request_parser_continue_body_with_read_exception() -> (
 
 
 @pytest.mark.asyncio
-async def test_async_request_parser_continue_body_bad_chunk_pushback() -> None:
+async def test_async_request_parser_bad_chunk_preserves_remaining() -> None:
     header_bytes = (
         b"POST /upload HTTP/1.1\r\n"
         b"Host: localhost\r\n"
@@ -679,8 +681,9 @@ async def test_async_request_parser_continue_body_bad_chunk_pushback() -> None:
     reader.read = AsyncMock(
         side_effect=[header_bytes, b"Z\r\nbroken\r\n" + next_request, b""]
     )
+    unread_bytes = bytearray()
 
-    parser = AsyncRequestParser()
+    parser = AsyncRequestParser(unread_bytes=unread_bytes)
     parsed, _, remaining = await parser.parse_headers(reader)
 
     assert parsed is not None
@@ -689,14 +692,12 @@ async def test_async_request_parser_continue_body_bad_chunk_pushback() -> None:
 
     assert parsed is None
     assert wire_bytes == header_bytes + b"Z"
-    reader.feed_data.assert_called_once()
-    pushed_back = reader.feed_data.call_args.args[0]
-    assert pushed_back.startswith(b"\r\nbroken\r\n")
-    assert next_request in pushed_back
+    assert unread_bytes.startswith(b"\r\nbroken\r\n")
+    assert next_request in unread_bytes
 
 
 @pytest.mark.asyncio
-async def test_async_request_parser_continue_body_bad_chunk_no_pushback() -> (
+async def test_async_request_parser_bad_chunk_without_remaining_bytes() -> (
     None
 ):
     header_bytes = (
@@ -706,8 +707,9 @@ async def test_async_request_parser_continue_body_bad_chunk_no_pushback() -> (
         b"\r\n"
     )
     reader = _create_mock_reader([header_bytes, b"Z"])
+    unread_bytes = bytearray()
 
-    parser = AsyncRequestParser()
+    parser = AsyncRequestParser(unread_bytes=unread_bytes)
     parsed, _, remaining = await parser.parse_headers(reader)
 
     assert parsed is not None
@@ -716,7 +718,7 @@ async def test_async_request_parser_continue_body_bad_chunk_no_pushback() -> (
 
     assert parsed is None
     assert wire_bytes == header_bytes + b"Z"
-    reader.feed_data.assert_not_called()
+    assert unread_bytes == bytearray()
 
 
 @pytest.mark.asyncio
@@ -756,6 +758,35 @@ async def test_http_request_reader_read_request_with_body() -> None:
     assert request.method == "POST"
     assert request.body == b"Hello, World!"
     assert request.text == "Hello, World!"
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_preserves_pipeline_with_new_helpers() -> (
+    None
+):
+    max_read = 8192
+    second_request = b"GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    third_request = b"GET /third HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    first_template = (
+        b"GET /first HTTP/1.1\r\nHost: localhost\r\nX-Padding: \r\n\r\n"
+    )
+    padding = b"x" * (max_read - len(first_template) - len(second_request))
+    first_request = first_template.replace(
+        b"X-Padding: ",
+        b"X-Padding: " + padding,
+    )
+    reader = asyncio.StreamReader()
+    reader.feed_data(first_request + second_request + third_request)
+    reader.feed_eof()
+
+    targets: list[str] = []
+    for _ in range(3):
+        request_reader = HTTPRequestReader(max_read=max_read)
+        request = await request_reader.read_request(reader)
+        assert request is not None
+        targets.append(request.target)
+
+    assert targets == ["/first", "/second", "/third"]
 
 
 @pytest.mark.asyncio

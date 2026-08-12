@@ -1233,6 +1233,7 @@ class AsyncHTTPTestServer:
         client = self._extract_client_info(writer)
         conn_recv, conn_sent = self._init_connection_tracking(client)
         recording_writer = RecordingStreamWriter(writer, conn_sent)
+        unread_bytes = bytearray()
         try:
             while True:
                 request_result = await self._read_request(
@@ -1240,6 +1241,7 @@ class AsyncHTTPTestServer:
                     recording_writer,
                     client=client,
                     connection_wire=conn_recv,
+                    unread_bytes=unread_bytes,
                 )
                 if request_result is None:
                     break
@@ -1301,9 +1303,10 @@ class AsyncHTTPTestServer:
         *,
         client: tuple[str, int] | None,
         connection_wire: bytearray | None = None,
+        unread_bytes: bytearray | None = None,
     ) -> tuple[RecordedHTTPRequest, dict[str, Any]] | None:
         state: dict[str, Any] = {}
-        parser = AsyncRequestParser()
+        parser = AsyncRequestParser(unread_bytes=unread_bytes)
 
         if not self.header_middlewares and self._on_headers_received is None:
             parsed, wire_bytes = await parser.parse(reader, connection_wire)
