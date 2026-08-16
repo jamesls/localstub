@@ -557,6 +557,68 @@ class TestRawForwarding:
             await upstream.wait_closed()
 
     @pytest.mark.asyncio
+    async def test_forwards_upgrade_request_body_to_upstream(self) -> None:
+        captured_body = b""
+        request_received = asyncio.Event()
+
+        async def upstream_handler(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            nonlocal captured_body
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                captured_body = await reader.readexactly(5)
+                request_received.set()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+            except asyncio.IncompleteReadError:
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        upstream = await asyncio.start_server(upstream_handler, "127.0.0.1", 0)
+        assert upstream.sockets is not None
+        upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+
+        try:
+            forwarder = RawForwarder(verify_upstream=False)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                reader, writer = await asyncio.open_connection(
+                    proxy.host, proxy.port
+                )
+                try:
+                    request = (
+                        f"POST http://{upstream_host}:{upstream_port}"
+                        "/chat HTTP/1.1\r\n"
+                        f"Host: {upstream_host}:{upstream_port}\r\n"
+                        "Connection: Upgrade\r\n"
+                        "Upgrade: custom\r\n"
+                        "Content-Length: 5\r\n"
+                        "\r\n"
+                    ).encode() + b"hello"
+                    writer.write(request)
+                    await writer.drain()
+
+                    response = await asyncio.wait_for(
+                        _read_http_response_bytes(reader),
+                        timeout=1.0,
+                    )
+                    assert response.startswith(b"HTTP/1.1 200 OK")
+                    await asyncio.wait_for(
+                        request_received.wait(), timeout=1.0
+                    )
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+        finally:
+            upstream.close()
+            await upstream.wait_closed()
+
+        assert captured_body == b"hello"
+
+    @pytest.mark.asyncio
     async def test_preserves_chunked_request_framing(self) -> None:
         captured_headers = b""
         captured_body = b""

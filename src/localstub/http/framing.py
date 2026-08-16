@@ -87,6 +87,39 @@ def _scan_chunk_size_line(
         raise ChunkScanError(size_end + 1)
 
 
+def chunk_payloads(buffer: bytearray) -> list[bytes]:
+    """Extract the chunk data from chunked transfer framing.
+
+    Returns the payload of each complete chunk before the terminal
+    zero-size chunk, skipping chunk extensions and trailers.  Stops
+    at the terminal chunk or the first incomplete chunk, so bytes
+    that follow the chunked body are never touched.
+
+    Raises ChunkScanError where scan_chunked_body would: on a
+    malformed chunk-size line or a bad chunk-data terminator.
+    """
+    payloads: list[bytes] = []
+    index = 0
+
+    while True:
+        chunk_size_line = _scan_chunk_size_line(buffer, index)
+        if chunk_size_line is None:
+            return payloads
+
+        chunk_size, chunk_data_start = chunk_size_line
+        if chunk_size == 0:
+            return payloads
+
+        chunk_data_end = chunk_data_start + chunk_size
+        if chunk_data_end + 2 > len(buffer):
+            return payloads
+        if buffer[chunk_data_end : chunk_data_end + 2] != CRLF:
+            raise ChunkScanError(chunk_data_end + 1)
+
+        payloads.append(bytes(buffer[chunk_data_start:chunk_data_end]))
+        index = chunk_data_end + 2
+
+
 def scan_chunked_body(
     buffer: bytearray,
     start: int = 0,

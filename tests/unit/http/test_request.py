@@ -227,6 +227,198 @@ async def test_async_request_parser_parse_chunked_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_request_parser_upgrade_content_length_body() -> None:
+    request_data = (
+        b"POST /chat HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: custom\r\n"
+        b"Content-Length: 5\r\n"
+        b"\r\n"
+        b"hello"
+    )
+    reader = _create_mock_reader([request_data])
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is not None
+    assert parsed.body == b"hello"
+    assert parsed.is_complete
+    assert wire_bytes == request_data
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_upgrade_chunked_body() -> None:
+    request_data = (
+        b"POST /chat HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: custom\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5\r\nHello\r\n"
+        b"6\r\n World\r\n"
+        b"0\r\n\r\n"
+    )
+    reader = _create_mock_reader([request_data])
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is not None
+    assert parsed.body == b"Hello World"
+    assert parsed.is_complete
+    assert wire_bytes == request_data
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_upgrade_body_preserves_pipeline() -> None:
+    smuggled = b"GET /admin HTTP/1.1\r\n\r\n"
+    first_request = (
+        b"POST /chat HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: custom\r\n"
+        b"Content-Length: 23\r\n"
+        b"\r\n" + smuggled
+    )
+    second_request = b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    reader = asyncio.StreamReader()
+    reader.feed_data(first_request + second_request)
+    reader.feed_eof()
+
+    first, first_wire = await AsyncRequestParser().parse(reader)
+    second, second_wire = await AsyncRequestParser().parse(reader)
+
+    assert first is not None
+    assert first.body == smuggled
+    assert first_wire == first_request
+    assert second is not None
+    assert second.url == b"/next"
+    assert second_wire == second_request
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_upgrade_without_body_completes() -> None:
+    request_data = (
+        b"GET /chat HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: websocket\r\n"
+        b"\r\n"
+    )
+    protocol_bytes = b"upgraded-protocol-data"
+    reader = asyncio.StreamReader()
+    reader.feed_data(request_data + protocol_bytes)
+    reader.feed_eof()
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is not None
+    assert parsed.is_complete
+    assert not parsed.body_parts
+    assert wire_bytes == request_data
+    assert take_unread_data(reader) == protocol_bytes
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_upgrade_chunked_incremental() -> None:
+    header_data = (
+        b"POST /chat HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: custom\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    )
+    reader = _create_mock_reader([
+        header_data,
+        b"5\r\nHel",
+        b"lo\r\n",
+        b"0\r\n\r\n",
+    ])
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is not None
+    assert parsed.body == b"Hello"
+    assert parsed.is_complete
+    assert wire_bytes == header_data + b"5\r\nHello\r\n0\r\n\r\n"
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_upgrade_chunked_trailers() -> None:
+    request_data = (
+        b"POST /chat HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: custom\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5\r\nhello\r\n"
+        b"0\r\n"
+        b"X-Checksum: abc\r\n"
+        b"\r\n"
+    )
+    reader = _create_mock_reader([request_data])
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is not None
+    assert parsed.body == b"hello"
+    assert parsed.is_complete
+    assert wire_bytes == request_data
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_upgrade_zero_content_length() -> None:
+    request_data = (
+        b"POST /chat HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: custom\r\n"
+        b"Content-Length: 0\r\n"
+        b"\r\n"
+    )
+    reader = _create_mock_reader([request_data])
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is not None
+    assert parsed.is_complete
+    assert not parsed.body_parts
+    assert wire_bytes == request_data
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_connect_ignores_content_length() -> None:
+    request_data = (
+        b"CONNECT example.com:443 HTTP/1.1\r\n"
+        b"Host: example.com:443\r\n"
+        b"Content-Length: 5\r\n"
+        b"\r\n"
+    )
+    tunnel_bytes = b"\x16\x03\x01ab"
+    reader = asyncio.StreamReader()
+    reader.feed_data(request_data + tunnel_bytes)
+    reader.feed_eof()
+
+    parser = AsyncRequestParser()
+    parsed, wire_bytes = await parser.parse(reader)
+
+    assert parsed is not None
+    assert parsed.method == "CONNECT"
+    assert not parsed.body_parts
+    assert wire_bytes == request_data
+    assert take_unread_data(reader) == tunnel_bytes
+
+
+@pytest.mark.asyncio
 async def test_async_request_parser_parse_with_connection_wire() -> None:
     request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
     reader = _create_mock_reader([request_data])
@@ -771,6 +963,30 @@ async def test_http_request_reader_read_request_with_body() -> None:
     assert request.method == "POST"
     assert request.body == b"Hello, World!"
     assert request.text == "Hello, World!"
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_upgrade_request_records_body() -> None:
+    request_data = (
+        b"POST /chat HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: custom\r\n"
+        b"Content-Length: 5\r\n"
+        b"\r\n"
+        b"hello"
+    )
+    reader = asyncio.StreamReader()
+    reader.feed_data(request_data)
+    reader.feed_eof()
+
+    http_reader = HTTPRequestReader()
+    request = await http_reader.read_request(reader)
+
+    assert request is not None
+    assert request.body == b"hello"
+    assert request.wire_raw_bytes == request_data
+    assert request.wire_body_bytes == b"hello"
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from localstub.http import stream
 from localstub.http.framing import (
     HEADER_TERMINATOR,
     ChunkScanError,
+    chunk_payloads,
     content_length,
     is_chunked_transfer,
     scan_chunked_body,
@@ -384,6 +385,7 @@ class AsyncRequestParser:
         self._wire = bytearray()
         self._connection_wire_offset = 0
         self._max_read = max_read
+        self._upgraded = False
 
     async def parse(
         self,
@@ -471,7 +473,7 @@ class AsyncRequestParser:
             try:
                 self._parser.feed_data(segment)
             except httptools.HttpParserUpgrade:
-                pass
+                self._note_upgrade()
             except httptools.HttpParserError:
                 error_offset = self._precise_error_offset(
                     bytes(buffer[:feed_end])
@@ -628,6 +630,36 @@ class AsyncRequestParser:
         stream.unread_data(reader, buffer[body_offset:])
         return None, bytes(self._wire)
 
+    def _note_upgrade(self) -> None:
+        """Arrange for an Upgrade request's declared body to be read.
+
+        httptools stops at the header boundary of an Upgrade request
+        and marks the message complete without parsing any declared
+        body (RFC 9110 allows Upgrade requests to carry one).  Clear
+        the premature completion flag so the body framing logic runs;
+        the body is then consumed without the parser, which accepts
+        no further data after the upgrade.  CONNECT requests have no
+        content, so their tunnel bytes are never mistaken for a body.
+        """
+        self._upgraded = True
+        result = self._protocol.result
+        if result.method == "CONNECT":
+            return
+        if is_chunked_transfer(result.headers) or (
+            content_length(result.headers) is not None
+        ):
+            result.is_complete = False
+
+    def _complete_upgrade_body(self, parts: list[bytes]) -> None:
+        """Record an Upgrade request's body via the protocol callbacks.
+
+        The httptools parser refuses data after an upgrade, so the
+        callbacks it would have made for the body are made directly.
+        """
+        for part in parts:
+            self._protocol.on_body(part)
+        self._protocol.on_message_complete()
+
     async def _parse_content_length_body(
         self,
         reader: asyncio.StreamReader,
@@ -643,15 +675,18 @@ class AsyncRequestParser:
                 return None, bytes(self._wire)
 
         body = bytes(buffer[:content_length])
-        try:
-            self._parser.feed_data(body)
-        except httptools.HttpParserError:
-            return self._body_parse_error(
-                reader,
-                buffer,
-                content_length,
-                connection_wire,
-            )
+        if self._upgraded:
+            self._complete_upgrade_body([body] if body else [])
+        else:
+            try:
+                self._parser.feed_data(body)
+            except httptools.HttpParserError:
+                return self._body_parse_error(
+                    reader,
+                    buffer,
+                    content_length,
+                    connection_wire,
+                )
 
         self._wire.extend(body)
         stream.unread_data(reader, buffer[content_length:])
@@ -681,15 +716,18 @@ class AsyncRequestParser:
             if scan.end is not None:
                 chunked_end = scan.end
                 chunked_body = bytes(buffer[:chunked_end])
-                try:
-                    self._parser.feed_data(chunked_body)
-                except httptools.HttpParserError:
-                    return self._body_parse_error(
-                        reader,
-                        buffer,
-                        chunked_end,
-                        connection_wire,
-                    )
+                if self._upgraded:
+                    self._complete_upgrade_body(chunk_payloads(buffer))
+                else:
+                    try:
+                        self._parser.feed_data(chunked_body)
+                    except httptools.HttpParserError:
+                        return self._body_parse_error(
+                            reader,
+                            buffer,
+                            chunked_end,
+                            connection_wire,
+                        )
 
                 self._wire.extend(chunked_body)
                 stream.unread_data(reader, buffer[chunked_end:])
