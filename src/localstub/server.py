@@ -250,17 +250,25 @@ class ThrottledTransmission(TransmissionStrategy):
     bandwidth-limited scenarios (e.g., S3 GetObject with slow transfer).
     """
 
-    def __init__(self, chunk_size: int, delay: float) -> None:
+    def __init__(
+        self,
+        chunk_size: int,
+        delay: float,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
         """Initialize throttled transmission.
 
         Args:
             chunk_size: Number of bytes to send in each chunk
             delay: Seconds to wait between chunks
+            sleep: Coroutine function used to wait between chunks,
+                defaults to ``asyncio.sleep``
         """
         if chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer")
         self.chunk_size = chunk_size
         self.delay = delay
+        self._sleep = sleep
 
     async def write_body(
         self,
@@ -275,7 +283,7 @@ class ThrottledTransmission(TransmissionStrategy):
 
             offset += self.chunk_size
             if offset < len(body):  # Don't delay after last chunk
-                await asyncio.sleep(self.delay)
+                await self._sleep(self.delay)
 
 
 @dataclass

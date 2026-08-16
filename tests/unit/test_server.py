@@ -1,6 +1,6 @@
 import asyncio
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
@@ -66,15 +66,14 @@ async def test_immediate_transmission_without_tracking() -> None:
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_chunks_body() -> None:
-    strategy = ThrottledTransmission(chunk_size=100, delay=0.01)
+    sleep = create_autospec(asyncio.sleep)
+    strategy = ThrottledTransmission(chunk_size=100, delay=0.01, sleep=sleep)
     body = b"x" * 250
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
     recorder = RecordingStreamWriter(writer)
 
-    start = time.time()
     await strategy.write_body(recorder, body)
-    elapsed = time.time() - start
 
     assert writer.write.call_count == 3
     assert writer.drain.call_count == 3
@@ -85,38 +84,37 @@ async def test_throttled_transmission_chunks_body() -> None:
     assert len(chunks[2]) == 50
 
     assert recorder.bytes_sent == body
-    assert elapsed >= 0.018
+    assert sleep.await_count == 2
+    sleep.assert_awaited_with(0.01)
 
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_single_chunk() -> None:
-    strategy = ThrottledTransmission(chunk_size=1000, delay=0.01)
+    sleep = create_autospec(asyncio.sleep)
+    strategy = ThrottledTransmission(chunk_size=1000, delay=0.01, sleep=sleep)
     body = b"small"
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
     recorder = RecordingStreamWriter(writer)
 
-    start = time.time()
     await strategy.write_body(recorder, body)
-    elapsed = time.time() - start
 
     assert writer.write.call_count == 1
     assert writer.drain.call_count == 1
     assert recorder.bytes_sent == body
-    assert elapsed < 0.005
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_throttled_transmission_exact_multiple() -> None:
-    strategy = ThrottledTransmission(chunk_size=100, delay=0.01)
+    sleep = create_autospec(asyncio.sleep)
+    strategy = ThrottledTransmission(chunk_size=100, delay=0.01, sleep=sleep)
     body = b"x" * 200
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
     recorder = RecordingStreamWriter(writer)
 
-    start = time.time()
     await strategy.write_body(recorder, body)
-    elapsed = time.time() - start
 
     assert writer.write.call_count == 2
     assert writer.drain.call_count == 2
@@ -126,7 +124,8 @@ async def test_throttled_transmission_exact_multiple() -> None:
     assert len(chunks[1]) == 100
     assert recorder.bytes_sent == body
 
-    assert elapsed >= 0.008
+    assert sleep.await_count == 1
+    sleep.assert_awaited_with(0.01)
 
 
 def test_throttled_transmission_rejects_zero_chunk_size() -> None:
