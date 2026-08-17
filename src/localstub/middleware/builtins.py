@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal, Protocol, runtime_checkable
 
 from localstub.forward import RawForwarder
 from localstub.http.client import HTTPClient
@@ -16,6 +17,7 @@ from localstub.http.utils import maybe_await
 from localstub.middleware.core import (
     ForwardProxyResponse,
     ResponderContext,
+    ResponderMiddleware,
     ResponderNext,
     ResponseSpec,
 )
@@ -173,3 +175,48 @@ class HandlerMiddleware:
         if handler is None:
             return await call_next()
         return await maybe_await(handler(ctx))
+
+
+type SlotName = Literal["throttle", "sequence", "raw_proxy", "proxy"]
+
+_SLOT_ORDER: tuple[SlotName, ...] = (
+    "throttle",
+    "sequence",
+    "raw_proxy",
+    "proxy",
+)
+
+
+@runtime_checkable
+class SupportsReset(Protocol):
+    def reset(self) -> None: ...
+
+
+class BuiltinMiddlewares:
+    """Ordered slots for a server's built-in responder middlewares.
+
+    Slot order is pipeline priority order.
+    """
+
+    def __init__(self) -> None:
+        self._slots: dict[SlotName, ResponderMiddleware | None] = {
+            name: None for name in _SLOT_ORDER
+        }
+
+    def set(self, name: SlotName, middleware: ResponderMiddleware) -> None:
+        self._slots[name] = middleware
+
+    def clear(self, name: SlotName) -> None:
+        self._slots[name] = None
+
+    def active(self) -> list[ResponderMiddleware]:
+        return [m for m in self._slots.values() if m is not None]
+
+    @property
+    def any_active(self) -> bool:
+        return any(m is not None for m in self._slots.values())
+
+    def reset_all(self) -> None:
+        for middleware in self.active():
+            if isinstance(middleware, SupportsReset):
+                middleware.reset()

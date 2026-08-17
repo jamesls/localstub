@@ -50,6 +50,7 @@ from localstub.middleware import (
     compose_sender,
 )
 from localstub.middleware.builtins import (
+    BuiltinMiddlewares,
     ForwardProxyMiddleware,
     HandlerMiddleware,
     RawForwardProxyMiddleware,
@@ -443,22 +444,15 @@ class AsyncHTTPTestServer:
         self._upstream_client = upstream_client
         self._raw_forwarder = raw_forwarder
 
-        self._throttle_middleware: ThrottleMiddleware | None = None
-        self._response_sequence_middleware: (
-            ResponseSequenceMiddleware | None
-        ) = None
-        self._raw_forward_proxy_middleware: (
-            RawForwardProxyMiddleware | None
-        ) = (
-            RawForwardProxyMiddleware(raw_forwarder)
-            if raw_forwarder is not None
-            else None
-        )
-        self._forward_proxy_middleware: ForwardProxyMiddleware | None = (
-            ForwardProxyMiddleware(upstream_client)
-            if upstream_client is not None
-            else None
-        )
+        self._builtins = BuiltinMiddlewares()
+        if raw_forwarder is not None:
+            self._builtins.set(
+                "raw_proxy", RawForwardProxyMiddleware(raw_forwarder)
+            )
+        if upstream_client is not None:
+            self._builtins.set(
+                "proxy", ForwardProxyMiddleware(upstream_client)
+            )
 
         self.responder_middlewares: list[ResponderMiddleware] = []
         self.sender_middlewares: list[SenderMiddleware] = []
@@ -515,8 +509,7 @@ class AsyncHTTPTestServer:
 
     @default_response.setter
     def default_response(self, response: HTTPResponse) -> None:
-        self._default_response = response
-        self._response_sequence_middleware = None
+        self.set_default_response(response)
 
     def add_route(
         self,
@@ -555,10 +548,9 @@ class AsyncHTTPTestServer:
         headers: HeadersLike | None = None,
     ) -> None:
         """Configure a static JSON response returned for every request."""
-        self._default_response = HTTPResponse.json(
-            obj, status=status, headers=headers
+        self.set_default_response(
+            HTTPResponse.json(obj, status=status, headers=headers)
         )
-        self._response_sequence_middleware = None
 
     def set_text_response(
         self,
@@ -567,12 +559,9 @@ class AsyncHTTPTestServer:
         status: int = 200,
         headers: HeadersLike | None = None,
     ) -> None:
-        self._default_response = HTTPResponse.text(
-            text,
-            status=status,
-            headers=headers,
+        self.set_default_response(
+            HTTPResponse.text(text, status=status, headers=headers)
         )
-        self._response_sequence_middleware = None
 
     def set_raw_response(
         self,
@@ -581,12 +570,9 @@ class AsyncHTTPTestServer:
         status: int = 200,
         headers: HeadersLike | None = None,
     ) -> None:
-        self._default_response = HTTPResponse.raw(
-            data,
-            status=status,
-            headers=headers,
+        self.set_default_response(
+            HTTPResponse.raw(data, status=status, headers=headers)
         )
-        self._response_sequence_middleware = None
 
     def set_default_response(self, response: HTTPResponse) -> None:
         """Configure a static response returned for every request.
@@ -598,7 +584,7 @@ class AsyncHTTPTestServer:
             response: HTTPResponse object to return for all requests
         """
         self._default_response = response
-        self._response_sequence_middleware = None
+        self._builtins.clear("sequence")
 
     def set_response_sequence(self, responses: list[HTTPResponse]) -> None:
         """Configure a sequence of responses to return in order.
@@ -619,9 +605,7 @@ class AsyncHTTPTestServer:
         Args:
             responses: List of HTTPResponse objects to return in sequence
         """
-        self._response_sequence_middleware = ResponseSequenceMiddleware(
-            responses
-        )
+        self._builtins.set("sequence", ResponseSequenceMiddleware(responses))
         # Clear default response (last one wins)
         self._default_response = HTTPResponse.json({})
 
@@ -716,10 +700,7 @@ class AsyncHTTPTestServer:
         self._recorder.reset()
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
-        if self._response_sequence_middleware is not None:
-            self._response_sequence_middleware.reset()
-        if self._throttle_middleware is not None:
-            self._throttle_middleware.reset()
+        self._builtins.reset_all()
 
     def set_throttle(
         self,
@@ -751,14 +732,14 @@ class AsyncHTTPTestServer:
             clock=clock,
         )
         response_fn = self._normalize_throttle_response(response)
-        self._throttle_middleware = ThrottleMiddleware(
-            throttler=throttler,
-            response=response_fn,
+        self._builtins.set(
+            "throttle",
+            ThrottleMiddleware(throttler=throttler, response=response_fn),
         )
 
     def clear_throttle(self) -> None:
         """Disable request-rate throttling."""
-        self._throttle_middleware = None
+        self._builtins.clear("throttle")
 
     def _normalize_throttle_response(
         self,
@@ -958,19 +939,12 @@ class AsyncHTTPTestServer:
         *,
         capture_ctx: Callable[[ResponderContext], None] | None = None,
     ) -> Callable[[ResponderContext], Awaitable[ResponseSpec]]:
-        builtins: list[ResponderMiddleware] = []
-        if self._throttle_middleware is not None:
-            builtins.append(self._throttle_middleware)
-        if self._response_sequence_middleware is not None:
-            builtins.append(self._response_sequence_middleware)
-        if self._raw_forward_proxy_middleware is not None:
-            builtins.append(self._raw_forward_proxy_middleware)
-        if self._forward_proxy_middleware is not None:
-            builtins.append(self._forward_proxy_middleware)
-        builtins.append(RouterMiddleware(self.router))
-        builtins.append(HandlerMiddleware(lambda: self._handler))
-
-        middlewares = [*self.responder_middlewares, *builtins]
+        middlewares: list[ResponderMiddleware] = [
+            *self.responder_middlewares,
+            *self._builtins.active(),
+            RouterMiddleware(self.router),
+            HandlerMiddleware(lambda: self._handler),
+        ]
 
         def terminal(_: ResponderContext) -> ResponseSpec:
             return self._default_response
@@ -984,10 +958,7 @@ class AsyncHTTPTestServer:
     def _uses_static_response(self) -> bool:
         return (
             not self.responder_middlewares
-            and self._throttle_middleware is None
-            and self._response_sequence_middleware is None
-            and self._raw_forward_proxy_middleware is None
-            and self._forward_proxy_middleware is None
+            and not self._builtins.any_active
             and not self.router.has_routes
             and self._handler is None
         )

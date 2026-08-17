@@ -237,6 +237,25 @@ async def test_server_throttle_key_isolated_per_path(server, client):
 
 
 @pytest.mark.asyncio
+async def test_server_clear_throttle_disables_throttling(server, client):
+    clock = ManualClock()
+    server.set_throttle(
+        rate_per_second=1.0,
+        key=lambda request: "global",
+        clock=clock,
+    )
+
+    response1 = await client.get(server.url)
+    response2 = await client.get(server.url)
+    server.clear_throttle()
+    response3 = await client.get(server.url)
+
+    assert response1.status_code == 200
+    assert response2.status_code == 429
+    assert response3.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_server_returns_custom_headers(server, client):
     server.set_json_response(
         {"status": "ok"}, headers={"x-custom-header": "custom-value"}

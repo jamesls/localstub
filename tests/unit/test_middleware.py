@@ -26,7 +26,11 @@ from localstub.middleware import (
     compose_responder,
     compose_sender,
 )
-from localstub.middleware.builtins import ForwardProxyMiddleware
+from localstub.middleware.builtins import (
+    BuiltinMiddlewares,
+    ForwardProxyMiddleware,
+    ResponseSequenceMiddleware,
+)
 
 
 @dataclass(frozen=True)
@@ -310,6 +314,41 @@ async def test_forward_proxy_middleware_delegates_non_proxy_request() -> None:
     result = await middleware(ctx, call_next)
     assert result is local
     assert client.requests == []
+
+
+def test_builtin_middlewares_active_returns_slot_priority_order() -> None:
+    builtins = BuiltinMiddlewares()
+    proxy = ForwardProxyMiddleware(StubHTTPClient(HTTPResponse.json({})))
+    sequence = ResponseSequenceMiddleware([HTTPResponse.json({})])
+    builtins.set("proxy", proxy)
+    builtins.set("sequence", sequence)
+
+    assert builtins.active() == [sequence, proxy]
+
+
+def test_builtin_middlewares_clear_empties_slot() -> None:
+    builtins = BuiltinMiddlewares()
+    builtins.set("sequence", ResponseSequenceMiddleware([]))
+    assert builtins.any_active
+
+    builtins.clear("sequence")
+
+    assert not builtins.any_active
+    assert builtins.active() == []
+
+
+def test_builtin_middlewares_reset_all_skips_non_resettable() -> None:
+    builtins = BuiltinMiddlewares()
+    sequence = ResponseSequenceMiddleware([HTTPResponse.json({})], index=1)
+    builtins.set("sequence", sequence)
+    builtins.set(
+        "proxy",
+        ForwardProxyMiddleware(StubHTTPClient(HTTPResponse.json({}))),
+    )
+
+    builtins.reset_all()
+
+    assert sequence.index == 0
 
 
 @pytest.mark.asyncio
