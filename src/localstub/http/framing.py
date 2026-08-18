@@ -26,7 +26,13 @@ def content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
         digits = value.strip()
         if not digits.isdigit():
             return None
-        return int(digits)
+        try:
+            return int(digits)
+        except ValueError:
+            # int() refuses digit strings longer than the
+            # interpreter's conversion limit
+            # (sys.get_int_max_str_digits(), 4300 by default).
+            return None
     return None
 
 

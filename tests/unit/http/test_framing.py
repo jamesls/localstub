@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -30,10 +32,16 @@ def test_content_length_with_arbitrary_value_accepts_only_digits(
     result = content_length([(b"Content-Length", value)])
 
     digits = value.strip()
-    if digits.isdigit():
+    if digits.isdigit() and len(digits) <= sys.get_int_max_str_digits():
         assert result == int(digits)
     else:
         assert result is None
+
+
+def test_content_length_with_over_limit_digits_returns_none() -> None:
+    value = b"1" * (sys.get_int_max_str_digits() + 1)
+
+    assert content_length([(b"Content-Length", value)]) is None
 
 
 def test_scan_chunked_body_resumes_after_complete_chunks() -> None:
