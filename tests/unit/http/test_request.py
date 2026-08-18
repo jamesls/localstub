@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from localstub.http.headers import Headers
 from localstub.http.request import (
@@ -16,6 +19,12 @@ from localstub.http.request import (
     RequestProtocol,
 )
 from localstub.http.stream import take_unread_data
+
+from .strategies import (
+    chunked_bodies,
+    fragments_of,
+    header_items,
+)
 
 
 def test_parsed_request_default_values() -> None:
@@ -1458,3 +1467,111 @@ def _make_recorded(
         wire_raw_bytes=wire_raw_bytes,
         http_version="1.1",
     )
+
+
+_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS")
+_TARGET_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789/-_.?=&"
+_BODY_MODES = ("none", "content-length", "chunked")
+
+
+@st.composite
+def _request_wires(draw: st.DrawFn) -> bytes:
+    method = draw(st.sampled_from(_METHODS))
+    target = "/" + draw(st.text(alphabet=_TARGET_ALPHABET, max_size=16))
+    lines = [f"{method} {target} HTTP/1.1\r\n".encode("ascii")]
+    lines.extend(
+        f"{name}: {value}\r\n".encode("ascii")
+        for name, value in draw(header_items())
+    )
+    mode = draw(st.sampled_from(_BODY_MODES))
+    body = b""
+    if mode == "content-length":
+        body = draw(st.binary(max_size=64))
+        lines.append(f"Content-Length: {len(body)}\r\n".encode("ascii"))
+    elif mode == "chunked":
+        lines.append(b"Transfer-Encoding: chunked\r\n")
+        body = draw(chunked_bodies()).encoded
+    lines.append(b"\r\n")
+    return b"".join(lines) + body
+
+
+@st.composite
+def _fragmented_request_cases(draw: st.DrawFn) -> tuple[bytes, list[bytes]]:
+    encoded = draw(_request_wires())
+    return encoded, draw(fragments_of(encoded))
+
+
+@st.composite
+def _pipelined_request_cases(
+    draw: st.DrawFn,
+) -> tuple[list[bytes], list[bytes]]:
+    requests = draw(st.lists(_request_wires(), min_size=2, max_size=3))
+    return requests, draw(fragments_of(b"".join(requests)))
+
+
+def _fragment_reader(fragments: list[bytes]) -> asyncio.StreamReader:
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.read = AsyncMock(
+        side_effect=itertools.chain(fragments, itertools.repeat(b""))
+    )
+    return reader
+
+
+async def _parse_one_request(
+    fragments: list[bytes],
+) -> tuple[ParsedRequest | None, bytes, bytes]:
+    reader = _fragment_reader(fragments)
+    parsed, wire = await AsyncRequestParser().parse(reader)
+    return parsed, wire, take_unread_data(reader)
+
+
+async def _parse_request_sequence(
+    count: int,
+    fragments: list[bytes],
+) -> tuple[list[tuple[ParsedRequest | None, bytes]], bytes]:
+    reader = _fragment_reader(fragments)
+    outcomes = [await AsyncRequestParser().parse(reader) for _ in range(count)]
+    return outcomes, take_unread_data(reader)
+
+
+@given(case=_fragmented_request_cases())
+def test_parser_with_any_fragmentation_matches_one_shot_parse(
+    case: tuple[bytes, list[bytes]],
+) -> None:
+    encoded, fragments = case
+    one_shot, one_shot_wire, one_shot_leftover = asyncio.run(
+        _parse_one_request([encoded])
+    )
+    fragmented, fragmented_wire, fragmented_leftover = asyncio.run(
+        _parse_one_request(fragments)
+    )
+
+    assert one_shot is not None
+    assert fragmented is not None
+    assert one_shot.is_complete
+    assert fragmented.is_complete
+    assert fragmented.method == one_shot.method
+    assert fragmented.url == one_shot.url
+    assert fragmented.http_version == one_shot.http_version
+    assert fragmented.headers == one_shot.headers
+    assert fragmented.body == one_shot.body
+    assert one_shot_wire == encoded
+    assert fragmented_wire == encoded
+    assert one_shot_leftover == b""
+    assert fragmented_leftover == b""
+
+
+@given(case=_pipelined_request_cases())
+def test_parser_pipelined_stream_preserves_per_request_wire_bytes(
+    case: tuple[list[bytes], list[bytes]],
+) -> None:
+    requests, fragments = case
+    outcomes, leftover = asyncio.run(
+        _parse_request_sequence(len(requests), fragments)
+    )
+
+    for (parsed, wire), encoded in zip(outcomes, requests, strict=True):
+        assert parsed is not None
+        assert parsed.is_complete
+        assert wire == encoded
+    assert leftover == b""
