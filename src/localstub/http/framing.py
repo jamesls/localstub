@@ -21,10 +21,12 @@ def content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
     for name, value in reversed(headers):
         if name.lower() != b"content-length":
             continue
-        try:
-            return int(value.strip())
-        except ValueError:
+        # RFC 9110: Content-Length is 1*DIGIT.  int() alone is too
+        # lenient (accepts sign prefixes and underscores).
+        digits = value.strip()
+        if not digits.isdigit():
             return None
+        return int(digits)
     return None
 
 

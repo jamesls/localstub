@@ -1,8 +1,26 @@
 from __future__ import annotations
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
-from localstub.http.uri import parse_absolute_uri
+from localstub.http.uri import ParsedURI, parse_absolute_uri
+
+
+def _uri_like(scheme: str, host: str, port: int | str, path: str) -> str:
+    return f"{scheme}://{host}:{port}{path}"
+
+
+URI_LIKE_STRINGS = st.one_of(
+    st.text(),
+    st.builds(
+        _uri_like,
+        st.sampled_from(["http", "https"]),
+        st.text(),
+        st.one_of(st.integers(), st.text()),
+        st.text(),
+    ),
+)
 
 
 def test_parse_absolute_uri_http() -> None:
@@ -102,6 +120,15 @@ def test_parsed_uri_authority_brackets_ipv6_host_default_port() -> None:
 
     assert result is not None
     assert result.authority == "[::1]"
+
+
+@given(uri=URI_LIKE_STRINGS)
+def test_parse_absolute_uri_with_arbitrary_text_returns_result_or_none(
+    uri: str,
+) -> None:
+    result = parse_absolute_uri(uri)
+
+    assert result is None or isinstance(result, ParsedURI)
 
 
 def test_parsed_uri_is_frozen() -> None:

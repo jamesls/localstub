@@ -1,10 +1,33 @@
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from localstub.http.framing import (
     ChunkScanError,
     chunk_payloads,
+    content_length,
     scan_chunked_body,
 )
+
+CONTENT_LENGTH_VALUES = st.one_of(
+    st.binary(),
+    st.text(alphabet="0123456789+-_ \t", min_size=1).map(
+        lambda text: text.encode("ascii")
+    ),
+)
+
+
+@given(value=CONTENT_LENGTH_VALUES)
+def test_content_length_with_arbitrary_value_accepts_only_digits(
+    value: bytes,
+) -> None:
+    result = content_length([(b"Content-Length", value)])
+
+    digits = value.strip()
+    if digits.isdigit():
+        assert result == int(digits)
+    else:
+        assert result is None
 
 
 def test_scan_chunked_body_resumes_after_complete_chunks() -> None:

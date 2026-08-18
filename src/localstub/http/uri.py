@@ -66,15 +66,21 @@ def parse_absolute_uri(uri: str) -> ParsedURI | None:
     if "://" not in uri:
         return None
 
-    parsed = urlparse(uri)
+    # Malformed authorities (unbalanced IPv6 bracket, non-numeric or
+    # out-of-range port) raise ValueError from urlparse/.port.
+    try:
+        parsed = urlparse(uri)
+        parsed_port = parsed.port
+    except ValueError:
+        return None
 
     # Validate we have required components
     if not parsed.scheme or not parsed.netloc:
         return None
 
     # Determine default port based on scheme
-    if parsed.port is not None:
-        port = parsed.port
+    if parsed_port is not None:
+        port = parsed_port
     elif parsed.scheme == "https":
         port = 443
     else:
