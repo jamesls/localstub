@@ -1,4 +1,6 @@
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.throttle import (
@@ -77,6 +79,13 @@ def test_token_bucket_try_acquire_rejects_non_positive_amount():
     bucket = TokenBucket(rate_per_second=1.0, capacity=1.0, clock=clock)
     with pytest.raises(ValueError, match="amount must be > 0"):
         bucket.try_acquire(amount=0.0)
+
+
+def test_token_bucket_try_acquire_rejects_amount_above_capacity() -> None:
+    clock = ManualClock()
+    bucket = TokenBucket(rate_per_second=1.0, capacity=1.0, clock=clock)
+    with pytest.raises(ValueError, match="amount must be <= capacity"):
+        bucket.try_acquire(amount=1.5)
 
 
 def test_token_bucket_reset_restores_capacity():
@@ -164,3 +173,128 @@ def test_token_bucket_throttler_reset_clears_state():
 
     throttler.reset()
     assert throttler.check(req).allowed
+
+
+_RETRY_SLACK = 1e-6
+_RATES = st.floats(min_value=0.1, max_value=50.0)
+_CAPACITIES = st.floats(min_value=0.1, max_value=50.0)
+_BURSTS = st.floats(min_value=1.0, max_value=50.0)
+_DELTAS = st.floats(min_value=0.0, max_value=100.0)
+_AMOUNTS = st.floats(min_value=0.01, max_value=100.0)
+_FRACTIONS = st.floats(min_value=0.01, max_value=1.0)
+_BucketScenario = tuple[float, float, list[tuple[float, float]]]
+
+
+@st.composite
+def _bucket_scenarios(draw: st.DrawFn) -> _BucketScenario:
+    rate = draw(_RATES)
+    capacity = draw(_CAPACITIES)
+    # Mix absolute amounts with capacity fractions so runs hit both
+    # the amount > capacity rejection and the amount == capacity
+    # boundary.
+    amounts = st.one_of(
+        _AMOUNTS,
+        _FRACTIONS.map(lambda fraction: capacity * fraction),
+    )
+    ops = draw(st.lists(st.tuples(_DELTAS, amounts), max_size=20))
+    return rate, capacity, ops
+
+
+def _assert_amount_above_capacity_raises(
+    bucket: TokenBucket,
+    amount: float,
+) -> None:
+    with pytest.raises(ValueError, match="amount must be <= capacity"):
+        bucket.try_acquire(amount)
+
+
+@given(scenario=_bucket_scenarios())
+def test_token_bucket_denied_acquire_succeeds_after_retry_after(
+    scenario: _BucketScenario,
+) -> None:
+    rate, capacity, ops = scenario
+    clock = ManualClock()
+    bucket = TokenBucket(rate_per_second=rate, capacity=capacity, clock=clock)
+
+    for delta, amount in ops:
+        clock.advance(delta)
+        if amount > capacity:
+            _assert_amount_above_capacity_raises(bucket, amount)
+            continue
+        allowed, retry_after = bucket.try_acquire(amount)
+        if allowed:
+            assert retry_after == 0.0
+            continue
+        assert retry_after > 0.0
+        clock.advance(retry_after + _RETRY_SLACK)
+        retried, second_retry_after = bucket.try_acquire(amount)
+        assert retried
+        assert second_retry_after == 0.0
+
+
+@given(scenario=_bucket_scenarios())
+def test_token_bucket_grants_stay_within_capacity_plus_refill(
+    scenario: _BucketScenario,
+) -> None:
+    rate, capacity, ops = scenario
+    clock = ManualClock()
+    bucket = TokenBucket(rate_per_second=rate, capacity=capacity, clock=clock)
+    granted = 0.0
+    elapsed = 0.0
+
+    for delta, amount in ops:
+        clock.advance(delta)
+        elapsed += delta
+        if amount > capacity:
+            _assert_amount_above_capacity_raises(bucket, amount)
+        elif bucket.try_acquire(amount)[0]:
+            granted += amount
+        budget = capacity + elapsed * rate
+        assert granted <= budget * (1.0 + 1e-9) + 1e-9
+
+
+@given(scenario=_bucket_scenarios())
+def test_token_bucket_retry_after_at_most_full_refill_wait(
+    scenario: _BucketScenario,
+) -> None:
+    rate, capacity, ops = scenario
+    clock = ManualClock()
+    bucket = TokenBucket(rate_per_second=rate, capacity=capacity, clock=clock)
+
+    for delta, amount in ops:
+        clock.advance(delta)
+        if amount > capacity:
+            _assert_amount_above_capacity_raises(bucket, amount)
+            continue
+        allowed, retry_after = bucket.try_acquire(amount)
+        if allowed:
+            assert retry_after == 0.0
+            continue
+        assert retry_after > 0.0
+        assert retry_after <= amount / rate * (1.0 + 1e-9) + 1e-9
+
+
+@given(rate=_RATES, burst=_BURSTS, deltas=st.lists(_DELTAS, max_size=20))
+def test_token_bucket_throttler_denied_check_succeeds_after_retry_after(
+    rate: float,
+    burst: float,
+    deltas: list[float],
+) -> None:
+    clock = ManualClock()
+    throttler = TokenBucketThrottler(
+        rate_per_second=rate,
+        key=lambda request: "global",
+        burst=burst,
+        clock=clock,
+    )
+    request = _recorded("GET", "/")
+
+    for delta in deltas:
+        clock.advance(delta)
+        decision = throttler.check(request)
+        if decision.allowed:
+            assert decision.retry_after_seconds == 0.0
+            continue
+        assert decision.retry_after_seconds > 0.0
+        clock.advance(decision.retry_after_seconds + _RETRY_SLACK)
+        assert throttler.check(request).allowed

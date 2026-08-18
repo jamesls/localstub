@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from unittest.mock import AsyncMock
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from localstub.http.headers import Headers
 from localstub.http.response import (
@@ -14,6 +17,13 @@ from localstub.http.response import (
     ResponseProtocol,
 )
 from localstub.http.responsespec import HTTPResponse
+
+from .strategies import (
+    HEADER_VALUE_ALPHABET,
+    chunked_bodies,
+    fragments_of,
+    header_items,
+)
 
 
 def test_recorded_http_response_delegates_to_response_value() -> None:
@@ -542,3 +552,85 @@ def _create_mock_reader(data_chunks: list[bytes]) -> asyncio.StreamReader:
     reader = AsyncMock(spec=asyncio.StreamReader)
     reader.read = AsyncMock(side_effect=data_chunks + [b""])
     return reader
+
+
+_BODYLESS_STATUS_CODES = (204, 304)
+_STATUS_CODES = tuple(
+    code for code in range(200, 600) if code not in _BODYLESS_STATUS_CODES
+)
+_RESPONSE_BODY_MODES = ("content-length", "chunked", "close-delimited")
+
+
+@st.composite
+def _response_wires(draw: st.DrawFn) -> tuple[bytes, str]:
+    status = draw(st.sampled_from(_STATUS_CODES))
+    reason = draw(st.text(alphabet=HEADER_VALUE_ALPHABET, max_size=12))
+    lines = [f"HTTP/1.1 {status} {reason}\r\n".encode("ascii")]
+    lines.extend(
+        f"{name}: {value}\r\n".encode("ascii")
+        for name, value in draw(header_items())
+    )
+    mode = draw(st.sampled_from(_RESPONSE_BODY_MODES))
+    if mode == "content-length":
+        body = draw(st.binary(max_size=64))
+        lines.append(f"Content-Length: {len(body)}\r\n".encode("ascii"))
+    elif mode == "chunked":
+        lines.append(b"Transfer-Encoding: chunked\r\n")
+        body = draw(chunked_bodies()).encoded
+    else:
+        body = draw(st.binary(max_size=64))
+    lines.append(b"\r\n")
+    return b"".join(lines) + body, mode
+
+
+@st.composite
+def _fragmented_response_cases(
+    draw: st.DrawFn,
+) -> tuple[bytes, str, list[bytes]]:
+    encoded, mode = draw(_response_wires())
+    return encoded, mode, draw(fragments_of(encoded))
+
+
+def _fragment_reader(fragments: list[bytes]) -> asyncio.StreamReader:
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    reader.read = AsyncMock(
+        side_effect=itertools.chain(fragments, itertools.repeat(b""))
+    )
+    return reader
+
+
+async def _parse_with_single_parser(
+    fragments: list[bytes],
+) -> tuple[ParsedResponse | None, bytes]:
+    parser = AsyncResponseParser()
+    return await parser.parse(_fragment_reader(fragments))
+
+
+async def _parse_with_multi_parser(
+    fragments: list[bytes],
+) -> tuple[ParsedResponse | None, bytes]:
+    parser = AsyncMultiResponseParser()
+    return await parser.next_response(_fragment_reader(fragments))
+
+
+@given(case=_fragmented_response_cases())
+def test_single_and_multi_response_parsers_agree_on_any_fragmentation(
+    case: tuple[bytes, str, list[bytes]],
+) -> None:
+    encoded, mode, fragments = case
+    single, single_wire = asyncio.run(_parse_with_single_parser(fragments))
+    multi, multi_wire = asyncio.run(_parse_with_multi_parser(fragments))
+
+    assert single is not None
+    assert multi is not None
+    assert single.is_complete
+    assert multi.is_complete
+    assert multi.status_code == single.status_code
+    assert multi.status_text == single.status_text
+    assert multi.http_version == single.http_version
+    assert multi.headers == single.headers
+    assert multi.body == single.body
+    assert multi.is_eof_delimited == single.is_eof_delimited
+    assert single_wire == encoded
+    assert multi_wire == encoded
+    assert single.is_eof_delimited == (mode == "close-delimited")
