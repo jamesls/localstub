@@ -56,6 +56,8 @@ class TokenBucket:
     def try_acquire(self, amount: float = 1.0) -> tuple[bool, float]:
         if amount <= 0:
             raise ValueError("amount must be > 0")
+        if amount > self._max_capacity:
+            raise ValueError("amount must be <= capacity")
         self._refill()
         if amount <= self._current_capacity:
             self._current_capacity -= amount

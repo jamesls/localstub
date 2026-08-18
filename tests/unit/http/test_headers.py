@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
-from localstub.http.headers import Headers
+from localstub.http.headers import HeaderItem, Headers
 
 
 def test_headers_are_immutable() -> None:
@@ -53,3 +55,137 @@ def test_headers_not_equal_to_other_types() -> None:
     headers = Headers.from_items([("X-Test", "a")])
 
     assert headers != [("X-Test", "a")]
+
+
+_HEADER_NAMES = st.text(alphabet="abAB-", min_size=1, max_size=4)
+_HEADER_VALUES = st.text(
+    alphabet="abcdefghijklmnopqrstuvwxyz0123456789 ", max_size=8
+)
+_HEADER_ITEMS = st.lists(st.tuples(_HEADER_NAMES, _HEADER_VALUES), max_size=6)
+_PatchHistory = tuple[list[HeaderItem], list[dict[str, str]]]
+
+
+@st.composite
+def _patch_values(draw: st.DrawFn) -> dict[str, str]:
+    items = draw(
+        st.lists(
+            st.tuples(_HEADER_NAMES, _HEADER_VALUES),
+            unique_by=lambda item: item[0].lower(),
+            max_size=4,
+        )
+    )
+    return dict(items)
+
+
+@st.composite
+def _patch_histories(draw: st.DrawFn) -> _PatchHistory:
+    return draw(_HEADER_ITEMS), draw(st.lists(_patch_values(), max_size=5))
+
+
+def _model_patch_set(
+    model: list[HeaderItem],
+    values: dict[str, str],
+) -> list[HeaderItem]:
+    lowered = {name.lower() for name in values}
+    kept = [item for item in model if item[0].lower() not in lowered]
+    return kept + list(values.items())
+
+
+def _apply_history(
+    history: _PatchHistory,
+) -> tuple[Headers, list[HeaderItem]]:
+    initial, patches = history
+    headers = Headers.from_items(initial)
+    model = list(initial)
+    for patch in patches:
+        headers = headers.patch_set(patch)
+        model = _model_patch_set(model, patch)
+    return headers, model
+
+
+def _probe_names(history: _PatchHistory, extra: str) -> set[str]:
+    initial, patches = history
+    names = {extra}
+    names.update(name for name, _ in initial)
+    for patch in patches:
+        names.update(patch)
+    return {
+        variant
+        for name in names
+        for variant in (name, name.lower(), name.upper(), name.swapcase())
+    }
+
+
+@given(history=_patch_histories())
+def test_headers_items_after_patch_history_match_naive_model(
+    history: _PatchHistory,
+) -> None:
+    headers, model = _apply_history(history)
+
+    assert list(headers.items()) == model
+
+
+@given(history=_patch_histories(), probe=_HEADER_NAMES)
+def test_headers_lookups_after_patch_history_match_naive_model(
+    history: _PatchHistory,
+    probe: str,
+) -> None:
+    headers, model = _apply_history(history)
+
+    for name in _probe_names(history, probe):
+        expected = [
+            value
+            for item_name, value in model
+            if item_name.lower() == name.lower()
+        ]
+        assert headers.get_all(name) == (expected or None)
+        assert headers.get_all(name, []) == expected
+        assert headers.get(name) == (expected[0] if expected else None)
+        assert (name in headers) == bool(expected)
+        if expected:
+            assert headers[name] == expected[0]
+        else:
+            with pytest.raises(KeyError):
+                headers[name]
+
+
+@given(history=_patch_histories())
+def test_headers_patched_equals_flat_headers_with_same_items(
+    history: _PatchHistory,
+) -> None:
+    patched, model = _apply_history(history)
+    flat = Headers.from_items(model)
+
+    assert patched == flat
+    assert flat == patched
+    assert hash(patched) == hash(flat)
+
+
+@given(
+    history=_patch_histories(),
+    name=_HEADER_NAMES.filter(lambda name: name.swapcase() != name),
+    values=st.tuples(_HEADER_VALUES, _HEADER_VALUES),
+)
+def test_headers_patch_set_case_colliding_names_raises_value_error(
+    history: _PatchHistory,
+    name: str,
+    values: tuple[str, str],
+) -> None:
+    headers, _ = _apply_history(history)
+    patch = {name: values[0], name.swapcase(): values[1]}
+
+    with pytest.raises(ValueError, match="duplicate header name"):
+        headers.patch_set(patch)
+
+
+@given(first=_patch_histories(), second=_patch_histories())
+def test_headers_equality_across_histories_follows_item_equality(
+    first: _PatchHistory,
+    second: _PatchHistory,
+) -> None:
+    headers_a, model_a = _apply_history(first)
+    headers_b, model_b = _apply_history(second)
+
+    assert (headers_a == headers_b) == (model_a == model_b)
+    if model_a == model_b:
+        assert hash(headers_a) == hash(headers_b)
