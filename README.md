@@ -12,6 +12,10 @@ some environment variables for specifying a `CA_BUNDLE`.  This also
 lets you inspect existing HTTP clients to see the exact bytes they
 are sending to servers.
 
+> [!WARNING]
+> localstub is under active development.  There may be breaking API changes
+> until the 1.0.0 GA release.
+
 
 ```python
 import asyncio
