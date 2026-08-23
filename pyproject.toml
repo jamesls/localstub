@@ -90,7 +90,7 @@ exclude_also = [
 ]
 
 [tool.pyright]
-include = ["src"]
+include = ["src", "docs/examples"]
 exclude = ["**/__pycache__"]
 
 reportMissingImports = true
