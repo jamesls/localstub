@@ -1,11 +1,63 @@
 # localstub
 
-Local HTTP Stub for Testing
+localstub is a Python library and CLI for testing HTTP clients against
+the behavior of a real server.  It runs an asyncio HTTP server in
+your test process, returns whatever responses you configure, including
+error responses, slow responses, disconnects, and records each request
+exactly as it arrived on the wire for your tests to inspect.
+
+A TLS proxy is provided so you can test your clients without having to
+make any config changes, most HTTP clients support `HTTPS_PROXY` and
+some environment variables for specifying a `CA_BUNDLE`.  This also
+lets you inspect existing HTTP clients to see the exact bytes they
+are sending to servers.
+
+
+```python
+import asyncio
+import ssl
+
+import httpx
+
+from localstub import AsyncHTTPTestServer, AsyncTLSInterceptProxy
+
+
+async def main() -> None:
+    async with (
+        AsyncHTTPTestServer() as server,
+        AsyncTLSInterceptProxy(server=server) as proxy,
+    ):
+        # Configure the test server with whatever response you want.
+        server.set_json_response({"ok": True})
+
+        # Using a generic HTTP client here, but this would be YOUR
+        # client library that's making calls to your remote service.
+        async with httpx.AsyncClient(
+            proxy=proxy.endpoint_url,
+            verify=ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            ),
+        ) as client:
+            # Your client makes a request just like it normally
+            # would, but it gets routed to the test server we've
+            # setup which will return an `{"ok": true}` JSON response.
+            response = await client.get("https://example.com/")
+            assert response.json() == {"ok": True}
+
+        # The server records every request it receives in
+        # `server.requests`, so you can inspect the exact
+        # request the client sent.
+        request = server.requests[0]
+        assert request.headers["host"] == "example.com"
+
+
+asyncio.run(main())
+```
 
 ## Installation
 
 ```sh
-pip install localstub
+uv add localstub
 ```
 
 ## Development

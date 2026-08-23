@@ -30,6 +30,11 @@ dependencies = [
   "anyio>=4.11.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/jamesls/localstub"
+Issues = "https://github.com/jamesls/localstub/issues"
+Changelog = "https://github.com/jamesls/localstub/blob/main/CHANGELOG.md"
+
 [dependency-groups]
 dev = [
   "ast-grep-cli",
