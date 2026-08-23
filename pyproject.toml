@@ -59,6 +59,17 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+  ".cruft.json",
+  ".github",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "rules",
+  "scripts",
+  "sgconfig.yml",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/localstub"]
 
