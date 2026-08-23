@@ -1,0 +1,75 @@
+name: Publish to PyPI (Trusted Publishing)
+
+on:
+  # Publish when you push a version tag with format X.Y.Z
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+  # Allow manual runs from the Actions tab
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked --all-extras --dev
+      - name: Run prcheck
+        run: uv run poe prcheck
+
+      - name: Check tag matches pyproject.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        # The built version comes from pyproject.toml, not the git tag, so
+        # a mismatched tag would silently publish the wrong version.
+        run: |
+          version=$(uv version --short)
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match pyproject.toml" \
+              "version $version" >&2
+            exit 1
+          fi
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    # Guarding the whole job makes a manual workflow_dispatch a dry run of
+    # the build without touching PyPI or waiting on the pypi environment's
+    # protection rules.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/localstub
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
