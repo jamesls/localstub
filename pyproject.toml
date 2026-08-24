@@ -43,15 +43,13 @@ dev = [
   "pytest>=8.4.2",
   "pytest-asyncio",
   "pytest-cov>=7.0.0",
-  "mkdocstrings>=0.30.0",
-  "mkdocs-material>=9.6.20",
-  "pymdown-extensions>=10.16.1",
   "pyinstrument",
   "jmeslog>=0.2.0",
   "poethepoet>=0.37.0",
   "ruff>=0.16.0",
   "pyright[nodejs]>=1.1.405",
   "hypothesis>=6.165.10",
+  "zensical"
 ]
 
 
