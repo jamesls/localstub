@@ -16,6 +16,7 @@ are sending to servers.
 > localstub is under active development.  There may be breaking API changes
 > until the 1.0.0 GA release.
 
+[Documentation](https://jamesls.github.io/localstub/)
 
 ```python
 import asyncio
