@@ -13,7 +13,7 @@ from typing import (
     Self,
 )
 
-from localstub.forward import RawForwarder
+from localstub.forward import RawForwarder, response_allows_keep_alive
 from localstub.http.client import HTTPClient
 from localstub.http.connection import should_close_connection
 from localstub.http.exchange import RecordedExchange
@@ -994,13 +994,7 @@ class AsyncHTTPTestServer:
             )
             return SendResult(
                 recorded=recorded,
-                should_close=(
-                    result.is_eof_delimited
-                    or should_close_connection(
-                        request,
-                        response_headers=result.headers,
-                    )
-                ),
+                should_close=not response_allows_keep_alive(request, result),
             )
 
         if not isinstance(response, HTTPResponse):

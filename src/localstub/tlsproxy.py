@@ -19,6 +19,7 @@ from localstub.forward import (
     ResponseTransformer,
     TransformContext,
     TransformResult,
+    response_allows_keep_alive,
 )
 from localstub.http.exchange import RecordedExchange
 from localstub.http.request import (
@@ -530,18 +531,66 @@ class AsyncTLSInterceptProxy:
     ) -> None:
         upstream_id = f"{host}:{port}"
 
-        parser = AsyncRequestParser(max_read=self._max_read)
-        parsed, header_wire, remaining = await parser.parse_headers(
-            client_reader
-        )
-        if parsed is None:
-            await self._send_and_close(
-                client_writer, b"HTTP/1.1 400 Bad Request", client_id
+        while True:
+            parser = AsyncRequestParser(max_read=self._max_read)
+            parsed, header_wire, remaining = await parser.parse_headers(
+                client_reader
             )
-            return
+            if parsed is None:
+                # Bytes received but unparseable is a malformed request; an
+                # empty read is a clean EOF from a client that closed a
+                # persistent connection, so just close our side.
+                if header_wire:
+                    await self._send_and_close(
+                        client_writer, b"HTTP/1.1 400 Bad Request", client_id
+                    )
+                else:
+                    self._close_client(client_writer, client_id)
+                return
 
-        _wire_log(f"lstub <-- {client_id}", header_wire)
+            _wire_log(f"lstub <-- {client_id}", header_wire)
 
+            keep_alive = await self._forward_one_request(
+                host=host,
+                port=port,
+                upstream_id=upstream_id,
+                client_id=client_id,
+                parser=parser,
+                parsed=parsed,
+                header_wire=header_wire,
+                remaining=remaining,
+                client_reader=client_reader,
+                client_writer=client_writer,
+            )
+
+            if client_writer.is_closing():
+                # An error response or fault injection already tore the
+                # connection down; there is nothing left to keep alive.
+                return
+            if not keep_alive:
+                self._close_client(client_writer, client_id)
+                return
+
+    async def _forward_one_request(
+        self,
+        *,
+        host: str,
+        port: int,
+        upstream_id: str,
+        client_id: str,
+        parser: AsyncRequestParser,
+        parsed: ParsedRequest,
+        header_wire: bytes,
+        remaining: bytearray,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> bool:
+        """Forward a single request/response exchange.
+
+        Returns whether the client connection may be reused for a
+        subsequent request. Error and fault-injection paths close the
+        client writer themselves and return ``False``.
+        """
         # Check for Expect: 100-continue with client actually waiting.
         expect_hdr = {k.lower(): v for k, v in parsed.headers}.get(
             b"expect", b""
@@ -569,65 +618,23 @@ class AsyncTLSInterceptProxy:
                 b"HTTP/1.1 502 Bad Gateway",
                 client_id,
             )
-            return
+            return False
         upstream_reader, upstream_writer = upstream
 
         try:
             if client_waiting:
-                forwarded = await self._forwarder.forward_with_100_continue(
+                return await self._forward_100_continue_request(
                     parser=parser,
-                    parsed_headers=parsed,
-                    header_wire_bytes=header_wire,
-                    remaining_buffer=remaining,
+                    parsed=parsed,
+                    header_wire=header_wire,
+                    remaining=remaining,
                     client_reader=client_reader,
                     client_writer=client_writer,
                     upstream_reader=upstream_reader,
                     upstream_writer=upstream_writer,
-                    request_method=parsed.method,
                     upstream_id=upstream_id,
                     client_id=client_id,
                 )
-
-                request, request_timestamp = self._record_request(
-                    forwarded.parsed_request,
-                    forwarded.request_wire_bytes,
-                    client_writer,
-                )
-
-                if forwarded.error == ForwardError.REQUEST_PARSE_FAILED:
-                    await self._record_failure_and_close(
-                        request,
-                        request_timestamp,
-                        client_writer,
-                        b"HTTP/1.1 400 Bad Request",
-                        client_id,
-                    )
-                    return
-
-                if forwarded.response is None:
-                    await self._record_failure_and_close(
-                        request,
-                        request_timestamp,
-                        client_writer,
-                        b"HTTP/1.1 502 Bad Gateway",
-                        client_id,
-                    )
-                    _close_log(
-                        f"{upstream_id} --> lstub",
-                        "failed to parse response",
-                    )
-                    return
-
-                response = forwarded.response.to_recorded_response()
-                self._recorder.record_exchange(
-                    request=request,
-                    response=response,
-                    request_timestamp=request_timestamp,
-                )
-                _close_log(f"{upstream_id} --> lstub", "response received")
-                _close_log(f"lstub --> {client_id}", "response relayed")
-                client_writer.close()
-                return
 
             final_parsed, full_wire = await parser.continue_parse_body(
                 client_reader, remaining
@@ -638,7 +645,7 @@ class AsyncTLSInterceptProxy:
                     b"HTTP/1.1 400 Bad Request",
                     client_id,
                 )
-                return
+                return False
 
             body_wire = full_wire[len(header_wire) :]
             if body_wire:
@@ -670,7 +677,7 @@ class AsyncTLSInterceptProxy:
                     f"{upstream_id} --> lstub",
                     "failed to parse response",
                 )
-                return
+                return False
 
             response = final_response.to_recorded_response()
             self._recorder.record_exchange(
@@ -680,9 +687,90 @@ class AsyncTLSInterceptProxy:
             )
             _close_log(f"{upstream_id} --> lstub", "response received")
             _close_log(f"lstub --> {client_id}", "response relayed")
-            client_writer.close()
+            return response_allows_keep_alive(request, final_response)
         finally:
             upstream_writer.close()
+
+    async def _forward_100_continue_request(
+        self,
+        *,
+        parser: AsyncRequestParser,
+        parsed: ParsedRequest,
+        header_wire: bytes,
+        remaining: bytearray,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        upstream_reader: asyncio.StreamReader,
+        upstream_writer: asyncio.StreamWriter,
+        upstream_id: str,
+        client_id: str,
+    ) -> bool:
+        forwarded = await self._forwarder.forward_with_100_continue(
+            parser=parser,
+            parsed_headers=parsed,
+            header_wire_bytes=header_wire,
+            remaining_buffer=remaining,
+            client_reader=client_reader,
+            client_writer=client_writer,
+            upstream_reader=upstream_reader,
+            upstream_writer=upstream_writer,
+            request_method=parsed.method,
+            upstream_id=upstream_id,
+            client_id=client_id,
+        )
+
+        request, request_timestamp = self._record_request(
+            forwarded.parsed_request,
+            forwarded.request_wire_bytes,
+            client_writer,
+        )
+
+        if forwarded.error == ForwardError.REQUEST_PARSE_FAILED:
+            await self._record_failure_and_close(
+                request,
+                request_timestamp,
+                client_writer,
+                b"HTTP/1.1 400 Bad Request",
+                client_id,
+            )
+            return False
+
+        if forwarded.response is None:
+            await self._record_failure_and_close(
+                request,
+                request_timestamp,
+                client_writer,
+                b"HTTP/1.1 502 Bad Gateway",
+                client_id,
+            )
+            _close_log(
+                f"{upstream_id} --> lstub",
+                "failed to parse response",
+            )
+            return False
+
+        response = forwarded.response.to_recorded_response()
+        self._recorder.record_exchange(
+            request=request,
+            response=response,
+            request_timestamp=request_timestamp,
+        )
+        _close_log(f"{upstream_id} --> lstub", "response received")
+        _close_log(f"lstub --> {client_id}", "response relayed")
+        if not forwarded.request_body_consumed:
+            # An early final response leaves the declared request body
+            # unread; a client that stopped waiting may still send it,
+            # so later bytes have ambiguous framing (RFC 9112 §9.6).
+            return False
+        return response_allows_keep_alive(request, forwarded.response)
+
+    def _close_client(
+        self,
+        writer: asyncio.StreamWriter,
+        client_id: str,
+    ) -> None:
+        _close_log(f"lstub --> {client_id}", "connection closed")
+        writer.close()
 
     def _record_request(
         self,

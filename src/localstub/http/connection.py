@@ -47,7 +47,15 @@ def should_close_connection(
     request: RecordedHTTPRequest,
     *,
     response_headers: Headers | Message | dict[str, str] | None,
+    response_version: str | None = None,
 ) -> bool:
+    """Return whether the connection must close after this exchange.
+
+    ``response_version`` is the HTTP version of the response placed on
+    the wire.  Persistence is opt-in for HTTP/1.0 responses (RFC 9112
+    §9.3); when the version is unknown (``None``) the response is
+    assumed to be HTTP/1.1.
+    """
     request_tokens = connection_tokens_from_headers(request.headers)
 
     if response_headers is None:
@@ -58,6 +66,9 @@ def should_close_connection(
         response_tokens = connection_tokens_from_headers(response_headers)
 
     if "close" in response_tokens:
+        return True
+
+    if response_version == "1.0" and "keep-alive" not in response_tokens:
         return True
 
     if _is_http11(request):
