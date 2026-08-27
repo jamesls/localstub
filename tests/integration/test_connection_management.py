@@ -4,6 +4,8 @@ import socket
 import pytest
 
 from localstub.forward import RawForwarder
+from localstub.http.clients.asyncio import AsyncioClient
+from localstub.http.request import HTTPRequest
 from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
 from localstub.server import (
     AsyncHTTPTestServer,
@@ -410,3 +412,70 @@ async def test_connection_close_is_parsed_as_token_not_substring():
                 pass
 
         assert len(server.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_asyncio_client_reuses_connection_across_sends() -> None:
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({"ok": True})
+        target = f"http://{server.host}:{server.port}/"
+
+        async with AsyncioClient() as client:
+            await client.send(HTTPRequest(method="GET", target=target))
+            await client.send(HTTPRequest(method="GET", target=target))
+
+        assert len(server.requests) == 2
+        first, second = server.requests
+        assert first.client is not None
+        assert first.client == second.client
+
+
+@pytest.mark.asyncio
+async def test_asyncio_client_reconnects_after_connection_close() -> None:
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({}, headers={"Connection": "close"})
+        target = f"http://{server.host}:{server.port}/"
+
+        async with AsyncioClient() as client:
+            await client.send(HTTPRequest(method="GET", target=target))
+            await client.send(HTTPRequest(method="GET", target=target))
+
+        assert len(server.requests) == 2
+        first, second = server.requests
+        assert first.client is not None
+        assert second.client is not None
+        assert first.client != second.client
+
+
+@pytest.mark.asyncio
+async def test_asyncio_client_expired_connection_is_not_reused() -> None:
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({})
+        target = f"http://{server.host}:{server.port}/"
+
+        async with AsyncioClient(idle_timeout=0.0) as client:
+            await client.send(HTTPRequest(method="GET", target=target))
+            await asyncio.sleep(0.01)
+            await client.send(HTTPRequest(method="GET", target=target))
+
+        assert len(server.requests) == 2
+        first, second = server.requests
+        assert first.client != second.client
+
+
+@pytest.mark.asyncio
+async def test_asyncio_client_concurrency_bounded_by_origin_cap() -> None:
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({})
+        target = f"http://{server.host}:{server.port}/"
+
+        async with AsyncioClient(max_connections_per_origin=2) as client:
+            responses = await asyncio.gather(*[
+                client.send(HTTPRequest(method="GET", target=target))
+                for _ in range(6)
+            ])
+
+        assert all(response.status == 200 for response in responses)
+        assert len(server.requests) == 6
+        client_addresses = {request.client for request in server.requests}
+        assert len(client_addresses) <= 2

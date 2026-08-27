@@ -559,10 +559,14 @@ _STATUS_CODES = tuple(
     code for code in range(200, 600) if code not in _BODYLESS_STATUS_CODES
 )
 _RESPONSE_BODY_MODES = ("content-length", "chunked", "close-delimited")
+_FRAMED_RESPONSE_BODY_MODES = ("content-length", "chunked")
 
 
 @st.composite
-def _response_wires(draw: st.DrawFn) -> tuple[bytes, str]:
+def _response_wires(
+    draw: st.DrawFn,
+    modes: tuple[str, ...] = _RESPONSE_BODY_MODES,
+) -> tuple[bytes, str]:
     status = draw(st.sampled_from(_STATUS_CODES))
     reason = draw(st.text(alphabet=HEADER_VALUE_ALPHABET, max_size=12))
     lines = [f"HTTP/1.1 {status} {reason}\r\n".encode("ascii")]
@@ -570,7 +574,7 @@ def _response_wires(draw: st.DrawFn) -> tuple[bytes, str]:
         f"{name}: {value}\r\n".encode("ascii")
         for name, value in draw(header_items())
     )
-    mode = draw(st.sampled_from(_RESPONSE_BODY_MODES))
+    mode = draw(st.sampled_from(modes))
     if mode == "content-length":
         body = draw(st.binary(max_size=64))
         lines.append(f"Content-Length: {len(body)}\r\n".encode("ascii"))
@@ -589,6 +593,16 @@ def _fragmented_response_cases(
 ) -> tuple[bytes, str, list[bytes]]:
     encoded, mode = draw(_response_wires())
     return encoded, mode, draw(fragments_of(encoded))
+
+
+@st.composite
+def _pipelined_response_cases(
+    draw: st.DrawFn,
+) -> tuple[bytes, bytes, list[bytes]]:
+    first, _ = draw(_response_wires(_FRAMED_RESPONSE_BODY_MODES))
+    second, _ = draw(_response_wires(_FRAMED_RESPONSE_BODY_MODES))
+    combined = first + second
+    return first, second, draw(fragments_of(combined))
 
 
 def _fragment_reader(fragments: list[bytes]) -> asyncio.StreamReader:
@@ -634,3 +648,73 @@ def test_single_and_multi_response_parsers_agree_on_any_fragmentation(
     assert single_wire == encoded
     assert multi_wire == encoded
     assert single.is_eof_delimited == (mode == "close-delimited")
+
+
+async def _check_pipelined_response_case(
+    first_wire: bytes,
+    second_wire: bytes,
+    fragments: list[bytes],
+) -> None:
+    bytes_available = 0
+    for fragment in fragments:
+        bytes_available += len(fragment)
+        if bytes_available >= len(first_wire):
+            break
+    first_read_crosses_boundary = bytes_available > len(first_wire)
+    parser = AsyncMultiResponseParser()
+    reader = _fragment_reader(fragments)
+
+    first, actual_first_wire = await parser.next_response(reader)
+
+    assert first is not None
+    assert first.is_complete
+    assert actual_first_wire == first_wire
+    assert parser.has_buffered_data == first_read_crosses_boundary
+
+    second, actual_second_wire = await parser.next_response(reader)
+
+    assert second is not None
+    assert second.is_complete
+    assert actual_second_wire == second_wire
+    assert not parser.has_buffered_data
+
+
+@given(case=_pipelined_response_cases())
+def test_multi_response_parser_preserves_pipelined_response_fragmentation(
+    case: tuple[bytes, bytes, list[bytes]],
+) -> None:
+    asyncio.run(_check_pipelined_response_case(*case))
+
+
+def test_multi_response_parser_has_no_buffered_data_initially() -> None:
+    parser = AsyncMultiResponseParser()
+
+    assert not parser.has_buffered_data
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_no_buffered_data_after_exact_read() -> (
+    None
+):
+    response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+    reader = _create_mock_reader([response])
+    parser = AsyncMultiResponseParser()
+
+    parsed, _ = await parser.next_response(reader)
+
+    assert parsed is not None
+    assert not parser.has_buffered_data
+
+
+@pytest.mark.asyncio
+async def test_multi_response_parser_has_buffered_data_after_extra_bytes() -> (
+    None
+):
+    response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXTRA"
+    reader = _create_mock_reader([response])
+    parser = AsyncMultiResponseParser()
+
+    parsed, _ = await parser.next_response(reader)
+
+    assert parsed is not None
+    assert parser.has_buffered_data

@@ -7,6 +7,7 @@ internal and may change without notice.
 
 from __future__ import annotations
 
+from localstub.http.clients.asyncio import AsyncioClient
 from localstub.http.exchange import RecordedExchange
 from localstub.http.headers import Headers
 from localstub.http.request import (
@@ -48,6 +49,7 @@ from localstub.traffic_jsonl import dump_server_traffic_jsonl
 __all__ = [
     "AsyncHTTPTestServer",
     "AsyncTLSInterceptProxy",
+    "AsyncioClient",
     "ByteFlip",
     "Delay",
     "DropConnection",

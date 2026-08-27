@@ -50,6 +50,9 @@ class StubHTTPClient:
         self.requests.append(request)
         return self.response
 
+    async def aclose(self) -> None:
+        pass
+
 
 def _services() -> ServerServices:
     return ServerServices(

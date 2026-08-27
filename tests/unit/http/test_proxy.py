@@ -25,6 +25,9 @@ class StubHTTPClient:
         self.requests.append(request)
         return self.response
 
+    async def aclose(self) -> None:
+        pass
+
 
 @dataclass
 class FailingHTTPClient:
@@ -32,6 +35,9 @@ class FailingHTTPClient:
 
     async def send(self, request: HTTPRequest) -> HTTPResponse:
         raise HTTPClientError(self.message)
+
+    async def aclose(self) -> None:
+        pass
 
 
 def _recorded(

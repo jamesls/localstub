@@ -239,6 +239,11 @@ class AsyncMultiResponseParser:
         self._max_read = max_read
         self._buffer = bytearray()
 
+    @property
+    def has_buffered_data(self) -> bool:
+        """Whether bytes remain past the last parsed response."""
+        return bool(self._buffer)
+
     async def next_response(
         self,
         reader: asyncio.StreamReader,
