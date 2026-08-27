@@ -19,8 +19,13 @@ from typing import Protocol
 
 import truststore
 
+from localstub.http.connection import should_close_connection
 from localstub.http.headers import Headers
-from localstub.http.request import AsyncRequestParser, ParsedRequest
+from localstub.http.request import (
+    AsyncRequestParser,
+    ParsedRequest,
+    RecordedHTTPRequest,
+)
 from localstub.http.response import (
     AsyncMultiResponseParser,
     ParsedResponse,
@@ -110,15 +115,38 @@ ResponseTransformer = Callable[
 ]
 
 
+@dataclass(frozen=True)
+class RelayedResponse:
+    """Connection-relevant metadata of the response sent to the client.
+
+    A transformer may rewrite or override the upstream message, so the
+    response the client saw can differ from the recorded upstream
+    response; connection-persistence decisions must follow the relayed
+    message rather than the upstream one.
+    """
+
+    status: int
+    headers: Headers | Message
+    http_version: str | None
+    is_eof_delimited: bool
+
+
 @dataclass
 class ForwardResult:
-    """Result of forwarding a request to upstream."""
+    """Result of forwarding a request to upstream.
+
+    The ``status``/``reason``/``headers``/``body``/``wire_bytes``
+    fields describe the upstream message as received (what gets
+    recorded); ``relayed`` describes the response actually sent to
+    the client.
+    """
 
     status: int
     reason: str | None
     headers: Message
     body: bytes
     wire_bytes: bytes
+    relayed: RelayedResponse
     is_eof_delimited: bool = False
 
     def to_recorded_response(
@@ -141,6 +169,32 @@ class ForwardResult:
         )
 
 
+def response_allows_keep_alive(
+    request: RecordedHTTPRequest,
+    result: ForwardResult,
+) -> bool:
+    """Return whether the client connection may carry another request.
+
+    The decision follows the response actually relayed to the client
+    (``result.relayed``).  Reuse is ruled out by a protocol switch,
+    an EOF-delimited body (the client learns completion from the
+    close), a ``Connection: close`` from either party, or a relayed
+    HTTP/1.0 response that did not opt in to keep-alive.
+    """
+    relayed = result.relayed
+    if relayed.status == 101:
+        # The connection now speaks the upgraded protocol; without a
+        # bidirectional relay it cannot carry further HTTP.
+        return False
+    if relayed.is_eof_delimited:
+        return False
+    return not should_close_connection(
+        request,
+        response_headers=relayed.headers,
+        response_version=relayed.http_version,
+    )
+
+
 class ForwardError(Enum):
     """Forwarding error category."""
 
@@ -150,11 +204,17 @@ class ForwardError(Enum):
 
 @dataclass
 class ForwardedRequest:
-    """Result of forwarding a request that originated from a client."""
+    """Result of forwarding a request that originated from a client.
+
+    ``request_body_consumed`` reports whether the client's request body
+    was fully read.  When false, unread body bytes may still arrive on
+    the connection, so it cannot carry another HTTP request.
+    """
 
     parsed_request: ParsedRequest
     request_wire_bytes: bytes
     response: ForwardResult | None
+    request_body_consumed: bool
     error: ForwardError | None = None
 
 
@@ -402,6 +462,7 @@ class RawForwarder:
                     header_wire_bytes + bytes(remaining_buffer)
                 ),
                 response=None,
+                request_body_consumed=False,
                 error=ForwardError.RESPONSE_PARSE_FAILED,
             )
 
@@ -417,6 +478,7 @@ class RawForwarder:
                         header_wire_bytes + bytes(remaining_buffer)
                     ),
                     response=None,
+                    request_body_consumed=False,
                     error=ForwardError.REQUEST_PARSE_FAILED,
                 )
 
@@ -439,6 +501,7 @@ class RawForwarder:
                 parsed_request=final_parsed,
                 request_wire_bytes=full_wire,
                 response=response,
+                request_body_consumed=True,
                 error=(
                     None
                     if response is not None
@@ -467,6 +530,10 @@ class RawForwarder:
             parsed_request=parsed_headers,
             request_wire_bytes=request_wire_bytes,
             response=response,
+            # A bodyless request (e.g. Content-Length: 0) is already
+            # complete at the header boundary, so an early final
+            # response leaves nothing unread on the connection.
+            request_body_consumed=parsed_headers.is_complete,
         )
 
     async def _relay_until_continue_or_final(
@@ -552,7 +619,43 @@ class RawForwarder:
             client_writer.write(wire_bytes_to_send)
             await client_writer.drain()
 
-        return self._build_result(parsed, wire_bytes)
+        return self._build_result(
+            parsed,
+            wire_bytes,
+            relayed=self._relayed_metadata(result, parsed, headers),
+        )
+
+    def _relayed_metadata(
+        self,
+        result: TransformResult,
+        parsed: ParsedResponse,
+        upstream_headers: Message,
+    ) -> RelayedResponse:
+        """Describe the response actually sent after transformation."""
+        if result.override_response is not None:
+            # An override is serialized with an HTTP/1.1 status line
+            # and Content-Length framing.
+            return RelayedResponse(
+                status=result.override_response.status,
+                headers=result.override_response.headers,
+                http_version="1.1",
+                is_eof_delimited=False,
+            )
+        if result.body is not None:
+            # A rewritten body is reframed with Content-Length while
+            # keeping the upstream status line and headers.
+            return RelayedResponse(
+                status=parsed.status_code or 0,
+                headers=upstream_headers,
+                http_version=parsed.http_version,
+                is_eof_delimited=False,
+            )
+        return RelayedResponse(
+            status=parsed.status_code or 0,
+            headers=upstream_headers,
+            http_version=parsed.http_version,
+            is_eof_delimited=parsed.is_eof_delimited,
+        )
 
     def _maybe_decompress(self, headers: Message, body: bytes) -> bytes:
         if not self._decompress_body:
@@ -634,23 +737,35 @@ class RawForwarder:
         self,
         parsed: ParsedResponse,
         wire_bytes: bytes,
+        relayed: RelayedResponse | None = None,
     ) -> ForwardResult:
         """Build ForwardResult from parsed response.
 
         Args:
             parsed: Parsed response from upstream.
             wire_bytes: Raw wire bytes of the response.
+            relayed: Metadata of the response sent to the client, when
+                it differs from the upstream response.  Defaults to the
+                upstream response relayed verbatim.
 
         Returns:
             ForwardResult for recording.
         """
         headers = headers_to_message(parsed.headers)
         body = self._maybe_decompress(headers, parsed.body)
+        if relayed is None:
+            relayed = RelayedResponse(
+                status=parsed.status_code or 0,
+                headers=headers,
+                http_version=parsed.http_version,
+                is_eof_delimited=parsed.is_eof_delimited,
+            )
         return ForwardResult(
             status=parsed.status_code or 0,
             reason=decode_status_text(parsed.status_text),
             headers=headers,
             body=body,
             wire_bytes=wire_bytes,
+            relayed=relayed,
             is_eof_delimited=parsed.is_eof_delimited,
         )

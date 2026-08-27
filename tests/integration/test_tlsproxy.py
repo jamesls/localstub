@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import http.client
 import logging
 import socket
 import ssl
@@ -918,6 +919,886 @@ async def test_forward_preserves_close_delimited_response_bodies():
 
         recorded_response = await proxy.next_response(timeout=1.0)
         assert recorded_response.body == b"streamed close body"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def _send_requests_over_one_tunnel(
+    proxy_host: str,
+    proxy_port: int,
+    upstream_host: str,
+    upstream_port: int,
+    ca_pem_path: str,
+    count: int,
+) -> list[tuple[int, bytes]]:
+    """Send *count* requests over a single tunneled connection.
+
+    Mirrors a real client (http.client) that establishes one CONNECT tunnel
+    and reuses it for sequential requests.
+    """
+    ctx = ssl.create_default_context(cafile=ca_pem_path)
+    conn = http.client.HTTPSConnection(
+        proxy_host, proxy_port, context=ctx, timeout=10.0
+    )
+    conn.set_tunnel(upstream_host, upstream_port)
+    results: list[tuple[int, bytes]] = []
+    try:
+        for _ in range(count):
+            conn.request("GET", "/")
+            response = conn.getresponse()
+            results.append((response.status, response.read()))
+    finally:
+        conn.close()
+    return results
+
+
+@pytest.mark.asyncio
+async def test_forward_reuses_tunnel_for_multiple_requests():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Length: 5\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\nhello"
+        )
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            LOG.debug("Failed to close test writer", exc_info=True)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            results = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _send_requests_over_one_tunnel,
+                    proxy_host,
+                    proxy_port,
+                    upstream_host,
+                    upstream_port,
+                    str(proxy.ca.ca_pem_path()),
+                    2,
+                ),
+                timeout=10.0,
+            )
+
+        assert results == [(200, b"hello"), (200, b"hello")]
+
+        first = await proxy.next_exchange(timeout=1.0)
+        second = await proxy.next_exchange(timeout=1.0)
+        assert first.request.target == "/"
+        assert second.request.target == "/"
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_closes_tunnel_when_client_requests_connection_close():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye")
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            LOG.debug("Failed to close test writer", exc_info=True)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await asyncio.open_connection(*proxy.address)
+            try:
+                writer.write(
+                    f"CONNECT {upstream_host}:{upstream_port} HTTP/1.1\r\n"
+                    f"Host: {upstream_host}:{upstream_port}\r\n"
+                    "\r\n".encode()
+                )
+                await writer.drain()
+                connect_response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert connect_response.startswith(b"HTTP/1.1 200")
+
+                verify_context = ssl.create_default_context(
+                    cafile=str(proxy.ca.ca_pem_path())
+                )
+                await writer.start_tls(
+                    verify_context, server_hostname=upstream_host
+                )
+
+                writer.write(
+                    b"GET / HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                )
+                await writer.drain()
+
+                headers = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert headers.startswith(b"HTTP/1.1 200")
+                body = await asyncio.wait_for(
+                    reader.readexactly(3), timeout=1.0
+                )
+                assert body == b"bye"
+
+                # The client asked to close, so the proxy must not keep the
+                # tunnel alive: the next read observes EOF (or a reset).
+                try:
+                    eof = await asyncio.wait_for(reader.read(1), timeout=1.0)
+                    assert eof == b""
+                except (ConnectionResetError, ssl.SSLError):
+                    pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_returns_400_for_malformed_request_over_tunnel():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        # A malformed client request is rejected before any upstream
+        # connection is opened, so this handler is never invoked.
+        await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await asyncio.open_connection(*proxy.address)
+            try:
+                writer.write(
+                    f"CONNECT {upstream_host}:{upstream_port} HTTP/1.1\r\n"
+                    f"Host: {upstream_host}:{upstream_port}\r\n"
+                    "\r\n".encode()
+                )
+                await writer.drain()
+                connect_response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert connect_response.startswith(b"HTTP/1.1 200")
+
+                verify_context = ssl.create_default_context(
+                    cafile=str(proxy.ca.ca_pem_path())
+                )
+                await writer.start_tls(
+                    verify_context, server_hostname=upstream_host
+                )
+
+                writer.write(b"INVALID HTTP DATA\r\n\r\n")
+                await writer.drain()
+
+                response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert response.startswith(b"HTTP/1.1 400")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def _establish_forward_tls_tunnel(
+    proxy: AsyncTLSInterceptProxy,
+    upstream_host: str,
+    upstream_port: int,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Open a CONNECT tunnel to *upstream* and upgrade the client to TLS."""
+    reader, writer = await asyncio.open_connection(*proxy.address)
+    writer.write(
+        f"CONNECT {upstream_host}:{upstream_port} HTTP/1.1\r\n"
+        f"Host: {upstream_host}:{upstream_port}\r\n"
+        "\r\n".encode()
+    )
+    await writer.drain()
+    connect_response = await asyncio.wait_for(
+        reader.readuntil(b"\r\n\r\n"), timeout=1.0
+    )
+    assert connect_response.startswith(b"HTTP/1.1 200")
+    verify_context = ssl.create_default_context(
+        cafile=str(proxy.ca.ca_pem_path())
+    )
+    await writer.start_tls(verify_context, server_hostname=upstream_host)
+    return reader, writer
+
+
+@pytest.mark.asyncio
+async def test_forward_returns_400_when_request_body_malformed():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        # The malformed body is rejected by the proxy, so a full request
+        # never reaches upstream.
+        await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                writer.write(
+                    b"POST / HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                    + b"Transfer-Encoding: chunked\r\n\r\n"
+                    + b"XYZ\r\n"
+                )
+                await writer.drain()
+
+                response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert response.startswith(b"HTTP/1.1 400")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_closes_tunnel_after_early_final_expect_response():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n"
+        )
+        await writer.drain()
+        await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                writer.write(
+                    b"PUT /upload HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                    + b"Content-Length: 18\r\n"
+                    + b"Expect: 100-continue\r\n\r\n"
+                )
+                await writer.drain()
+
+                response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert response.startswith(b"HTTP/1.1 417")
+
+                # A client that stopped waiting for the interim response
+                # may already have committed its body to the wire.  The
+                # proxy never read that body, so it must close the tunnel
+                # instead of parsing the body as another request.
+                try:
+                    writer.write(b"late body arriving")
+                    await writer.drain()
+                    trailing = await asyncio.wait_for(
+                        reader.read(4096), timeout=1.0
+                    )
+                    assert trailing == b""
+                except (ConnectionResetError, ssl.SSLError):
+                    pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        recorded_response = await proxy.next_response(timeout=1.0)
+        assert recorded_response.status == 417
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_closes_tunnel_after_101_switching_protocols():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n\r\n"
+        )
+        await writer.drain()
+        await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                writer.write(
+                    b"GET /ws HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                    + b"Upgrade: websocket\r\n"
+                    + b"Connection: Upgrade\r\n\r\n"
+                )
+                await writer.drain()
+
+                response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert response.startswith(b"HTTP/1.1 101")
+
+                # After a protocol switch the tunnel no longer carries
+                # HTTP.  Without a bidirectional relay the proxy must
+                # close rather than parse frames as another request.
+                try:
+                    writer.write(b"\x81\x05hello")
+                    await writer.drain()
+                    trailing = await asyncio.wait_for(
+                        reader.read(4096), timeout=1.0
+                    )
+                    assert trailing == b""
+                except (ConnectionResetError, ssl.SSLError):
+                    pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        recorded_response = await proxy.next_response(timeout=1.0)
+        assert recorded_response.status == 101
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_returns_400_when_100_continue_body_malformed():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        await writer.drain()
+        await reader.read()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                writer.write(
+                    b"PUT / HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                    + b"Transfer-Encoding: chunked\r\n"
+                    + b"Expect: 100-continue\r\n\r\n"
+                )
+                await writer.drain()
+
+                continue_response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert continue_response == b"HTTP/1.1 100 Continue\r\n\r\n"
+
+                writer.write(b"XYZ\r\n")
+                await writer.drain()
+
+                final = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert final.startswith(b"HTTP/1.1 400")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_returns_502_when_100_continue_response_unparseable():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        await writer.drain()
+        await reader.readexactly(4)
+        writer.write(b"GARBAGE NOT HTTP\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                writer.write(
+                    b"PUT / HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                    + b"Content-Length: 4\r\n"
+                    + b"Expect: 100-continue\r\n\r\n"
+                )
+                await writer.drain()
+
+                continue_response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert continue_response == b"HTTP/1.1 100 Continue\r\n\r\n"
+
+                writer.write(b"data")
+                await writer.drain()
+
+                final = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert final.startswith(b"HTTP/1.1 502")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def _expect_tunnel_eof(reader: asyncio.StreamReader) -> None:
+    """Assert the proxy closed the tunnel (EOF or reset) after a response."""
+    try:
+        trailing = await asyncio.wait_for(reader.read(1), timeout=1.0)
+        assert trailing == b""
+    except (ConnectionResetError, ssl.SSLError):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_forward_closes_tunnel_after_http10_response_without_keepalive():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            LOG.debug("Failed to close test writer", exc_info=True)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                writer.write(
+                    b"GET / HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n\r\n".encode()
+                )
+                await writer.drain()
+
+                headers = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert headers.startswith(b"HTTP/1.0 200")
+                body = await asyncio.wait_for(
+                    reader.readexactly(5), timeout=1.0
+                )
+                assert body == b"hello"
+
+                # Persistence is opt-in for HTTP/1.0 responses; without
+                # Connection: keep-alive the proxy must close the tunnel.
+                await _expect_tunnel_eof(reader)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_reuses_tunnel_after_http10_keep_alive_response():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.0 200 OK\r\n"
+            b"Content-Length: 5\r\n"
+            b"Connection: keep-alive\r\n"
+            b"\r\nhello"
+        )
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            LOG.debug("Failed to close test writer", exc_info=True)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                for _ in range(2):
+                    writer.write(
+                        b"GET / HTTP/1.1\r\n"
+                        + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                        + b"\r\n"
+                    )
+                    await writer.drain()
+
+                    headers = await asyncio.wait_for(
+                        reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                    )
+                    assert headers.startswith(b"HTTP/1.0 200")
+                    body = await asyncio.wait_for(
+                        reader.readexactly(5), timeout=1.0
+                    )
+                    assert body == b"hello"
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_closes_tunnel_when_transformer_override_says_close():
+    def close_transformer(upstream: TransformContext) -> TransformResult:
+        return TransformResult(
+            override_response=HTTPResponse.text(
+                "goodbye", headers={"Connection": "close"}
+            )
+        )
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            LOG.debug("Failed to close test writer", exc_info=True)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=close_transformer,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                writer.write(
+                    b"GET / HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n\r\n".encode()
+                )
+                await writer.drain()
+
+                headers = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert headers.startswith(b"HTTP/1.1 200")
+                assert b"Connection: close" in headers
+                body = await asyncio.wait_for(
+                    reader.readexactly(7), timeout=1.0
+                )
+                assert body == b"goodbye"
+
+                # The client was told Connection: close, so the proxy
+                # must close even though the upstream response did not
+                # ask for it.
+                await _expect_tunnel_eof(reader)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_closes_expect_tunnel_after_transformed_101() -> None:
+    def switching_transformer(
+        _upstream: TransformContext,
+    ) -> TransformResult:
+        return TransformResult(
+            override_response=HTTPResponse.raw(
+                b"",
+                status=101,
+                headers={
+                    "Upgrade": "websocket",
+                    "Connection": "Upgrade",
+                },
+            )
+        )
+
+    async with (
+        AsyncHTTPTestServer(
+            default_response=HTTPResponse.raw(b""),
+        ) as upstream,
+        AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=switching_transformer,
+        ) as proxy,
+    ):
+        assert upstream.host is not None
+        assert upstream.port is not None
+        reader, writer = await _establish_forward_tls_tunnel(
+            proxy, upstream.host, upstream.port
+        )
+        try:
+            writer.write(
+                b"GET /ws HTTP/1.1\r\n"
+                + f"Host: {upstream.host}:{upstream.port}\r\n".encode()
+                + b"Expect: 100-continue\r\n"
+                + b"Upgrade: websocket\r\n"
+                + b"Connection: Upgrade\r\n\r\n"
+            )
+            await writer.drain()
+
+            response = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"), timeout=1.0
+            )
+            assert response.startswith(b"HTTP/1.1 101")
+            await _expect_tunnel_eof(reader)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_reuses_tunnel_when_transformer_rewrites_body():
+    def uppercase_transformer(upstream: TransformContext) -> TransformResult:
+        return TransformResult(body=upstream.body.upper())
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            LOG.debug("Failed to close test writer", exc_info=True)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+            response_transformer=uppercase_transformer,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                for _ in range(2):
+                    writer.write(
+                        b"GET / HTTP/1.1\r\n"
+                        + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                        + b"\r\n"
+                    )
+                    await writer.drain()
+
+                    headers = await asyncio.wait_for(
+                        reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                    )
+                    assert headers.startswith(b"HTTP/1.1 200")
+                    body = await asyncio.wait_for(
+                        reader.readexactly(5), timeout=1.0
+                    )
+                    assert body == b"HELLO"
+            finally:
+                writer.close()
+                await writer.wait_closed()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_forward_reuses_tunnel_after_bodyless_expect_request():
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            LOG.debug("Failed to close test writer", exc_info=True)
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=False,
+        ) as proxy:
+            reader, writer = await _establish_forward_tls_tunnel(
+                proxy, upstream_host, upstream_port
+            )
+            try:
+                # A bodyless request with Expect: 100-continue that gets
+                # an immediate final response leaves nothing unread, so
+                # the tunnel stays reusable.
+                writer.write(
+                    b"GET / HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
+                    + b"Expect: 100-continue\r\n\r\n"
+                )
+                await writer.drain()
+
+                headers = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert headers.startswith(b"HTTP/1.1 200")
+                body = await asyncio.wait_for(
+                    reader.readexactly(2), timeout=1.0
+                )
+                assert body == b"ok"
+
+                writer.write(
+                    b"GET / HTTP/1.1\r\n"
+                    + f"Host: {upstream_host}:{upstream_port}\r\n\r\n".encode()
+                )
+                await writer.drain()
+
+                headers = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"), timeout=1.0
+                )
+                assert headers.startswith(b"HTTP/1.1 200")
+                body = await asyncio.wait_for(
+                    reader.readexactly(2), timeout=1.0
+                )
+                assert body == b"ok"
+            finally:
+                writer.close()
+                await writer.wait_closed()
     finally:
         server.close()
         await server.wait_closed()
