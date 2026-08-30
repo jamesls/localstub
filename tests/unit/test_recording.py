@@ -10,6 +10,7 @@ from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.recording import (
+    BoundedByteBuffer,
     BoundedRecordQueue,
     TrafficRecorder,
     trim_history,
@@ -67,6 +68,53 @@ def _recorder(
         clock=_ManualClock(clock_value),
         timestamp_provider=_FixedTimestampProvider(_WALL_TIME),
     )
+
+
+def test_bounded_byte_buffer_retains_newest_bytes() -> None:
+    buffer = BoundedByteBuffer(5)
+    buffer.extend(b"abc")
+    buffer.extend(b"defg")
+
+    assert bytes(buffer) == b"cdefg"
+    assert buffer.dropped == 2
+
+
+def test_bounded_byte_buffer_large_append_retains_newest_bytes() -> None:
+    buffer = BoundedByteBuffer(3)
+    buffer.extend(b"old")
+    buffer.extend(b"12345")
+
+    assert bytes(buffer) == b"345"
+    assert buffer.dropped == 5
+
+
+def test_unbounded_byte_buffer_never_drops() -> None:
+    buffer = BoundedByteBuffer(None)
+    buffer.extend(b"abc")
+    buffer.extend(b"def")
+
+    assert bytes(buffer) == b"abcdef"
+    assert buffer.dropped == 0
+
+
+def test_bounded_byte_buffer_clear_releases_retained_bytes() -> None:
+    buffer = BoundedByteBuffer(3)
+    buffer.extend(b"abcdef")
+    buffer.clear()
+
+    assert bytes(buffer) == b""
+    assert len(buffer) == 0
+    assert buffer.dropped == 3
+
+
+def test_bounded_byte_buffer_zero_maxsize_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        BoundedByteBuffer(0)
+
+
+def test_bounded_byte_buffer_maxsize_reports_capacity() -> None:
+    buffer = BoundedByteBuffer(7)
+    assert buffer.maxsize == 7
 
 
 def test_put_and_get_nowait_preserves_fifo_order() -> None:

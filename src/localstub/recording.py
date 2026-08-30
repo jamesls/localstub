@@ -29,6 +29,57 @@ from localstub.throttle import Clock, MonotonicClock
 LOG = logging.getLogger(__name__)
 
 DEFAULT_RECORDING_BUFFER_SIZE: Final = 256
+DEFAULT_MAX_CONNECTION_BYTES: Final = 1024 * 1024
+
+
+class BoundedByteBuffer:
+    """Byte buffer that retains its newest bytes up to a maximum size."""
+
+    def __init__(self, maxsize: int | None) -> None:
+        if maxsize is not None and maxsize < 1:
+            raise ValueError(
+                f"maxsize must be at least 1 or None, got {maxsize}"
+            )
+        self._maxsize = maxsize
+        self._buffer = bytearray()
+        self._dropped = 0
+
+    @property
+    def maxsize(self) -> int | None:
+        return self._maxsize
+
+    @property
+    def dropped(self) -> int:
+        """Number of bytes evicted because the buffer was full."""
+        return self._dropped
+
+    def extend(self, data: bytes | bytearray) -> None:
+        """Append *data*, evicting the oldest bytes past the maximum."""
+        if self._maxsize is None:
+            self._buffer.extend(data)
+            return
+
+        if len(data) >= self._maxsize:
+            self._dropped += len(self._buffer) + len(data) - self._maxsize
+            self._buffer.clear()
+            self._buffer.extend(data[-self._maxsize :])
+            return
+
+        excess = len(self._buffer) + len(data) - self._maxsize
+        if excess > 0:
+            del self._buffer[:excess]
+            self._dropped += excess
+        self._buffer.extend(data)
+
+    def clear(self) -> None:
+        """Remove all retained bytes without counting them as dropped."""
+        self._buffer.clear()
+
+    def __bytes__(self) -> bytes:
+        return bytes(self._buffer)
+
+    def __len__(self) -> int:
+        return len(self._buffer)
 
 
 class BoundedRecordQueue[T]:
