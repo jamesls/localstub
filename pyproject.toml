@@ -1,6 +1,6 @@
 [project]
 name = "localstub"
-version = "0.0.2"
+version = "0.0.3"
 description = "Local HTTP Stub for Testing"
 authors = [
   { name="James Saryerwinnie", email="js@jamesls.com"},
