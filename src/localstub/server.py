@@ -61,7 +61,9 @@ from localstub.middleware.builtins import (
     default_throttle_response,
 )
 from localstub.recording import (
+    DEFAULT_MAX_CONNECTION_BYTES,
     DEFAULT_RECORDING_BUFFER_SIZE,
+    BoundedByteBuffer,
     TrafficRecorder,
 )
 from localstub.router import ResponderHandler, Router
@@ -150,12 +152,12 @@ class Writer(Protocol):
 
 
 class RecordingStreamWriter:
-    """Wrapper that records all bytes written to the underlying writer."""
+    """Wrapper that records the current response and connection bytes."""
 
     def __init__(
         self,
         writer: asyncio.StreamWriter,
-        sent_buffer: bytearray | None = None,
+        sent_buffer: BoundedByteBuffer | None = None,
     ) -> None:
         self._writer = writer
         self._sent_buffer = sent_buffer
@@ -163,17 +165,12 @@ class RecordingStreamWriter:
 
     @property
     def bytes_sent(self) -> bytes:
-        """Return all bytes written through this recorder."""
+        """Return bytes written for the current response."""
         return bytes(self._recorded)
 
-    @property
-    def bytes_sent_len(self) -> int:
-        """Length of recorded bytes without copying."""
-        return len(self._recorded)
-
-    def bytes_sent_since(self, offset: int) -> bytes:
-        """Return bytes written since *offset* without a full copy."""
-        return bytes(self._recorded[offset:])
+    def start_response(self) -> None:
+        """Start recording a new response."""
+        self._recorded.clear()
 
     def write(self, data: bytes) -> None:
         self._recorded.extend(data)
@@ -427,7 +424,14 @@ class AsyncHTTPTestServer:
         timestamp_provider: TimestampProvider | None = None,
         recording_buffer_size: int | None = DEFAULT_RECORDING_BUFFER_SIZE,
         recorder: TrafficRecorder | None = None,
+        *,
+        max_connection_bytes: int | None = DEFAULT_MAX_CONNECTION_BYTES,
     ) -> None:
+        if max_connection_bytes is not None and max_connection_bytes < 0:
+            raise ValueError(
+                "max_connection_bytes must be non-negative or None, "
+                f"got {max_connection_bytes}"
+            )
         self._host = host
         self._port = port
         self._server: asyncio.base_events.Server | None = None
@@ -479,12 +483,15 @@ class AsyncHTTPTestServer:
             clock=self._clock,
             timestamp_provider=self._timestamp_provider,
         )
+        self._max_connection_bytes = max_connection_bytes
 
         # Connection-level raw bytes tracking (keyed by client address)
         self._connection_raw_bytes_received: dict[
-            tuple[str, int], bytearray
+            tuple[str, int], BoundedByteBuffer
         ] = {}
-        self._connection_raw_bytes_sent: dict[tuple[str, int], bytearray] = {}
+        self._connection_raw_bytes_sent: dict[
+            tuple[str, int], BoundedByteBuffer
+        ] = {}
 
         self.host: str | None = None
         self.port: int | None = None
@@ -633,13 +640,13 @@ class AsyncHTTPTestServer:
     def get_connection_bytes_received(
         self, client: tuple[str, int]
     ) -> bytes | None:
-        """Get all raw bytes received from a specific client connection.
+        """Get retained raw bytes received from a client connection.
 
         Args:
             client: Tuple of (host, port) identifying the client connection
 
         Returns:
-            All bytes received from this client, or None if no data recorded
+            Retained bytes from this client, or None if no data recorded
         """
         buf = self._connection_raw_bytes_received.get(client)
         return bytes(buf) if buf is not None else None
@@ -647,16 +654,30 @@ class AsyncHTTPTestServer:
     def get_connection_bytes_sent(
         self, client: tuple[str, int]
     ) -> bytes | None:
-        """Get all raw bytes sent to a specific client connection.
+        """Get retained raw bytes sent to a client connection.
 
         Args:
             client: Tuple of (host, port) identifying the client connection
 
         Returns:
-            All bytes sent to this client, or None if no data recorded
+            Retained bytes sent to this client, or None if no data recorded
         """
         buf = self._connection_raw_bytes_sent.get(client)
         return bytes(buf) if buf is not None else None
+
+    def get_connection_dropped_bytes_received(
+        self, client: tuple[str, int]
+    ) -> int | None:
+        """Get the count of received bytes dropped for a connection."""
+        buf = self._connection_raw_bytes_received.get(client)
+        return buf.dropped if buf is not None else None
+
+    def get_connection_dropped_bytes_sent(
+        self, client: tuple[str, int]
+    ) -> int | None:
+        """Get the count of sent bytes dropped for a connection."""
+        buf = self._connection_raw_bytes_sent.get(client)
+        return buf.dropped if buf is not None else None
 
     def get_request_timestamp(self, request: RecordedHTTPRequest) -> float:
         """Get the reception timestamp for a request.
@@ -698,6 +719,10 @@ class AsyncHTTPTestServer:
                 assert len(server.requests) == 1
         """
         self._recorder.reset()
+        for buf in self._connection_raw_bytes_received.values():
+            buf.clear()
+        for buf in self._connection_raw_bytes_sent.values():
+            buf.clear()
         self._connection_raw_bytes_received.clear()
         self._connection_raw_bytes_sent.clear()
         self._builtins.reset_all()
@@ -919,15 +944,19 @@ class AsyncHTTPTestServer:
 
     def _init_connection_tracking(
         self, client: tuple[str, int] | None
-    ) -> tuple[bytearray | None, bytearray | None]:
+    ) -> tuple[BoundedByteBuffer | None, BoundedByteBuffer | None]:
         """Initialize connection-level byte tracking for a client."""
-        if client is None:
+        if client is None or self._max_connection_bytes == 0:
             return None, None
 
         if client not in self._connection_raw_bytes_received:
-            self._connection_raw_bytes_received[client] = bytearray()
+            self._connection_raw_bytes_received[client] = BoundedByteBuffer(
+                self._max_connection_bytes
+            )
         if client not in self._connection_raw_bytes_sent:
-            self._connection_raw_bytes_sent[client] = bytearray()
+            self._connection_raw_bytes_sent[client] = BoundedByteBuffer(
+                self._max_connection_bytes
+            )
 
         return (
             self._connection_raw_bytes_received[client],
@@ -970,9 +999,9 @@ class AsyncHTTPTestServer:
         response: ResponseSpec,
     ) -> SendResult:
         writer = recording_writer
+        writer.start_response()
 
         if isinstance(response, ForwardProxyResponse):
-            wire_offset = writer.bytes_sent_len
             result = await response.forwarder.forward_and_relay(
                 host=response.host,
                 port=response.port,
@@ -981,7 +1010,7 @@ class AsyncHTTPTestServer:
                 request_method=response.request_method,
                 upstream_tls=response.upstream_tls,
             )
-            wire_bytes = writer.bytes_sent_since(wire_offset)
+            wire_bytes = writer.bytes_sent
             if result is None:
                 return await self._send_response(
                     recording_writer,
@@ -1002,13 +1031,12 @@ class AsyncHTTPTestServer:
                 f"Unhandled response spec: {type(response).__name__}"
             )
 
-        wire_offset = writer.bytes_sent_len
         should_close = await self._write_response(
             writer,
             response,
             request,
         )
-        wire_bytes = writer.bytes_sent_since(wire_offset)
+        wire_bytes = writer.bytes_sent
         recorded = self._build_recorded_response(response, wire_bytes)
         return SendResult(recorded=recorded, should_close=should_close)
 
@@ -1205,7 +1233,7 @@ class AsyncHTTPTestServer:
         writer: Writer,
         *,
         client: tuple[str, int] | None,
-        connection_wire: bytearray | None = None,
+        connection_wire: BoundedByteBuffer | None = None,
     ) -> tuple[RecordedHTTPRequest, dict[str, Any]] | None:
         state: dict[str, Any] = {}
         parser = AsyncRequestParser()

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, create_autospec
 import pytest
 
 from localstub.middleware import ResponderContext
+from localstub.recording import TrafficRecorder
 from localstub.server import (
     AsyncHTTPTestServer,
     ByteFlip,
@@ -32,6 +33,38 @@ def test_server_handler_getter() -> None:
 
     server = AsyncHTTPTestServer(handler=handler)
     assert server.handler is handler
+
+
+def test_server_accepts_recorder_in_legacy_positional_slot() -> None:
+    recorder = TrafficRecorder(None)
+
+    server = AsyncHTTPTestServer(
+        "127.0.0.1",
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        recorder,
+    )
+
+    assert server.requests == []
+
+
+def test_recording_writer_holds_only_current_response() -> None:
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    recorder = RecordingStreamWriter(writer)
+
+    recorder.start_response()
+    recorder.write(b"first response")
+    recorder.start_response()
+    recorder.write(b"second response")
+
+    assert recorder.bytes_sent == b"second response"
 
 
 @pytest.mark.asyncio
@@ -211,3 +244,8 @@ def test_zero_recording_buffer_size_raises_value_error():
 def test_negative_recording_buffer_size_raises_value_error():
     with pytest.raises(ValueError, match="at least 1"):
         AsyncHTTPTestServer(recording_buffer_size=-1)
+
+
+def test_negative_max_connection_bytes_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="must be non-negative or None"):
+        AsyncHTTPTestServer(max_connection_bytes=-1)

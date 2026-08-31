@@ -545,6 +545,85 @@ async def test_connection_bytes_sent_single_request(server, client):
 
 
 @pytest.mark.asyncio
+async def test_connection_byte_cap_trims_and_counts_drops() -> None:
+    cap = 32
+    async with (
+        AsyncHTTPTestServer(max_connection_bytes=cap) as server,
+        httpx.AsyncClient() as client,
+    ):
+        server.set_text_response("response body")
+        await client.post(server.url, content=b"request body")
+
+        request = server.last_request
+        response = server.last_response
+        assert request is not None
+        assert response is not None
+        client_addr = request.client
+        assert client_addr is not None
+
+        assert (
+            server.get_connection_bytes_received(client_addr)
+            == (request.wire_raw_bytes[-cap:])
+        )
+        assert (
+            server.get_connection_bytes_sent(client_addr)
+            == (response.wire_raw_bytes[-cap:])
+        )
+        assert server.get_connection_dropped_bytes_received(client_addr) == (
+            len(request.wire_raw_bytes) - cap
+        )
+        assert server.get_connection_dropped_bytes_sent(client_addr) == (
+            len(response.wire_raw_bytes) - cap
+        )
+
+
+@pytest.mark.asyncio
+async def test_zero_max_connection_bytes_disables_tracking() -> None:
+    async with (
+        AsyncHTTPTestServer(max_connection_bytes=0) as server,
+        httpx.AsyncClient() as client,
+    ):
+        await client.get(server.url)
+
+        assert server.last_request is not None
+        client_addr = server.last_request.client
+        assert client_addr is not None
+        assert server.get_connection_bytes_received(client_addr) is None
+        assert server.get_connection_bytes_sent(client_addr) is None
+        assert (
+            server.get_connection_dropped_bytes_received(client_addr) is None
+        )
+        assert server.get_connection_dropped_bytes_sent(client_addr) is None
+
+
+@pytest.mark.asyncio
+async def test_none_max_connection_bytes_keeps_complete_connection() -> None:
+    async with (
+        AsyncHTTPTestServer(max_connection_bytes=None) as server,
+        httpx.AsyncClient() as client,
+    ):
+        await client.get(f"{server.url}first")
+        await client.get(f"{server.url}second")
+
+        client_addr = server.requests[0].client
+        assert client_addr is not None
+        expected_received = b"".join(
+            request.wire_raw_bytes for request in server.requests
+        )
+        expected_sent = b"".join(
+            response.wire_raw_bytes for response in server.responses
+        )
+
+        assert (
+            server.get_connection_bytes_received(client_addr)
+            == expected_received
+        )
+        assert server.get_connection_bytes_sent(client_addr) == expected_sent
+        assert server.get_connection_dropped_bytes_received(client_addr) == 0
+        assert server.get_connection_dropped_bytes_sent(client_addr) == 0
+
+
+@pytest.mark.asyncio
 async def test_connection_bytes_multiple_requests_same_connection(
     server, client
 ):
