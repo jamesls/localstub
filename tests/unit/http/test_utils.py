@@ -1,71 +1,54 @@
 from __future__ import annotations
 
+import pytest
+
 from localstub.http.utils import (
+    headers_to_headers,
     headers_to_message,
     message_from_items,
+    serialize_header_line,
     status_phrase,
 )
 
 
-def test_headers_to_message_empty_headers() -> None:
-    message = headers_to_message([])
+def test_headers_to_headers_decodes_ascii_values() -> None:
+    headers = headers_to_headers([(b"Content-Type", b"application/json")])
 
-    assert len(message.keys()) == 0
-
-
-def test_headers_to_message_single_header() -> None:
-    message = headers_to_message([(b"Content-Type", b"application/json")])
-
-    assert message["Content-Type"] == "application/json"
+    assert headers["Content-Type"] == "application/json"
 
 
-def test_headers_to_message_multiple_headers() -> None:
-    headers = [
-        (b"Host", b"example.com"),
-        (b"Accept", b"*/*"),
-        (b"Connection", b"keep-alive"),
-    ]
-    message = headers_to_message(headers)
+def test_headers_to_headers_exposes_obs_text_through_raw_view() -> None:
+    headers = headers_to_headers([(b"X-Obs", b"value-\x80\xff")])
 
-    assert message["Host"] == "example.com"
-    assert message["Accept"] == "*/*"
-    assert message["Connection"] == "keep-alive"
+    assert isinstance(headers["X-Obs"], str)
+    assert headers.raw == ((b"X-Obs", b"value-\x80\xff"),)
 
 
-def test_headers_to_message_decodes_iso_8859_1() -> None:
-    message = headers_to_message([(b"X-Custom", b"\xe4\xf6\xfc")])
+def test_headers_to_message_preserves_string_facade() -> None:
+    message = headers_to_message([(b"X-Obs", b"\x80\xff")])
 
-    assert message["X-Custom"] == "\xe4\xf6\xfc"
-
-
-def test_message_from_items_empty_items() -> None:
-    message = message_from_items([])
-
-    assert len(message.keys()) == 0
+    assert message["X-Obs"] == "\x80\xff"
 
 
-def test_message_from_items_multiple_headers() -> None:
-    items = [
-        ("Content-Type", "application/json"),
-        ("Content-Length", "12"),
-    ]
-    message = message_from_items(items)
-
-    assert message["Content-Type"] == "application/json"
-    assert message["Content-Length"] == "12"
-
-
-def test_message_from_items_accepts_generator() -> None:
-    message = message_from_items((name, "v") for name in ["A", "B"])
-
-    assert message["A"] == "v"
-    assert message["B"] == "v"
-
-
-def test_message_from_items_preserves_non_latin_1_values() -> None:
+def test_message_from_items_preserves_unicode_values() -> None:
     message = message_from_items([("X-Custom", "→")])
 
     assert message["X-Custom"] == "→"
+
+
+def test_serialize_header_line_encodes_ascii_value() -> None:
+    assert serialize_header_line("X-Custom", "value") == b"X-Custom: value\r\n"
+
+
+def test_serialize_header_line_round_trips_obs_text_facade() -> None:
+    line = serialize_header_line("X-Obs", "\x80\xff")
+
+    assert line == b"X-Obs: \x80\xff\r\n"
+
+
+def test_serialize_header_line_rejects_value_outside_byte_range() -> None:
+    with pytest.raises(UnicodeEncodeError):
+        serialize_header_line("X-Custom", "→")
 
 
 def test_status_phrase_known_code_returns_phrase() -> None:

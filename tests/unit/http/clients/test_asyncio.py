@@ -105,6 +105,32 @@ async def test_post_body_gets_content_length_framing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_preserves_obs_text_request_and_response_headers() -> None:
+    wire = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"X-Response-Obs: \x80\xff\r\n"
+        b"Content-Length: 0\r\n"
+        b"\r\n"
+    )
+    async with OneShotServer(wire) as upstream:
+        client = AsyncioClient()
+
+        response = await client.send(
+            HTTPRequest(
+                method="GET",
+                target=f"http://127.0.0.1:{upstream.port}/",
+                headers=Headers.from_raw_items([
+                    (b"X-Request-Obs", b"\x80\xff")
+                ]),
+            )
+        )
+
+    assert b"X-Request-Obs: \x80\xff\r\n" in upstream.received
+    assert isinstance(response.headers["X-Response-Obs"], str)
+    assert (b"X-Response-Obs", b"\x80\xff") in response.headers.raw
+
+
+@pytest.mark.asyncio
 async def test_parses_chunked_response_body() -> None:
     wire = (
         b"HTTP/1.1 200 OK\r\n"

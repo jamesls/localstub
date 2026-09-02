@@ -11,6 +11,7 @@ import httpx
 import pytest
 import trustme
 
+from localstub.http.headers import Headers
 from localstub.middleware import ResponderContext
 from localstub.server import (
     AsyncHTTPTestServer,
@@ -1688,7 +1689,12 @@ async def test_forward_reuses_tunnel_when_transformer_rewrites_body():
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         await reader.readuntil(b"\r\n\r\n")
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"X-Obs: \x80\xff\r\n"
+            b"Content-Length: 5\r\n\r\n"
+            b"hello"
+        )
         await writer.drain()
         writer.close()
         try:
@@ -1723,6 +1729,7 @@ async def test_forward_reuses_tunnel_when_transformer_rewrites_body():
                         reader.readuntil(b"\r\n\r\n"), timeout=1.0
                     )
                     assert headers.startswith(b"HTTP/1.1 200")
+                    assert b"X-Obs: \x80\xff\r\n" in headers
                     body = await asyncio.wait_for(
                         reader.readexactly(5), timeout=1.0
                     )
@@ -2902,7 +2909,10 @@ async def test_forward_transformer_override_response():
             override_response=HTTPResponse.text(
                 "Service Unavailable",
                 status=503,
-                headers={"Content-Type": "text/plain"},
+                headers=Headers.from_raw_items([
+                    (b"Content-Type", b"text/plain"),
+                    (b"X-Obs", b"\x80\xff"),
+                ]),
             )
         )
 
@@ -2938,6 +2948,10 @@ async def test_forward_transformer_override_response():
         # Should receive the overridden response
         assert response.status_code == 503
         assert response.text == "Service Unavailable"
+        assert any(
+            name.lower() == b"x-obs" and value == b"\x80\xff"
+            for name, value in response.headers.raw
+        )
 
         # The recorded response should contain the original upstream response
         recorded = await proxy.next_response(timeout=1.0)

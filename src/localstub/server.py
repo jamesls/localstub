@@ -17,6 +17,7 @@ from localstub.forward import RawForwarder, response_allows_keep_alive
 from localstub.http.client import HTTPClient
 from localstub.http.connection import should_close_connection
 from localstub.http.exchange import RecordedExchange
+from localstub.http.headers import HeaderItem
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequestHeaders,
@@ -28,6 +29,7 @@ from localstub.http.responsespec import HeadersLike, HTTPResponse
 from localstub.http.utils import (
     headers_to_headers,
     maybe_await,
+    serialize_header_line,
     status_phrase,
 )
 from localstub.middleware import (
@@ -110,12 +112,12 @@ def _default_throttle_key(_: RecordedHTTPRequest) -> str:
 @lru_cache(maxsize=128)
 def _serialize_response_head(
     status: int,
-    headers: tuple[tuple[str, str], ...],
+    headers: tuple[HeaderItem, ...],
 ) -> bytes:
     reason = status_phrase(status, "UNKNOWN")
     head = bytearray(f"HTTP/1.1 {status} {reason}\r\n".encode("ascii"))
     for name, value in headers:
-        head.extend(f"{name}: {value}\r\n".encode("ascii"))
+        head.extend(serialize_header_line(name, value))
     head.extend(b"\r\n")
     return bytes(head)
 
@@ -1332,8 +1334,7 @@ class AsyncHTTPTestServer:
         headers = self._build_response_headers(response, body, False)
 
         for name, value in headers:
-            header_line = f"{name}: {value}\r\n".encode("ascii")
-            writer.write(header_line)
+            writer.write(serialize_header_line(name, value))
 
         writer.write(b"\r\n")
         if not is_informational and body:
@@ -1360,7 +1361,7 @@ class AsyncHTTPTestServer:
         response: HTTPResponse,
         body: bytes,
         should_close: bool,
-    ) -> tuple[tuple[str, str], ...]:
+    ) -> tuple[HeaderItem, ...]:
         """Build the complete response header items, in order."""
         items = list(response.headers.items())
         header_names = {name.lower() for name, _ in items}

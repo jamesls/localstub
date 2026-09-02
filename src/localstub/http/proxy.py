@@ -12,6 +12,7 @@ from localstub.http.headers import Headers
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.uri import ParsedURI
+from localstub.http.utils import serialize_header_line
 
 LOG = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ def build_origin_form_request(
     else:
         version = f"HTTP/{version_value}"
 
-    lines = [f"{method} {path} {version}"]
+    head = bytearray(f"{method} {path} {version}\r\n".encode("ascii"))
 
     hop_by_hop = {
         "proxy-connection",
@@ -64,18 +65,18 @@ def build_origin_form_request(
     for name, value in recorded.headers.items():
         name_lower = name.lower()
         if name_lower == "host":
-            lines.append(f"Host: {authority}")
+            head.extend(serialize_header_line("Host", authority))
             host_added = True
         elif name_lower in remove_headers:
             continue
         else:
-            lines.append(f"{name}: {value}")
+            head.extend(serialize_header_line(name, value))
 
     if not host_added:
-        lines.append(f"Host: {authority}")
+        head.extend(serialize_header_line("Host", authority))
 
-    header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n\r\n"
-    return header_bytes + recorded.wire_body_bytes
+    head.extend(b"\r\n")
+    return bytes(head) + recorded.wire_body_bytes
 
 
 async def forward_proxy_request(

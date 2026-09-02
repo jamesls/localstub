@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pytest
+from hypothesis import given
 
 from localstub.http.client import HTTPClientError
 from localstub.http.headers import Headers
@@ -12,6 +13,7 @@ from localstub.http.proxy import (
 )
 from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.http.responsespec import HTTPResponse
+from tests.unit.http.strategies import obs_text_value
 
 
 @dataclass
@@ -171,6 +173,26 @@ def test_build_origin_form_request_preserves_wire_body_framing() -> None:
 
     assert origin_wire.startswith(b"POST /upload HTTP/1.1\r\n")
     assert origin_wire.endswith(b"\r\n\r\n" + chunked_body)
+
+
+@given(value=obs_text_value())
+def test_build_origin_form_request_preserves_obs_text_header(
+    value: bytes,
+) -> None:
+    request = _proxy_request("http://example.com/path")
+    request = request.with_headers(
+        Headers.from_raw_items([
+            *request.headers.raw,
+            (b"X-Obs", value),
+        ])
+    )
+    uri = request.target_uri
+
+    assert uri is not None
+
+    wire = build_origin_form_request(request, uri)
+
+    assert b"X-Obs: " + value + b"\r\n" in wire
 
 
 @pytest.mark.parametrize(

@@ -25,10 +25,12 @@ def maybe_await[T](value: T | Awaitable[T]) -> Awaitable[T]:
 
 
 def headers_to_headers(headers: list[tuple[bytes, bytes]]) -> Headers:
-    return Headers.from_items(
-        (name.decode("iso-8859-1"), value.decode("iso-8859-1"))
-        for name, value in headers
-    )
+    return Headers.from_raw_items(headers)
+
+
+def serialize_header_line(name: str, value: str) -> bytes:
+    """Serialize a header from the reversible string facade."""
+    return name.encode("ascii") + b": " + value.encode("latin-1") + b"\r\n"
 
 
 def status_phrase(
@@ -54,10 +56,7 @@ def decode_status_text(
 
 
 def message_from_items(items: Iterable[tuple[str, str]]) -> Message:
-    """Build an email.message.Message from decoded header pairs.
-
-    Used for response recording/compatibility. Requests use Headers instead.
-    """
+    """Build an email.message.Message from decoded header pairs."""
     msg = Message()
     for name, value in items:
         msg[name] = value
@@ -65,8 +64,5 @@ def message_from_items(items: Iterable[tuple[str, str]]) -> Message:
 
 
 def headers_to_message(headers: list[tuple[bytes, bytes]]) -> Message:
-    """Convert parsed headers to email.message.Message."""
-    return message_from_items(
-        (name.decode("iso-8859-1"), value.decode("iso-8859-1"))
-        for name, value in headers
-    )
+    """Convert parsed headers through the reversible string facade."""
+    return message_from_items(headers_to_headers(headers).items())

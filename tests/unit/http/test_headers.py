@@ -5,6 +5,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from localstub.http.headers import HeaderItem, Headers
+from tests.unit.http.strategies import obs_text_value
 
 
 def test_headers_are_immutable() -> None:
@@ -55,6 +56,120 @@ def test_headers_not_equal_to_other_types() -> None:
     headers = Headers.from_items([("X-Test", "a")])
 
     assert headers != [("X-Test", "a")]
+
+
+@given(values=st.lists(obs_text_value(), min_size=1, max_size=4))
+def test_headers_obs_text_raw_and_string_views_round_trip(
+    values: list[bytes],
+) -> None:
+    raw = tuple((b"X-Obs", value) for value in values)
+    headers = Headers.from_raw_items(raw)
+    decoded = [value.decode("latin-1") for value in values]
+
+    assert headers.raw == raw
+    assert headers.get_all("x-obs") == decoded
+    assert headers["X-OBS"] == decoded[0]
+    assert list(headers.items()) == [("X-Obs", value) for value in decoded]
+    assert Headers.from_items(headers.items()).raw == raw
+
+
+@given(original=obs_text_value(), replacement=obs_text_value())
+def test_headers_patch_set_preserves_obs_text_bytes(
+    original: bytes,
+    replacement: bytes,
+) -> None:
+    headers = Headers.from_raw_items([
+        (b"X-Obs", original),
+        (b"X-Keep", b"unchanged"),
+        (b"x-obs", original),
+    ])
+
+    patched = headers.patch_set({
+        "x-OBS": replacement.decode("latin-1"),
+    })
+
+    assert headers.raw == (
+        (b"X-Obs", original),
+        (b"X-Keep", b"unchanged"),
+        (b"x-obs", original),
+    )
+    assert patched.raw == (
+        (b"X-Keep", b"unchanged"),
+        (b"x-OBS", replacement),
+    )
+    assert patched["X-Obs"] == replacement.decode("latin-1")
+
+
+def test_headers_get_with_non_ascii_name_returns_default() -> None:
+    headers = Headers.from_items([("X-Test", "a")])
+
+    assert headers.get("\u00e9") is None
+    assert headers.get("\u00e9", "fallback") == "fallback"
+
+
+def test_headers_get_all_with_non_ascii_name_returns_failobj() -> None:
+    headers = Headers.from_items([("X-Test", "a")])
+
+    assert headers.get_all("\u00e9") is None
+    assert headers.get_all("\u00e9", []) == []
+
+
+def test_headers_contains_with_non_ascii_name_is_false() -> None:
+    headers = Headers.from_items([("X-Test", "a")])
+
+    assert "\u00e9" not in headers
+
+
+def test_headers_getitem_with_non_ascii_name_raises_key_error() -> None:
+    headers = Headers.from_items([("X-Test", "a")])
+
+    with pytest.raises(KeyError):
+        headers["\u00e9"]
+
+
+def test_headers_patched_lookup_with_non_ascii_name_returns_default() -> None:
+    headers = Headers.from_items([("X-Test", "a")])
+    patched = headers.patch_set({"X-Other": "b"})
+
+    assert patched.get("\u00e9") is None
+    assert "\u00e9" not in patched
+
+
+def test_headers_from_items_with_non_ascii_name_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="header name must be ASCII"):
+        Headers.from_items([("X-\u00e9", "a")])
+
+
+def test_headers_from_items_with_non_latin1_value_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="Latin-1 range"):
+        Headers.from_items([("X-Test", "\u2192")])
+
+
+def test_headers_from_raw_items_with_non_ascii_name_raises_value_error() -> (
+    None
+):
+    with pytest.raises(ValueError, match="header name must be ASCII"):
+        Headers.from_raw_items([(b"X-\xe9", b"a")])
+
+
+def test_headers_from_raw_items_accepts_any_value_bytes() -> None:
+    headers = Headers.from_raw_items([(b"X-Test", bytes(range(0x100)))])
+
+    assert headers.raw == ((b"X-Test", bytes(range(0x100))),)
+
+
+def test_headers_patch_set_with_non_ascii_name_raises_value_error() -> None:
+    headers = Headers.from_items([("X-Test", "a")])
+
+    with pytest.raises(ValueError, match="header name must be ASCII"):
+        headers.patch_set({"X-\u00e9": "a"})
+
+
+def test_headers_patch_set_with_non_latin1_value_raises_value_error() -> None:
+    headers = Headers.from_items([("X-Test", "a")])
+
+    with pytest.raises(ValueError, match="Latin-1 range"):
+        headers.patch_set({"X-Test": "\u2192"})
 
 
 _HEADER_NAMES = st.text(alphabet="abAB-", min_size=1, max_size=4)

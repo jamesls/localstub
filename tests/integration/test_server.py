@@ -6,6 +6,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.middleware import (
     ResponderContext,
@@ -1221,6 +1222,31 @@ async def send_raw_request(host, port, data):
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_server_preserves_obs_text_headers(server):
+    obs_text = bytes(range(0x80, 0x100))
+    server.set_raw_response(
+        b"",
+        headers=Headers.from_raw_items([
+            (b"X-Response-Obs", obs_text),
+        ]),
+    )
+
+    response = await send_raw_request(
+        server.host,
+        server.port,
+        b"GET / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"X-Request-Obs: " + obs_text + b"\r\n"
+        b"\r\n",
+    )
+
+    assert b"X-Response-Obs: " + obs_text + b"\r\n" in response
+    assert server.last_request is not None
+    assert isinstance(server.last_request.headers["X-Request-Obs"], str)
+    assert (b"X-Request-Obs", obs_text) in server.last_request.headers.raw
 
 
 @pytest.mark.asyncio

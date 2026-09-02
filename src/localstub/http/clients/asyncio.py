@@ -9,7 +9,7 @@ from localstub.http.request import HTTPRequest
 from localstub.http.response import AsyncMultiResponseParser
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.uri import ParsedURI
-from localstub.http.utils import headers_to_headers
+from localstub.http.utils import headers_to_headers, serialize_header_line
 
 LOG = logging.getLogger(__name__)
 
@@ -23,17 +23,18 @@ def _serialize_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
     Host and Content-Length are generated here; the caller guarantees
     the request headers are already free of them (adapter contract).
     """
-    lines = [
-        f"{request.method} {uri.path or '/'} HTTP/1.1",
-        f"Host: {uri.authority}",
-    ]
+    head = bytearray(
+        f"{request.method} {uri.path or '/'} HTTP/1.1\r\n".encode("ascii")
+    )
+    head.extend(serialize_header_line("Host", uri.authority))
     for name, value in request.headers.items():
-        lines.append(f"{name}: {value}")
+        head.extend(serialize_header_line(name, value))
     if request.body is not None:
-        lines.append(f"Content-Length: {len(request.body)}")
-    lines.append("Connection: close")
-    head = "\r\n".join(lines).encode("latin-1") + b"\r\n\r\n"
-    return head + (request.body or b"")
+        head.extend(
+            serialize_header_line("Content-Length", str(len(request.body)))
+        )
+    head.extend(b"Connection: close\r\n\r\n")
+    return bytes(head) + (request.body or b"")
 
 
 class AsyncioClient:
