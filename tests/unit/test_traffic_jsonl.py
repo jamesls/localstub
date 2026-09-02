@@ -224,8 +224,17 @@ def test_dump_server_traffic_jsonl_rejects_negative_start() -> None:
         dump_server_traffic_jsonl(server, io.StringIO(), start=-1)
 
 
+_FIELD_NAME_CHARS = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+)
+_FIELD_VALUE_CHARS = "\t" + "".join(
+    chr(value) for value in (*range(0x20, 0x7F), *range(0x80, 0x100))
+)
 _HEADERS = st.lists(
-    st.tuples(st.text(min_size=1, max_size=8), st.text(max_size=8)),
+    st.tuples(
+        st.text(alphabet=_FIELD_NAME_CHARS, min_size=1, max_size=8),
+        st.text(alphabet=_FIELD_VALUE_CHARS, max_size=8),
+    ),
     max_size=4,
 ).map(Headers.from_items)
 _BODIES = st.one_of(

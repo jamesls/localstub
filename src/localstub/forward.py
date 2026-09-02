@@ -36,6 +36,7 @@ from localstub.http.utils import (
     decode_status_text,
     headers_to_message,
     maybe_await,
+    serialize_header_line,
     status_phrase,
 )
 
@@ -680,7 +681,9 @@ class RawForwarder:
         version = parsed.http_version or "1.1"
         status_code = parsed.status_code or 200
         status_text = decode_status_text(parsed.status_text, "OK")
-        lines = [f"HTTP/{version} {status_code} {status_text}"]
+        head = bytearray(
+            f"HTTP/{version} {status_code} {status_text}\r\n".encode("ascii")
+        )
 
         skip_headers = {
             b"content-length",
@@ -690,19 +693,17 @@ class RawForwarder:
         for name, value in parsed.headers:
             if name.lower() in skip_headers:
                 continue
-            header_name = name.decode("ascii", errors="replace")
-            header_value = value.decode("ascii", errors="replace")
-            lines.append(f"{header_name}: {header_value}")
+            head.extend(name + b": " + value + b"\r\n")
 
-        lines.append(f"Content-Length: {len(new_body)}")
-        lines.append("")
-        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n"
-        return header_bytes + new_body
+        head.extend(f"Content-Length: {len(new_body)}\r\n\r\n".encode("ascii"))
+        return bytes(head) + new_body
 
     def _build_override_wire_bytes(self, response: HTTPResponse) -> bytes:
         reason = status_phrase(response.status, "UNKNOWN")
 
-        lines = [f"HTTP/1.1 {response.status} {reason}"]
+        head = bytearray(
+            f"HTTP/1.1 {response.status} {reason}\r\n".encode("ascii")
+        )
 
         if isinstance(response.body, str):
             body = response.body.encode("utf-8")
@@ -714,11 +715,10 @@ class RawForwarder:
             items.append(("Content-Length", str(len(body))))
 
         for name, value in items:
-            lines.append(f"{name}: {value}")
+            head.extend(serialize_header_line(name, value))
 
-        lines.append("")
-        header_bytes = "\r\n".join(lines).encode("ascii") + b"\r\n"
-        return header_bytes + body
+        head.extend(b"\r\n")
+        return bytes(head) + body
 
     def _build_wire_bytes_for_result(
         self,

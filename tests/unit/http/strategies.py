@@ -50,6 +50,15 @@ def header_items() -> st.SearchStrategy[list[tuple[str, str]]]:
     return st.lists(header_item(), max_size=4)
 
 
+def obs_text_value() -> st.SearchStrategy[bytes]:
+    """A non-empty field value containing only RFC 9110 obs-text octets."""
+    return st.lists(
+        st.integers(min_value=0x80, max_value=0xFF),
+        min_size=1,
+        max_size=32,
+    ).map(bytes)
+
+
 @st.composite
 def chunked_bodies(draw: st.DrawFn) -> ChunkedBody:
     def chunk_size_line(size: int) -> bytes:
