@@ -37,11 +37,11 @@ def test_token_bucket_allows_burst_then_refills():
 
     allowed, retry_after = bucket.try_acquire()
     assert allowed
-    assert retry_after == 0.0
+    assert retry_after == pytest.approx(0.0)
 
     allowed, retry_after = bucket.try_acquire()
     assert allowed
-    assert retry_after == 0.0
+    assert retry_after == pytest.approx(0.0)
 
     allowed, retry_after = bucket.try_acquire()
     assert not allowed
@@ -50,7 +50,7 @@ def test_token_bucket_allows_burst_then_refills():
     clock.advance(0.5)
     allowed, retry_after = bucket.try_acquire()
     assert allowed
-    assert retry_after == 0.0
+    assert retry_after == pytest.approx(0.0)
 
 
 def test_monotonic_clock_now_returns_float():
@@ -106,8 +106,8 @@ def test_token_bucket_throttler_default_burst_for_low_rate_is_one():
         key=lambda request: "global",
         clock=clock,
     )
-    assert throttler.burst == 1.0
-    assert throttler.rate_per_second == 0.5
+    assert throttler.burst == pytest.approx(1.0)
+    assert throttler.rate_per_second == pytest.approx(0.5)
 
     req = _recorded("GET", "/")
     assert throttler.check(req).allowed
@@ -223,13 +223,13 @@ def test_token_bucket_denied_acquire_succeeds_after_retry_after(
             continue
         allowed, retry_after = bucket.try_acquire(amount)
         if allowed:
-            assert retry_after == 0.0
+            assert retry_after == pytest.approx(0.0)
             continue
         assert retry_after > 0.0
         clock.advance(retry_after + _RETRY_SLACK)
         retried, second_retry_after = bucket.try_acquire(amount)
         assert retried
-        assert second_retry_after == 0.0
+        assert second_retry_after == pytest.approx(0.0)
 
 
 @given(scenario=_bucket_scenarios())
@@ -268,7 +268,7 @@ def test_token_bucket_retry_after_at_most_full_refill_wait(
             continue
         allowed, retry_after = bucket.try_acquire(amount)
         if allowed:
-            assert retry_after == 0.0
+            assert retry_after == pytest.approx(0.0)
             continue
         assert retry_after > 0.0
         assert retry_after <= amount / rate * (1.0 + 1e-9) + 1e-9
@@ -293,7 +293,7 @@ def test_token_bucket_throttler_denied_check_succeeds_after_retry_after(
         clock.advance(delta)
         decision = throttler.check(request)
         if decision.allowed:
-            assert decision.retry_after_seconds == 0.0
+            assert decision.retry_after_seconds == pytest.approx(0.0)
             continue
         assert decision.retry_after_seconds > 0.0
         clock.advance(decision.retry_after_seconds + _RETRY_SLACK)

@@ -199,9 +199,9 @@ class BuiltinMiddlewares:
     """
 
     def __init__(self) -> None:
-        self._slots: dict[SlotName, ResponderMiddleware | None] = {
-            name: None for name in _SLOT_ORDER
-        }
+        self._slots: dict[SlotName, ResponderMiddleware | None] = (
+            dict.fromkeys(_SLOT_ORDER)
+        )
 
     def set(self, name: SlotName, middleware: ResponderMiddleware) -> None:
         self._slots[name] = middleware

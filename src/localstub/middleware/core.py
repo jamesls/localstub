@@ -65,7 +65,7 @@ class ResponderContext:
         method: str | None = None,
         target: str | None = None,
         headers: Mapping[str, str] | None = None,
-        body: bytes | None | _Unset = _UNSET,
+        body: bytes | _Unset | None = _UNSET,
     ) -> ResponderContext:
         """Return a copy of this context with request fields replaced.
 

@@ -159,7 +159,7 @@ class TestFromDirectory:
         cert_path = ca_dir / "ca.pem"
         cert_path.write_text("surviving cert")
 
-        with pytest.raises(ValueError, match="ca.pem but no .key file"):
+        with pytest.raises(ValueError, match=r"ca\.pem but no \.key file"):
             TLSProxyCA.from_directory(ca_dir)
 
         assert cert_path.read_text() == "surviving cert"
@@ -171,7 +171,7 @@ class TestFromDirectory:
         key_path = ca_dir / "ca.key"
         key_path.write_text("surviving key")
 
-        with pytest.raises(ValueError, match="ca.key but no .pem file"):
+        with pytest.raises(ValueError, match=r"ca\.key but no \.pem file"):
             TLSProxyCA.from_directory(ca_dir)
 
         assert key_path.read_text() == "surviving key"
@@ -184,7 +184,7 @@ class TestFromDirectory:
         (ca_dir / "second.pem").write_text("dummy")
         (ca_dir / "ca.key").write_text("dummy")
 
-        with pytest.raises(ValueError, match="Multiple .pem files"):
+        with pytest.raises(ValueError, match=r"Multiple \.pem files"):
             TLSProxyCA.from_directory(ca_dir)
 
     def test_raises_error_for_multiple_key_files(self, tmp_path: Path) -> None:
@@ -194,5 +194,5 @@ class TestFromDirectory:
         (ca_dir / "first.key").write_text("dummy")
         (ca_dir / "second.key").write_text("dummy")
 
-        with pytest.raises(ValueError, match="Multiple .key files"):
+        with pytest.raises(ValueError, match=r"Multiple \.key files"):
             TLSProxyCA.from_directory(ca_dir)

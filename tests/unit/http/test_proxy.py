@@ -326,7 +326,7 @@ async def test_forward_proxy_request_strips_dynamic_response_headers() -> None:
 
     response = await forward_proxy_request(client, recorded)
 
-    names = {name.lower() for name, _ in response.headers.items()}
+    names = {header[0].lower() for header in response.headers.items()}
     assert "connection" not in names
     assert "x-hop" not in names
     assert "transfer-encoding" not in names

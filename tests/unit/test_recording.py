@@ -213,7 +213,7 @@ def test_record_request_returns_injected_timestamps() -> None:
     recorder = _recorder(clock_value=5.5)
     wall, monotonic = recorder.record_request(_request())
     assert wall == _WALL_TIME
-    assert monotonic == 5.5
+    assert monotonic == pytest.approx(5.5)
 
 
 def test_record_request_updates_history_and_last_request() -> None:
@@ -245,8 +245,8 @@ def test_get_request_timestamp_returns_recorded_monotonic_time() -> None:
     clock.value = 2.0
     second = _request("/b")
     recorder.record_request(second)
-    assert recorder.get_request_timestamp(first) == 1.0
-    assert recorder.get_request_timestamp(second) == 2.0
+    assert recorder.get_request_timestamp(first) == pytest.approx(1.0)
+    assert recorder.get_request_timestamp(second) == pytest.approx(2.0)
 
 
 def test_get_request_timestamp_for_unknown_request_raises_value_error() -> (
@@ -268,7 +268,7 @@ def test_record_request_beyond_buffer_evicts_oldest() -> None:
     assert recorder.dropped_requests == 1
     with pytest.raises(ValueError, match="not found"):
         recorder.get_request_timestamp(first)
-    assert recorder.get_request_timestamp(second) == 0.0
+    assert recorder.get_request_timestamp(second) == pytest.approx(0.0)
 
 
 def test_record_exchange_with_response_records_exchange_and_response() -> None:

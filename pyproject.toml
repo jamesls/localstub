@@ -75,7 +75,10 @@ packages = ["src/localstub"]
 line-length = 79
 
 [tool.ruff.lint]
-extend-select = ["C901", "PLR0915", "E501", "SLF001"]
+preview = true
+extend-select = [
+  "E4", "E7", "E9", "F", "C901", "PLR0915", "E501", "SLF001", "PLC2701"
+]
 
 [tool.ruff.format]
 quote-style = "preserve"

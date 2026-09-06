@@ -2119,8 +2119,12 @@ async def test_request_timestamps_with_manual_clock():
             clock.advance(0.5)
             await client.get(server.url)
 
-        assert server.get_request_timestamp(server.requests[0]) == 1000.0
-        assert server.get_request_timestamp(server.requests[1]) == 1000.5
+        assert server.get_request_timestamp(
+            server.requests[0]
+        ) == pytest.approx(1000.0)
+        assert server.get_request_timestamp(
+            server.requests[1]
+        ) == pytest.approx(1000.5)
 
 
 @pytest.mark.asyncio
