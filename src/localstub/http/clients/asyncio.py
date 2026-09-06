@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Self
 
 from localstub.forward import open_upstream_connection
 from localstub.http.client import HTTPClientError
+from localstub.http.clients.pool import (
+    DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_MAX_CONNECTIONS_PER_ORIGIN,
+    DEFAULT_MAX_IDLE_CONNECTIONS,
+    ConnectionPool,
+    Origin,
+    PooledConnection,
+)
+from localstub.http.connection import response_allows_reuse
 from localstub.http.request import HTTPRequest
-from localstub.http.response import AsyncMultiResponseParser
+from localstub.http.response import AsyncMultiResponseParser, ParsedResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.uri import ParsedURI
 from localstub.http.utils import headers_to_headers, serialize_header_line
@@ -22,6 +32,7 @@ def _serialize_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
 
     Host and Content-Length are generated here; the caller guarantees
     the request headers are already free of them (adapter contract).
+    No Connection header is sent: HTTP/1.1 persistence is the default.
     """
     head = bytearray(
         f"{request.method} {uri.path or '/'} HTTP/1.1\r\n".encode("ascii")
@@ -33,8 +44,16 @@ def _serialize_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
         head.extend(
             serialize_header_line("Content-Length", str(len(request.body)))
         )
-    head.extend(b"Connection: close\r\n\r\n")
+    head.extend(b"\r\n")
     return bytes(head) + (request.body or b"")
+
+
+def _to_http_response(parsed: ParsedResponse) -> HTTPResponse:
+    return HTTPResponse(
+        status=parsed.status_code or 0,
+        headers=headers_to_headers(parsed.headers),
+        body=parsed.body,
+    )
 
 
 class AsyncioClient:
@@ -44,8 +63,12 @@ class AsyncioClient:
     connections with truststore-verified TLS and the httptools-backed
     response parser.  No third-party HTTP client library.
 
-    One TCP (+TLS) handshake per ``send()``; no connection pooling,
-    redirects, retries, cookies, or content decoding.
+    Upstream connections are pooled per origin and reused across
+    sequential ``send()`` calls; a connection is closed on any error,
+    timeout, or ambiguity about its stream position.  No redirects,
+    retries, cookies, or content decoding.  ``aclose()`` (or use as an
+    async context manager) closes the pool; lifecycle belongs to
+    whoever constructed the client.
     """
 
     def __init__(
@@ -55,11 +78,31 @@ class AsyncioClient:
         read_timeout: float | None = DEFAULT_READ_TIMEOUT,
         verify_tls: bool = True,
         max_read: int = 8192,
+        max_connections_per_origin: int = DEFAULT_MAX_CONNECTIONS_PER_ORIGIN,
+        max_idle_connections: int = DEFAULT_MAX_IDLE_CONNECTIONS,
+        idle_timeout: float | None = DEFAULT_IDLE_TIMEOUT,
     ) -> None:
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
         self._verify_tls = verify_tls
         self._max_read = max_read
+        self._pool = ConnectionPool(
+            self._open_connection,
+            max_connections_per_origin=max_connections_per_origin,
+            max_idle_connections=max_idle_connections,
+            idle_timeout=idle_timeout,
+            parser_factory=self._create_parser,
+        )
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the connection pool and its idle connections."""
+        await self._pool.aclose()
 
     async def send(self, request: HTTPRequest) -> HTTPResponse:
         uri = request.target_uri
@@ -67,53 +110,63 @@ class AsyncioClient:
             raise HTTPClientError(
                 f"request target is not absolute-form: {request.target!r}"
             )
+        origin = Origin.from_uri(uri)
         wire = _serialize_request(request, uri)
         try:
             async with asyncio.timeout(self._connect_timeout):
-                reader, writer = await open_upstream_connection(
-                    uri.host,
-                    uri.port,
-                    use_tls=uri.scheme == "https",
-                    verify=self._verify_tls,
-                )
+                connection = await self._pool.acquire(origin)
         except (TimeoutError, OSError) as exc:
             raise HTTPClientError(
                 f"failed to connect to {uri.host}:{uri.port}: {exc}"
             ) from exc
 
+        reusable = False
         try:
             async with asyncio.timeout(self._read_timeout):
-                writer.write(wire)
-                await writer.drain()
-                return await self._read_final_response(reader, request.method)
+                connection.writer.write(wire)
+                await connection.writer.drain()
+                parsed = await self._read_final_response(
+                    connection, request.method
+                )
+            reusable = (
+                response_allows_reuse(parsed)
+                and not connection.parser.has_buffered_data
+            )
+            return _to_http_response(parsed)
         except (TimeoutError, OSError) as exc:
             raise HTTPClientError(
                 f"exchange with {uri.host}:{uri.port} failed: {exc}"
             ) from exc
         finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:  # pragma: no cover - close/reset race
-                LOG.debug("Failed to close upstream writer", exc_info=True)
+            await self._pool.release(connection, reusable=reusable)
+
+    async def _open_connection(
+        self, origin: Origin
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return await open_upstream_connection(
+            origin.host,
+            origin.port,
+            use_tls=origin.scheme == "https",
+            verify=self._verify_tls,
+        )
+
+    def _create_parser(self) -> AsyncMultiResponseParser:
+        return AsyncMultiResponseParser(max_read=self._max_read)
 
     async def _read_final_response(
         self,
-        reader: asyncio.StreamReader,
+        connection: PooledConnection,
         request_method: str,
-    ) -> HTTPResponse:
-        parser = AsyncMultiResponseParser(max_read=self._max_read)
+    ) -> ParsedResponse:
         while True:
-            parsed, _ = await parser.next_response(reader, request_method)
+            parsed, _ = await connection.parser.next_response(
+                connection.reader, request_method
+            )
             if parsed is None:
                 raise HTTPClientError("failed to parse upstream response")
             status = parsed.status_code or 0
             if status >= 200:
-                return HTTPResponse(
-                    status=status,
-                    headers=headers_to_headers(parsed.headers),
-                    body=parsed.body,
-                )
+                return parsed
             LOG.debug(
                 "Skipping 1xx informational response (%d) while "
                 "waiting for the final response",

@@ -33,9 +33,15 @@ class HTTPClient(Protocol):
     6. Upstream TLS is verified by default using system trust.
     7. The adapter never closes an injected backend client.  Lifecycle
        belongs to whoever constructed it.
+    8. ``aclose()`` releases every resource the client holds (pooled
+       connections, sessions).  Whoever constructed the client calls
+       it; it is safe to call more than once, and a client holding no
+       resources implements it as a no-op.
     """
 
     async def send(self, request: HTTPRequest) -> HTTPResponse: ...
+
+    async def aclose(self) -> None: ...
 
 
 class HTTPClientError(Exception):

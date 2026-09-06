@@ -61,14 +61,13 @@ def _unused_port() -> int:
 async def test_get_exchange_against_test_server() -> None:
     async with AsyncHTTPTestServer() as server:
         server.set_json_response({"ok": True})
-        client = AsyncioClient()
-
-        response = await client.send(
-            HTTPRequest(
-                method="GET",
-                target=f"http://{server.host}:{server.port}/items?x=1",
+        async with AsyncioClient() as client:
+            response = await client.send(
+                HTTPRequest(
+                    method="GET",
+                    target=f"http://{server.host}:{server.port}/items?x=1",
+                )
             )
-        )
 
         assert response.status == 200
         assert isinstance(response.body, bytes)
@@ -84,17 +83,17 @@ async def test_get_exchange_against_test_server() -> None:
 async def test_post_body_gets_content_length_framing() -> None:
     async with AsyncHTTPTestServer() as server:
         server.set_json_response({})
-        client = AsyncioClient()
         body = b"hello upstream"
 
-        response = await client.send(
-            HTTPRequest(
-                method="POST",
-                target=f"http://{server.host}:{server.port}/upload",
-                headers=Headers.from_items([("X-Custom", "value")]),
-                body=body,
+        async with AsyncioClient() as client:
+            response = await client.send(
+                HTTPRequest(
+                    method="POST",
+                    target=f"http://{server.host}:{server.port}/upload",
+                    headers=Headers.from_items([("X-Custom", "value")]),
+                    body=body,
+                )
             )
-        )
 
         assert response.status == 200
         assert server.last_request is not None
@@ -131,6 +130,23 @@ async def test_preserves_obs_text_request_and_response_headers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_request_carries_no_connection_header() -> None:
+    async with AsyncHTTPTestServer() as server:
+        server.set_json_response({})
+
+        async with AsyncioClient() as client:
+            await client.send(
+                HTTPRequest(
+                    method="GET",
+                    target=f"http://{server.host}:{server.port}/",
+                )
+            )
+
+        assert server.last_request is not None
+        assert "Connection" not in server.last_request.headers
+
+
+@pytest.mark.asyncio
 async def test_parses_chunked_response_body() -> None:
     wire = (
         b"HTTP/1.1 200 OK\r\n"
@@ -138,9 +154,7 @@ async def test_parses_chunked_response_body() -> None:
         b"\r\n"
         b"4\r\nwiki\r\n5\r\npedia\r\n0\r\n\r\n"
     )
-    async with OneShotServer(wire) as upstream:
-        client = AsyncioClient()
-
+    async with OneShotServer(wire) as upstream, AsyncioClient() as client:
         response = await client.send(
             HTTPRequest(
                 method="GET",
@@ -155,9 +169,7 @@ async def test_parses_chunked_response_body() -> None:
 @pytest.mark.asyncio
 async def test_parses_close_delimited_response_body() -> None:
     wire = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nuntil close"
-    async with OneShotServer(wire) as upstream:
-        client = AsyncioClient()
-
+    async with OneShotServer(wire) as upstream, AsyncioClient() as client:
         response = await client.send(
             HTTPRequest(
                 method="GET",
@@ -172,9 +184,10 @@ async def test_parses_close_delimited_response_body() -> None:
 @pytest.mark.asyncio
 async def test_head_response_with_content_length_does_not_hang() -> None:
     wire = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
-    async with OneShotServer(wire) as upstream:
-        client = AsyncioClient(read_timeout=5.0)
-
+    async with (
+        OneShotServer(wire) as upstream,
+        AsyncioClient(read_timeout=5.0) as client,
+    ):
         response = await client.send(
             HTTPRequest(
                 method="HEAD",
@@ -196,9 +209,7 @@ async def test_preserves_duplicate_response_headers() -> None:
         b"Content-Length: 0\r\n"
         b"\r\n"
     )
-    async with OneShotServer(wire) as upstream:
-        client = AsyncioClient()
-
+    async with OneShotServer(wire) as upstream, AsyncioClient() as client:
         response = await client.send(
             HTTPRequest(
                 method="GET",
@@ -218,9 +229,7 @@ async def test_skips_interim_responses_until_final() -> None:
         b"\r\n"
         b"done"
     )
-    async with OneShotServer(wire) as upstream:
-        client = AsyncioClient()
-
+    async with OneShotServer(wire) as upstream, AsyncioClient() as client:
         response = await client.send(
             HTTPRequest(
                 method="POST",
@@ -247,13 +256,15 @@ async def test_read_timeout_raises_client_error() -> None:
         _accept_silently, "127.0.0.1", 0
     )
     port = silent_server.sockets[0].getsockname()[1]
-    client = AsyncioClient(read_timeout=0.05)
 
     try:
-        with pytest.raises(HTTPClientError) as exc_info:
-            await client.send(
-                HTTPRequest(method="GET", target=f"http://127.0.0.1:{port}/")
-            )
+        async with AsyncioClient(read_timeout=0.05) as client:
+            with pytest.raises(HTTPClientError) as exc_info:
+                await client.send(
+                    HTTPRequest(
+                        method="GET", target=f"http://127.0.0.1:{port}/"
+                    )
+                )
     finally:
         for writer in accepted:
             writer.close()
@@ -266,31 +277,31 @@ async def test_read_timeout_raises_client_error() -> None:
 @pytest.mark.asyncio
 async def test_connection_refused_raises_client_error() -> None:
     port = _unused_port()
-    client = AsyncioClient()
 
-    with pytest.raises(HTTPClientError) as exc_info:
-        await client.send(
-            HTTPRequest(method="GET", target=f"http://127.0.0.1:{port}/")
-        )
+    async with AsyncioClient() as client:
+        with pytest.raises(HTTPClientError) as exc_info:
+            await client.send(
+                HTTPRequest(method="GET", target=f"http://127.0.0.1:{port}/")
+            )
 
     assert f"failed to connect to 127.0.0.1:{port}" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_non_absolute_target_raises_client_error() -> None:
-    client = AsyncioClient()
-
-    with pytest.raises(HTTPClientError) as exc_info:
-        await client.send(HTTPRequest(method="GET", target="/relative"))
+    async with AsyncioClient() as client:
+        with pytest.raises(HTTPClientError) as exc_info:
+            await client.send(HTTPRequest(method="GET", target="/relative"))
 
     assert "not absolute-form" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_unparseable_response_raises_client_error() -> None:
-    async with OneShotServer(b"not http at all\r\n\r\n") as upstream:
-        client = AsyncioClient()
-
+    async with (
+        OneShotServer(b"not http at all\r\n\r\n") as upstream,
+        AsyncioClient() as client,
+    ):
         with pytest.raises(HTTPClientError) as exc_info:
             await client.send(
                 HTTPRequest(
@@ -300,3 +311,25 @@ async def test_unparseable_response_raises_client_error() -> None:
             )
 
     assert "failed to parse upstream response" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_send_after_aclose_raises_runtime_error() -> None:
+    client = AsyncioClient()
+    await client.aclose()
+
+    with pytest.raises(RuntimeError):
+        await client.send(
+            HTTPRequest(method="GET", target="http://127.0.0.1:1/")
+        )
+
+
+@pytest.mark.asyncio
+async def test_context_manager_closes_client() -> None:
+    async with AsyncioClient() as client:
+        pass
+
+    with pytest.raises(RuntimeError):
+        await client.send(
+            HTTPRequest(method="GET", target="http://127.0.0.1:1/")
+        )

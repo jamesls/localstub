@@ -4,6 +4,7 @@ from email.message import Message
 
 from localstub.http.headers import Headers
 from localstub.http.request import RecordedHTTPRequest
+from localstub.http.response import ParsedResponse
 
 
 def parse_connection_tokens(value: str) -> set[str]:
@@ -41,6 +42,27 @@ def _is_http10(request: RecordedHTTPRequest) -> bool:
 
 def _is_http11(request: RecordedHTTPRequest) -> bool:
     return request.http_version == "1.1"
+
+
+def response_allows_reuse(parsed: ParsedResponse) -> bool:
+    """Return whether the connection may carry another request.
+
+    The client-side sibling of ``should_close_connection``.  Reuse is
+    ruled out by an incomplete or close-delimited response, a non-1.1
+    HTTP version (HTTP/1.0 keep-alive is never reused), a
+    ``Connection: close`` token, or a 101 protocol switch.
+    """
+    if not parsed.is_complete or parsed.is_eof_delimited:
+        return False
+    if parsed.http_version != "1.1":
+        return False
+    if parsed.status_code == 101:
+        return False
+    tokens: set[str] = set()
+    for name, value in parsed.headers:
+        if name.lower() == b"connection":
+            tokens |= parse_connection_tokens(value.decode("latin-1"))
+    return "close" not in tokens
 
 
 def should_close_connection(

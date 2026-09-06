@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
+from localstub.http.clients.asyncio import AsyncioClient
 from localstub.middleware import ResponderContext
 from localstub.recording import TrafficRecorder
 from localstub.server import (
@@ -24,6 +25,13 @@ def test_server_url_raises_when_not_started() -> None:
     server = AsyncHTTPTestServer()
     with pytest.raises(RuntimeError, match="Server not started yet"):
         _ = server.url
+
+
+def test_forward_proxy_with_injected_client_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        AsyncHTTPTestServer(
+            forward_proxy=True, upstream_client=AsyncioClient()
+        )
 
 
 def test_server_handler_getter() -> None:

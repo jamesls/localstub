@@ -15,6 +15,7 @@ from typing import (
 
 from localstub.forward import RawForwarder, response_allows_keep_alive
 from localstub.http.client import HTTPClient
+from localstub.http.clients.asyncio import AsyncioClient
 from localstub.http.connection import should_close_connection
 from localstub.http.exchange import RecordedExchange
 from localstub.http.headers import HeaderItem
@@ -411,6 +412,10 @@ class AsyncHTTPTestServer:
       * `wire_raw_bytes` contains the *exact* bytes received, including
         chunked framing and trailers.
       * configurable static response, or plug in responder middleware.
+      * HTTP forward proxying: ``forward_proxy=True`` gives the server
+        its own ``AsyncioClient``, closed when the server closes.
+        ``upstream_client=`` injects a client you constructed; the
+        server never closes an injected client.
     """
 
     def __init__(
@@ -427,12 +432,17 @@ class AsyncHTTPTestServer:
         recording_buffer_size: int | None = DEFAULT_RECORDING_BUFFER_SIZE,
         recorder: TrafficRecorder | None = None,
         *,
+        forward_proxy: bool = False,
         max_connection_bytes: int | None = DEFAULT_MAX_CONNECTION_BYTES,
     ) -> None:
         if max_connection_bytes is not None and max_connection_bytes < 0:
             raise ValueError(
                 "max_connection_bytes must be non-negative or None, "
                 f"got {max_connection_bytes}"
+            )
+        if forward_proxy and upstream_client is not None:
+            raise ValueError(
+                "pass either forward_proxy=True or upstream_client, not both"
             )
         self._host = host
         self._port = port
@@ -447,6 +457,12 @@ class AsyncHTTPTestServer:
         )
         self.router = Router()
         self._on_headers_received = on_headers_received
+        self._owned_upstream_client_factory: (
+            Callable[[], HTTPClient] | None
+        ) = None
+        if forward_proxy:
+            self._owned_upstream_client_factory = AsyncioClient
+            upstream_client = self._owned_upstream_client_factory()
         self._upstream_client = upstream_client
         self._raw_forwarder = raw_forwarder
 
@@ -791,6 +807,7 @@ class AsyncHTTPTestServer:
         if self._server is not None:
             return
 
+        self._ensure_owned_upstream_client()
         self._closing = False
         self._server = await asyncio.start_server(
             self._client_connected,
@@ -804,6 +821,7 @@ class AsyncHTTPTestServer:
     async def aclose(self) -> None:
         server = self._server
         if server is None:
+            await self._close_owned_upstream_client()
             return
         self._closing = True
         cancelled: asyncio.CancelledError | None = None
@@ -838,9 +856,31 @@ class AsyncHTTPTestServer:
             if self._server is server:
                 self._server = None
             self._closing = False
+            await self._close_owned_upstream_client()
 
         if cancelled is not None:
             raise cancelled
+
+    def _ensure_owned_upstream_client(self) -> None:
+        factory = self._owned_upstream_client_factory
+        if factory is None or self._upstream_client is not None:
+            return
+        client = factory()
+        self._upstream_client = client
+        self._builtins.set("proxy", ForwardProxyMiddleware(client))
+
+    async def _close_owned_upstream_client(self) -> None:
+        if self._owned_upstream_client_factory is None:
+            return
+        client = self._upstream_client
+        if client is None:
+            return
+        try:
+            await client.aclose()
+        finally:
+            if self._upstream_client is client:
+                self._upstream_client = None
+                self._builtins.clear("proxy")
 
     async def __aenter__(self) -> Self:
         await self.start()

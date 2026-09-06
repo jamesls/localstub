@@ -4,6 +4,8 @@ import asyncio
 import gzip
 import socket
 import struct
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -14,6 +16,55 @@ from localstub.forward import RawForwarder
 from localstub.http.clients.asyncio import AsyncioClient
 from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
 from localstub.server import AsyncHTTPTestServer, HTTPResponse
+
+
+@asynccontextmanager
+async def _keepalive_upstream() -> AsyncIterator[
+    tuple[str, int, asyncio.Event]
+]:
+    # Serves one keep-alive response per connection, then blocks until
+    # the client closes its end, setting the event on EOF.
+    eof_seen = asyncio.Event()
+
+    async def handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        await reader.read()
+        eof_seen.set()
+        writer.close()
+
+    upstream = await asyncio.start_server(handler, "127.0.0.1", 0)
+    assert upstream.sockets
+    addr = upstream.sockets[0].getsockname()
+    try:
+        yield addr[0], addr[1], eof_seen
+    finally:
+        upstream.close()
+        await upstream.wait_closed()
+
+
+async def _send_proxy_request(
+    proxy: AsyncHTTPTestServer, host: str, port: int
+) -> None:
+    reader, writer = await asyncio.open_connection(proxy.host, proxy.port)
+    try:
+        request = (
+            f"GET http://{host}:{port}/ HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode()
+        writer.write(request)
+        await writer.drain()
+        response = await _read_http_response_bytes(reader)
+        assert b"200 OK" in response
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 
 def _parse_response_headers(header_bytes: bytes) -> dict[bytes, bytes]:
@@ -288,7 +339,7 @@ class TestProxyForwarding:
             )
 
             async with (
-                AsyncHTTPTestServer(upstream_client=AsyncioClient()) as proxy,
+                AsyncHTTPTestServer(forward_proxy=True) as proxy,
                 httpx.AsyncClient(proxy=proxy.url) as downstream_client,
             ):
                 response = await downstream_client.get(
@@ -302,9 +353,7 @@ class TestProxyForwarding:
     async def test_forwards_to_upstream_with_forwarder(
         self, upstream_server: AsyncHTTPTestServer
     ) -> None:
-        async with AsyncHTTPTestServer(
-            upstream_client=AsyncioClient()
-        ) as proxy:
+        async with AsyncHTTPTestServer(forward_proxy=True) as proxy:
             # Send request through the proxy
             reader, writer = await asyncio.open_connection(
                 proxy.host, proxy.port
@@ -367,9 +416,7 @@ class TestProxyForwarding:
 
         try:
             body = b"\xff\xfe\xfd\x00abc"
-            async with AsyncHTTPTestServer(
-                upstream_client=AsyncioClient()
-            ) as proxy:
+            async with AsyncHTTPTestServer(forward_proxy=True) as proxy:
                 reader, writer = await asyncio.open_connection(
                     proxy.host, proxy.port
                 )
@@ -427,9 +474,7 @@ class TestProxyForwarding:
     async def test_response_sequence_overrides_forwarding(
         self, upstream_server: AsyncHTTPTestServer
     ) -> None:
-        async with AsyncHTTPTestServer(
-            upstream_client=AsyncioClient()
-        ) as proxy:
+        async with AsyncHTTPTestServer(forward_proxy=True) as proxy:
             # Set a response sequence
             proxy.set_response_sequence([
                 HTTPResponse.json({"sequence": 1}),
@@ -461,9 +506,7 @@ class TestProxyForwarding:
     async def test_origin_form_not_forwarded(
         self, upstream_server: AsyncHTTPTestServer
     ) -> None:
-        async with AsyncHTTPTestServer(
-            upstream_client=AsyncioClient()
-        ) as proxy:
+        async with AsyncHTTPTestServer(forward_proxy=True) as proxy:
             proxy.set_json_response({"local": True})
 
             reader, writer = await asyncio.open_connection(
@@ -486,6 +529,70 @@ class TestProxyForwarding:
             finally:
                 writer.close()
                 await writer.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_aclose_closes_owned_upstream_client(self) -> None:
+        async with _keepalive_upstream() as (host, port, eof_seen):
+            proxy = AsyncHTTPTestServer(forward_proxy=True)
+            await proxy.start()
+            try:
+                await _send_proxy_request(proxy, host, port)
+                # The pooled upstream connection stays open after the
+                # downstream client disconnects.
+                assert not eof_seen.is_set()
+            finally:
+                await proxy.aclose()
+            async with asyncio.timeout(1.0):
+                await eof_seen.wait()
+            # Closing again after the owned client is closed is safe.
+            await proxy.aclose()
+
+    @pytest.mark.asyncio
+    async def test_owned_forward_proxy_starts_after_early_aclose(self) -> None:
+        async with _keepalive_upstream() as (host, port, _):
+            proxy = AsyncHTTPTestServer(forward_proxy=True)
+            await proxy.aclose()
+
+            try:
+                await proxy.start()
+                async with asyncio.timeout(1.0):
+                    await _send_proxy_request(proxy, host, port)
+            finally:
+                await proxy.aclose()
+
+    @pytest.mark.asyncio
+    async def test_owned_forward_proxy_restarts_after_aclose(self) -> None:
+        async with _keepalive_upstream() as (host, port, _):
+            proxy = AsyncHTTPTestServer(forward_proxy=True)
+            try:
+                await proxy.start()
+                async with asyncio.timeout(1.0):
+                    await _send_proxy_request(proxy, host, port)
+                await proxy.aclose()
+
+                await proxy.start()
+                async with asyncio.timeout(1.0):
+                    await _send_proxy_request(proxy, host, port)
+            finally:
+                await proxy.aclose()
+
+    @pytest.mark.asyncio
+    async def test_aclose_does_not_close_injected_upstream_client(
+        self,
+    ) -> None:
+        async with _keepalive_upstream() as (host, port, eof_seen):
+            client = AsyncioClient()
+            try:
+                async with AsyncHTTPTestServer(
+                    upstream_client=client
+                ) as proxy:
+                    await _send_proxy_request(proxy, host, port)
+                await asyncio.sleep(0.1)
+                assert not eof_seen.is_set()
+            finally:
+                await client.aclose()
+            async with asyncio.timeout(1.0):
+                await eof_seen.wait()
 
 
 class TestRawForwarding:

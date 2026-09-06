@@ -18,8 +18,6 @@ from localstub.ca import TLSProxyCA
 from localstub.config import load_config
 from localstub.console import console
 from localstub.handlers import handle_expect_header
-from localstub.http.client import HTTPClient
-from localstub.http.clients.asyncio import AsyncioClient
 from localstub.http.exchange import RecordedExchange
 from localstub.http.utils import maybe_await
 from localstub.server import AsyncHTTPTestServer
@@ -176,22 +174,16 @@ async def run_proxy(args: argparse.Namespace) -> None:
 
 async def run_http_proxy(args: argparse.Namespace) -> None:
     """Start and run the HTTP forward proxy."""
-    # Create an upstream client if not in record-only mode (config file
-    # provided)
-    upstream_client: HTTPClient | None = None
-    mode_label: str
-    if args.config_file:
-        # Record mode: no upstream client, use configured responses
-        mode_label = "record"
-    else:
-        # Forward mode: forward to upstream
-        upstream_client = AsyncioClient()
-        mode_label = "forward"
+    # Forward to upstream unless a config file provides canned
+    # responses (record mode).  The server owns the upstream client it
+    # constructs and closes it on aclose().
+    forward_proxy = not args.config_file
+    mode_label = "forward" if forward_proxy else "record"
 
     server = AsyncHTTPTestServer(
         port=args.port,
         on_headers_received=handle_expect_header,
-        upstream_client=upstream_client,
+        forward_proxy=forward_proxy,
     )
 
     # Configure responses if config file provided
