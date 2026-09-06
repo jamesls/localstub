@@ -111,6 +111,8 @@ exclude_also = [
 ]
 
 [tool.pyright]
+typeCheckingMode = "strict"
+reportUnknownMemberType = false
 include = ["src", "docs/examples"]
 exclude = ["**/__pycache__"]
 

@@ -81,7 +81,7 @@ def should_close_connection(
     request_tokens = connection_tokens_from_headers(request.headers)
 
     if response_headers is None:
-        response_tokens = set()
+        response_tokens: set[str] = set()
     elif isinstance(response_headers, dict):
         response_tokens = _connection_tokens_from_dict(response_headers)
     else:

@@ -33,6 +33,16 @@ class Writer(Protocol):
     def get_extra_info(self, name: str, default: Any | None = None) -> Any: ...
 
 
+def client_address(writer: Writer) -> tuple[str, int] | None:
+    """Extract the client ``(host, port)`` from a writer's peername."""
+    peer: tuple[object, ...] | str | None = writer.get_extra_info("peername")
+    match peer:
+        case (str() as host, int() as port, *_):
+            return (host, port)
+        case _:
+            return None
+
+
 _FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
 
 
@@ -190,9 +200,7 @@ class RecordedHTTPRequest:
             else ""
         )
         if client is None and writer is not None:
-            peer = writer.get_extra_info("peername")
-            if isinstance(peer, tuple) and len(peer) >= 2:
-                client = (peer[0], peer[1])
+            client = client_address(writer)
 
         request = HTTPRequest(
             method=parsed.method or "",
@@ -285,8 +293,10 @@ class ParsedRequest:
     method: str | None = None
     url: bytes | None = None
     http_version: str | None = None
-    headers: list[tuple[bytes, bytes]] = field(default_factory=list)
-    body_parts: list[bytes] = field(default_factory=list)
+    headers: list[tuple[bytes, bytes]] = field(
+        default_factory=list[tuple[bytes, bytes]]
+    )
+    body_parts: list[bytes] = field(default_factory=list[bytes])
     is_complete: bool = False
     headers_complete: bool = False
 

@@ -21,6 +21,7 @@ from .core import (
     compose_headers,
     compose_responder,
     compose_sender,
+    ensure_response_spec,
 )
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     'compose_headers',
     'compose_responder',
     'compose_sender',
+    'ensure_response_spec',
 ]

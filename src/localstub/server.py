@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
+from types import TracebackType
 from typing import (
     Any,
     Protocol,
@@ -24,6 +25,7 @@ from localstub.http.request import (
     HTTPRequestHeaders,
     ParsedRequest,
     RecordedHTTPRequest,
+    client_address,
 )
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HeadersLike, HTTPResponse
@@ -51,6 +53,7 @@ from localstub.middleware import (
     compose_headers,
     compose_responder,
     compose_sender,
+    ensure_response_spec,
 )
 from localstub.middleware.builtins import (
     BuiltinMiddlewares,
@@ -886,7 +889,12 @@ class AsyncHTTPTestServer:
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         await self.aclose()
 
     @property
@@ -1040,6 +1048,7 @@ class AsyncHTTPTestServer:
         request: RecordedHTTPRequest,
         response: ResponseSpec,
     ) -> SendResult:
+        response = ensure_response_spec(response)
         writer = recording_writer
         writer.start_response()
 
@@ -1066,11 +1075,6 @@ class AsyncHTTPTestServer:
             return SendResult(
                 recorded=recorded,
                 should_close=not response_allows_keep_alive(request, result),
-            )
-
-        if not isinstance(response, HTTPResponse):
-            raise TypeError(
-                f"Unhandled response spec: {type(response).__name__}"
             )
 
         should_close = await self._write_response(
@@ -1383,10 +1387,7 @@ class AsyncHTTPTestServer:
 
     def _extract_client_info(self, writer: Writer) -> tuple[str, int] | None:
         """Extract client (host, port) from the writer's peername."""
-        peer = writer.get_extra_info("peername")
-        if isinstance(peer, tuple) and len(peer) >= 2:
-            return (peer[0], peer[1])
-        return None
+        return client_address(writer)
 
     def _normalize_body(self, body_obj: bytes | str | None) -> bytes:
         """Normalize response body to bytes."""

@@ -59,8 +59,10 @@ class ParsedResponse:
     status_code: int | None = None
     status_text: bytes | None = None
     http_version: str | None = None
-    headers: list[tuple[bytes, bytes]] = field(default_factory=list)
-    body_parts: list[bytes] = field(default_factory=list)
+    headers: list[tuple[bytes, bytes]] = field(
+        default_factory=list[tuple[bytes, bytes]]
+    )
+    body_parts: list[bytes] = field(default_factory=list[bytes])
     is_complete: bool = False
     is_eof_delimited: bool = False
 

@@ -5,7 +5,7 @@ import asyncio
 import json
 import logging
 import signal
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Protocol, TextIO
@@ -361,7 +361,7 @@ async def _process_traffic(
 async def _process_traffic_until_source_closes(
     source: _TrafficSource,
     output_file: TrafficOutput | None,
-) -> AsyncIterator[None]:
+) -> AsyncGenerator[None]:
     source_stopped = asyncio.Event()
     traffic_task = asyncio.create_task(
         _process_traffic(source, output_file, source_stopped)

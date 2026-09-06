@@ -5,6 +5,7 @@ import logging
 import ssl
 from asyncio import transports
 from datetime import datetime
+from types import TracebackType
 from typing import TYPE_CHECKING, Self, cast
 
 from rich.markup import escape as rich_escape
@@ -64,14 +65,14 @@ def _hexdump(data: bytes, bytes_per_line: int = 32) -> str:
     Returns:
         Formatted hexdump string with Rich markup for consistent coloring.
     """
-    lines = []
+    lines: list[str] = []
     # Calculate width for hex part: pairs * 4 chars + (pairs - 1) spaces
     num_pairs = bytes_per_line // 2
     hex_width = num_pairs * 4 + (num_pairs - 1)
     for offset in range(0, len(data), bytes_per_line):
         chunk = data[offset : offset + bytes_per_line]
         # Build hex pairs
-        hex_pairs = []
+        hex_pairs: list[str] = []
         for i in range(0, len(chunk), 2):
             pair = chunk[i : i + 2]
             hex_pairs.append(pair.hex())
@@ -122,9 +123,7 @@ class TLSStreamReaderProtocol(asyncio.StreamReaderProtocol):
         self._reader_ref = stream_reader
 
     def eof_received(self) -> bool:
-        reader = self._reader_ref
-        if reader is not None:
-            reader.feed_eof()
+        self._reader_ref.feed_eof()
         return False
 
 
@@ -302,7 +301,12 @@ class AsyncTLSInterceptProxy:
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         await self.aclose()
 
     async def _handle_client(
@@ -492,10 +496,6 @@ class AsyncTLSInterceptProxy:
         ssl_context = self._ca.issue_context(host)
 
         transport = writer.transport
-        if transport is None:
-            raise RuntimeError(
-                "Stream transport unavailable during TLS upgrade"
-            )
 
         tls_reader = asyncio.StreamReader()
         tls_protocol = TLSStreamReaderProtocol(tls_reader)
