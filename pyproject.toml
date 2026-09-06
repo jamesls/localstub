@@ -85,7 +85,11 @@ quote-style = "preserve"
 preview = true
 
 [tool.pytest.ini_options]
+asyncio_debug = true
+filterwarnings = ["error"]
 addopts = """\
+    --strict-markers \
+    --strict-config \
     --cov localstub \
     --cov-report term-missing \
     --no-cov-on-fail \

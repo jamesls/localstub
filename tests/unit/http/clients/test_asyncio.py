@@ -111,9 +111,7 @@ async def test_preserves_obs_text_request_and_response_headers() -> None:
         b"Content-Length: 0\r\n"
         b"\r\n"
     )
-    async with OneShotServer(wire) as upstream:
-        client = AsyncioClient()
-
+    async with OneShotServer(wire) as upstream, AsyncioClient() as client:
         response = await client.send(
             HTTPRequest(
                 method="GET",

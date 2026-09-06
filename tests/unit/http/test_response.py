@@ -627,13 +627,14 @@ async def _parse_with_multi_parser(
     return await parser.next_response(_fragment_reader(fragments))
 
 
+@pytest.mark.asyncio
 @given(case=_fragmented_response_cases())
-def test_single_and_multi_response_parsers_agree_on_any_fragmentation(
+async def test_single_and_multi_response_parsers_agree_on_any_fragmentation(
     case: tuple[bytes, str, list[bytes]],
 ) -> None:
     encoded, mode, fragments = case
-    single, single_wire = asyncio.run(_parse_with_single_parser(fragments))
-    multi, multi_wire = asyncio.run(_parse_with_multi_parser(fragments))
+    single, single_wire = await _parse_with_single_parser(fragments)
+    multi, multi_wire = await _parse_with_multi_parser(fragments)
 
     assert single is not None
     assert multi is not None
@@ -679,11 +680,12 @@ async def _check_pipelined_response_case(
     assert not parser.has_buffered_data
 
 
+@pytest.mark.asyncio
 @given(case=_pipelined_response_cases())
-def test_multi_response_parser_preserves_pipelined_response_fragmentation(
+async def test_multi_parser_preserves_pipelined_response_fragmentation(
     case: tuple[bytes, bytes, list[bytes]],
 ) -> None:
-    asyncio.run(_check_pipelined_response_case(*case))
+    await _check_pipelined_response_case(*case)
 
 
 def test_multi_response_parser_has_no_buffered_data_initially() -> None:

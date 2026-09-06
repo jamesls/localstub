@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
 
 import pytest
+import pytest_asyncio
 
 from localstub.http.stream import read, take_unread_data, unread_data
 
 
-@pytest.fixture
-def reader() -> Iterator[asyncio.StreamReader]:
-    with asyncio.Runner():
-        yield asyncio.StreamReader()
+@pytest_asyncio.fixture
+async def reader() -> asyncio.StreamReader:
+    return asyncio.StreamReader()
 
 
 def test_take_unread_data_without_unread_returns_empty(

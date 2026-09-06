@@ -1534,17 +1534,20 @@ async def _parse_request_sequence(
     return outcomes, take_unread_data(reader)
 
 
+@pytest.mark.asyncio
 @given(case=_fragmented_request_cases())
-def test_parser_with_any_fragmentation_matches_one_shot_parse(
+async def test_parser_with_any_fragmentation_matches_one_shot_parse(
     case: tuple[bytes, list[bytes]],
 ) -> None:
     encoded, fragments = case
-    one_shot, one_shot_wire, one_shot_leftover = asyncio.run(
-        _parse_one_request([encoded])
-    )
-    fragmented, fragmented_wire, fragmented_leftover = asyncio.run(
-        _parse_one_request(fragments)
-    )
+    one_shot, one_shot_wire, one_shot_leftover = await _parse_one_request([
+        encoded
+    ])
+    (
+        fragmented,
+        fragmented_wire,
+        fragmented_leftover,
+    ) = await _parse_one_request(fragments)
 
     assert one_shot is not None
     assert fragmented is not None
@@ -1561,13 +1564,14 @@ def test_parser_with_any_fragmentation_matches_one_shot_parse(
     assert fragmented_leftover == b""
 
 
+@pytest.mark.asyncio
 @given(case=_pipelined_request_cases())
-def test_parser_pipelined_stream_preserves_per_request_wire_bytes(
+async def test_parser_pipelined_stream_preserves_per_request_wire_bytes(
     case: tuple[list[bytes], list[bytes]],
 ) -> None:
     requests, fragments = case
-    outcomes, leftover = asyncio.run(
-        _parse_request_sequence(len(requests), fragments)
+    outcomes, leftover = await _parse_request_sequence(
+        len(requests), fragments
     )
 
     for (parsed, wire), encoded in zip(outcomes, requests, strict=True):
