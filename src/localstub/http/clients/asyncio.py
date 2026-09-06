@@ -4,7 +4,6 @@ import asyncio
 import logging
 from typing import Self
 
-from localstub.forward import open_upstream_connection
 from localstub.http.client import HTTPClientError
 from localstub.http.clients.pool import (
     DEFAULT_IDLE_TIMEOUT,
@@ -18,6 +17,7 @@ from localstub.http.connection import response_allows_reuse
 from localstub.http.request import HTTPRequest
 from localstub.http.response import AsyncMultiResponseParser, ParsedResponse
 from localstub.http.responsespec import HTTPResponse
+from localstub.http.upstream import open_upstream_connection
 from localstub.http.uri import ParsedURI
 from localstub.http.utils import headers_to_headers, serialize_header_line
 

@@ -1,20 +1,11 @@
 from __future__ import annotations
 
-import time
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import Protocol
 
+from localstub.clock import Clock, MonotonicClock
 from localstub.http.request import RecordedHTTPRequest
-
-
-class Clock(Protocol):
-    def now(self) -> float: ...
-
-
-class MonotonicClock:
-    def now(self) -> float:
-        return time.monotonic()
 
 
 @dataclass(frozen=True)

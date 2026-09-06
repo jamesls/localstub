@@ -58,10 +58,8 @@ from localstub.middleware import (
 from localstub.middleware.builtins import (
     BuiltinMiddlewares,
     ForwardProxyMiddleware,
-    HandlerMiddleware,
     RawForwardProxyMiddleware,
     ResponseSequenceMiddleware,
-    RouterMiddleware,
     ThrottleMiddleware,
     ThrottleResponseFunc,
     default_throttle_response,
@@ -72,7 +70,12 @@ from localstub.recording import (
     BoundedByteBuffer,
     TrafficRecorder,
 )
-from localstub.router import ResponderHandler, Router
+from localstub.router import (
+    HandlerMiddleware,
+    ResponderHandler,
+    Router,
+    RouterMiddleware,
+)
 from localstub.throttle import (
     Clock,
     MonotonicClock,

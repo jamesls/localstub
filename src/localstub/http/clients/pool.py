@@ -16,9 +16,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from localstub.clock import Clock, MonotonicClock
 from localstub.http.response import AsyncMultiResponseParser
 from localstub.http.uri import ParsedURI
-from localstub.throttle import Clock, MonotonicClock
 
 LOG = logging.getLogger(__name__)
 

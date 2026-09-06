@@ -6,12 +6,12 @@ from datetime import UTC, datetime
 from enum import Enum, auto
 from typing import Any, Protocol
 
+from localstub.clock import Clock, MonotonicClock
 from localstub.forward import RawForwarder
 from localstub.http.request import HTTPRequestHeaders, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.utils import maybe_await
-from localstub.throttle import Clock, MonotonicClock
 
 
 class _Unset(Enum):
