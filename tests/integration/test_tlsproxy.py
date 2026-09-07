@@ -147,6 +147,17 @@ def test_proxy_address_raises_before_start():
 
 
 @pytest.mark.asyncio
+async def test_proxy_endpoint_url_matches_bound_address() -> None:
+    proxy = AsyncTLSInterceptProxy()
+    with pytest.raises(RuntimeError):
+        _ = proxy.endpoint_url
+
+    async with proxy:
+        host, port = proxy.address
+        assert proxy.endpoint_url == f"http://{host}:{port}"
+
+
+@pytest.mark.asyncio
 async def test_next_request_and_response_timeout_raise():
     proxy = AsyncTLSInterceptProxy()
 
