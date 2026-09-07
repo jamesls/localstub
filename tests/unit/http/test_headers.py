@@ -123,8 +123,10 @@ def test_headers_contains_with_non_ascii_name_is_false() -> None:
 def test_headers_getitem_with_non_ascii_name_raises_key_error() -> None:
     headers = Headers.from_items([("X-Test", "a")])
 
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError) as exc:
         headers["\u00e9"]
+
+    assert exc.value.args == ("\u00e9",)
 
 
 def test_headers_patched_lookup_with_non_ascii_name_returns_default() -> None:
