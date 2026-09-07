@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.utils import maybe_await
-from localstub.middleware import ResponderContext, ResponseSpec
+from localstub.middleware import (
+    ResponderContext,
+    ResponderNext,
+    ResponseSpec,
+    ensure_response_spec,
+)
 
 ResponderHandler = Callable[
     [ResponderContext],
@@ -16,7 +21,7 @@ ResponderHandler = Callable[
 @dataclass
 class Router:
     _routes: dict[tuple[str, str], ResponderHandler] = field(
-        default_factory=dict
+        default_factory=dict[tuple[str, str], ResponderHandler]
     )
 
     @property
@@ -37,7 +42,34 @@ class Router:
         handler = self.match(ctx.request)
         if handler is None:
             return None
-        resolved: ResponseSpec | None = await maybe_await(handler(ctx))
-        if resolved is None:
-            raise TypeError("Unhandled response spec: NoneType")
-        return resolved
+        return ensure_response_spec(await maybe_await(handler(ctx)))
+
+
+@dataclass
+class RouterMiddleware:
+    router: Router
+
+    async def __call__(
+        self,
+        ctx: ResponderContext,
+        call_next: ResponderNext,
+    ) -> ResponseSpec:
+        result = await self.router.handle(ctx)
+        if result is None:
+            return await call_next()
+        return result
+
+
+@dataclass
+class HandlerMiddleware:
+    get_handler: Callable[[], ResponderHandler | None]
+
+    async def __call__(
+        self,
+        ctx: ResponderContext,
+        call_next: ResponderNext,
+    ) -> ResponseSpec:
+        handler = self.get_handler()
+        if handler is None:
+            return await call_next()
+        return await maybe_await(handler(ctx))

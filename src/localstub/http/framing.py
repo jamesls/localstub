@@ -121,7 +121,7 @@ def chunk_payloads(buffer: bytearray) -> list[bytes]:
         chunk_data_end = chunk_data_start + chunk_size
         if chunk_data_end + 2 > len(buffer):
             return payloads
-        if buffer[chunk_data_end : chunk_data_end + 2] != CRLF:
+        if not buffer.startswith(CRLF, chunk_data_end):
             raise ChunkScanError(chunk_data_end + 1)
 
         payloads.append(bytes(buffer[chunk_data_start:chunk_data_end]))
@@ -147,7 +147,7 @@ def scan_chunked_body(
         chunk_size, chunk_data_start = chunk_size_line
 
         if chunk_size == 0:
-            if buffer[chunk_data_start : chunk_data_start + 2] == CRLF:
+            if buffer.startswith(CRLF, chunk_data_start):
                 end = chunk_data_start + 2
                 return ChunkScanResult(end=end, resume_from=end)
             trailer_end = buffer.find(HEADER_TERMINATOR, chunk_data_start)
@@ -159,7 +159,7 @@ def scan_chunked_body(
         chunk_data_end = chunk_data_start + chunk_size
         if chunk_data_end + 2 > len(buffer):
             return ChunkScanResult(end=None, resume_from=index)
-        if buffer[chunk_data_end : chunk_data_end + 2] != CRLF:
+        if not buffer.startswith(CRLF, chunk_data_end):
             mismatch = chunk_data_end
             while mismatch < len(buffer) and mismatch < chunk_data_end + 2:
                 expected = (

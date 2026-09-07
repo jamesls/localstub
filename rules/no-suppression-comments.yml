@@ -1,0 +1,7 @@
+id: no-suppression-comments
+language: python
+severity: error
+message: Suppression comments are forbidden; fix the underlying issue.
+rule:
+  kind: comment
+  regex: '#\s*(type:\s*ignore\b|(?i:noqa)\b|(?i:ruff|flake8):\s*(?i:noqa)\b)'

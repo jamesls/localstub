@@ -204,11 +204,12 @@ async def _check_release_history(
         writer.close.assert_called_once()
 
 
+@pytest.mark.asyncio
 @given(history=_release_histories())
-def test_pool_retains_newest_connections_for_arbitrary_release_histories(
+async def test_pool_retains_newest_connections_for_arbitrary_release_histories(
     history: tuple[list[int], list[int], int],
 ) -> None:
-    asyncio.run(_check_release_history(*history))
+    await _check_release_history(*history)
 
 
 async def _check_expiration_history(
@@ -273,6 +274,7 @@ async def _check_expiration_history(
         writer.close.assert_called_once()
 
 
+@pytest.mark.asyncio
 @given(
     origin_indexes=st.lists(
         st.integers(min_value=0, max_value=len(ORIGINS) - 1),
@@ -286,19 +288,17 @@ async def _check_expiration_history(
         max_value=len(ORIGINS) - 1,
     ),
 )
-def test_pool_expires_exactly_connections_past_timeout(
+async def test_pool_expires_exactly_connections_past_timeout(
     origin_indexes: list[int],
     idle_timeout: int,
     advance: int,
     trigger_origin_index: int,
 ) -> None:
-    asyncio.run(
-        _check_expiration_history(
-            origin_indexes,
-            idle_timeout,
-            advance,
-            trigger_origin_index,
-        )
+    await _check_expiration_history(
+        origin_indexes,
+        idle_timeout,
+        advance,
+        trigger_origin_index,
     )
 
 

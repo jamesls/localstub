@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 import httptools
 
@@ -21,9 +21,6 @@ from localstub.http.headers import HeaderItem, Headers
 from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_headers
 
-if TYPE_CHECKING:
-    from localstub.recording import BoundedByteBuffer
-
 LOG = logging.getLogger(__name__)
 
 
@@ -31,6 +28,26 @@ class Writer(Protocol):
     """Minimal StreamWriter interface for extracting client info."""
 
     def get_extra_info(self, name: str, default: Any | None = None) -> Any: ...
+
+
+class WireSink(Protocol):
+    """Anything that can accumulate raw wire bytes.
+
+    Satisfied by ``bytearray`` and by bounded buffers that own their
+    retention policy.  The parser only ever appends to it.
+    """
+
+    def extend(self, data: bytes | bytearray) -> None: ...
+
+
+def client_address(writer: Writer) -> tuple[str, int] | None:
+    """Extract the client ``(host, port)`` from a writer's peername."""
+    peer: tuple[object, ...] | str | None = writer.get_extra_info("peername")
+    match peer:
+        case (str() as host, int() as port, *_):
+            return (host, port)
+        case _:
+            return None
 
 
 _FRAMING_HEADERS = frozenset({"content-length", "transfer-encoding"})
@@ -190,9 +207,7 @@ class RecordedHTTPRequest:
             else ""
         )
         if client is None and writer is not None:
-            peer = writer.get_extra_info("peername")
-            if isinstance(peer, tuple) and len(peer) >= 2:
-                client = (peer[0], peer[1])
+            client = client_address(writer)
 
         request = HTTPRequest(
             method=parsed.method or "",
@@ -285,8 +300,10 @@ class ParsedRequest:
     method: str | None = None
     url: bytes | None = None
     http_version: str | None = None
-    headers: list[tuple[bytes, bytes]] = field(default_factory=list)
-    body_parts: list[bytes] = field(default_factory=list)
+    headers: list[tuple[bytes, bytes]] = field(
+        default_factory=list[tuple[bytes, bytes]]
+    )
+    body_parts: list[bytes] = field(default_factory=list[bytes])
     is_complete: bool = False
     headers_complete: bool = False
 
@@ -393,7 +410,7 @@ class AsyncRequestParser:
     async def parse(
         self,
         reader: asyncio.StreamReader,
-        connection_wire: bytearray | BoundedByteBuffer | None = None,
+        connection_wire: WireSink | None = None,
     ) -> tuple[ParsedRequest | None, bytes]:
         """Parse a complete HTTP request from the stream.
 
@@ -438,7 +455,7 @@ class AsyncRequestParser:
     async def parse_headers(
         self,
         reader: asyncio.StreamReader,
-        connection_wire: bytearray | BoundedByteBuffer | None = None,
+        connection_wire: WireSink | None = None,
     ) -> tuple[ParsedRequest | None, bytes, bytearray]:
         """Parse request headers only, stopping before body.
 
@@ -506,7 +523,7 @@ class AsyncRequestParser:
         self,
         reader: asyncio.StreamReader,
         remaining_buffer: bytearray,
-        connection_wire: bytearray | BoundedByteBuffer | None = None,
+        connection_wire: WireSink | None = None,
     ) -> tuple[ParsedRequest | None, bytes]:
         """Continue parsing the request body after headers.
 
@@ -593,7 +610,7 @@ class AsyncRequestParser:
 
     def _sync_connection_wire(
         self,
-        connection_wire: bytearray | BoundedByteBuffer | None,
+        connection_wire: WireSink | None,
     ) -> None:
         if connection_wire is None:
             return
@@ -623,7 +640,7 @@ class AsyncRequestParser:
         reader: asyncio.StreamReader,
         buffer: bytearray,
         consumed_guess: int,
-        connection_wire: bytearray | BoundedByteBuffer | None,
+        connection_wire: WireSink | None,
     ) -> tuple[ParsedRequest | None, bytes]:
         candidate = bytes(self._wire) + bytes(buffer[:consumed_guess])
         error_offset = self._precise_error_offset(candidate)
@@ -668,7 +685,7 @@ class AsyncRequestParser:
         reader: asyncio.StreamReader,
         buffer: bytearray,
         content_length: int,
-        connection_wire: bytearray | BoundedByteBuffer | None,
+        connection_wire: WireSink | None,
     ) -> tuple[ParsedRequest | None, bytes]:
         while len(buffer) < content_length:
             has_more = await self._read_more(reader, buffer)
@@ -704,7 +721,7 @@ class AsyncRequestParser:
         self,
         reader: asyncio.StreamReader,
         buffer: bytearray,
-        connection_wire: bytearray | BoundedByteBuffer | None,
+        connection_wire: WireSink | None,
     ) -> tuple[ParsedRequest | None, bytes]:
         scan_from = 0
         while True:
@@ -763,7 +780,7 @@ class HTTPRequestReader:
         self,
         reader: asyncio.StreamReader,
         writer: Writer | None = None,
-        connection_wire: bytearray | BoundedByteBuffer | None = None,
+        connection_wire: WireSink | None = None,
     ) -> RecordedHTTPRequest | None:
         """Parse a complete HTTP request from the stream.
 

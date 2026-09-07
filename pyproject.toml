@@ -49,6 +49,7 @@ dev = [
   "ruff>=0.16.0",
   "pyright[nodejs]>=1.1.405",
   "hypothesis>=6.165.10",
+  "import-linter",
   "zensical"
 ]
 
@@ -85,7 +86,11 @@ quote-style = "preserve"
 preview = true
 
 [tool.pytest.ini_options]
+asyncio_debug = true
+filterwarnings = ["error"]
 addopts = """\
+    --strict-markers \
+    --strict-config \
     --cov localstub \
     --cov-report term-missing \
     --no-cov-on-fail \
@@ -107,6 +112,8 @@ exclude_also = [
 ]
 
 [tool.pyright]
+typeCheckingMode = "strict"
+reportUnknownMemberType = false
 include = ["src", "docs/examples"]
 exclude = ["**/__pycache__"]
 
@@ -122,6 +129,8 @@ check = [
   { cmd = "uv run ruff format --diff ." },
   { cmd = "uv run pyright" },
   { cmd = "uv run ast-grep scan ." },
+  # import-linter has no quiet mode; only show its report on failure.
+  { shell = "out=$(uv run lint-imports --no-logo 2>&1) || { printf '%s\\n' \"$out\"; exit 1; }" },
 ]
 test = "uv run pytest tests/"
 format-code = [
@@ -133,8 +142,60 @@ auto-check = [
   { cmd = "uv run ruff format ." },
   { cmd = "uv run pyright" },
   { cmd = "uv run ast-grep scan ." },
+  # import-linter has no quiet mode; only show its report on failure.
+  { shell = "out=$(uv run lint-imports --no-logo 2>&1) || { printf '%s\\n' \"$out\"; exit 1; }" },
 ]
 prcheck = ["check", "test"]
+
+[tool.importlinter]
+root_package = "localstub"
+
+[[tool.importlinter.contracts]]
+name = "Modules import downward only; siblings on a row are independent"
+type = "layers"
+containers = ["localstub"]
+layers = [
+  "cli",
+  "tlsproxy | traffic_jsonl | config | handlers",
+  "server",
+  "recording | router",
+  "middleware",
+  "forward | throttle",
+  "http",
+  "clock | ca | console",
+]
+
+[[tool.importlinter.contracts]]
+name = "localstub.http layers: headers up to clients and proxy"
+type = "layers"
+containers = ["localstub.http"]
+layers = [
+  "clients | proxy",
+  "client | connection | exchange",
+  "request | response",
+  "responsespec | framing | stream | uri | utils | upstream",
+  "headers",
+]
+
+[[tool.importlinter.contracts]]
+name = "Only the CLI may import console"
+type = "forbidden"
+source_modules = [
+  "localstub.server",
+  "localstub.tlsproxy",
+  "localstub.traffic_jsonl",
+  "localstub.config",
+  "localstub.handlers",
+  "localstub.recording",
+  "localstub.router",
+  "localstub.middleware",
+  "localstub.forward",
+  "localstub.throttle",
+  "localstub.http",
+  "localstub.clock",
+  "localstub.ca",
+]
+forbidden_modules = ["localstub.console"]
 
 # Uncomment if you want to add a CLI script.
 [project.scripts]

@@ -4,14 +4,14 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
+from localstub.clock import Clock, MonotonicClock
 from localstub.forward import RawForwarder
 from localstub.http.request import HTTPRequestHeaders, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.utils import maybe_await
-from localstub.throttle import Clock, MonotonicClock
 
 
 class _Unset(Enum):
@@ -50,7 +50,7 @@ class ResponderContext:
     request: RecordedHTTPRequest
     connection: ConnectionMeta
     services: ServerServices
-    state: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict[str, Any])
     received_monotonic: float = 0.0
 
     def with_request(
@@ -104,7 +104,7 @@ class SenderContext:
     request: RecordedHTTPRequest
     connection: ConnectionMeta
     services: ServerServices
-    state: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass(frozen=True)
@@ -118,6 +118,18 @@ class ForwardProxyResponse:
 
 
 type ResponseSpec = HTTPResponse | ForwardProxyResponse
+
+
+def ensure_response_spec(value: object) -> ResponseSpec:
+    """Validate a handler's return value at the type-system boundary.
+
+    Handlers are annotated to return a ``ResponseSpec`` but user code may
+    return anything at runtime, so the check is performed against
+    ``object`` rather than trusting the annotation.
+    """
+    if isinstance(value, HTTPResponse | ForwardProxyResponse):
+        return value
+    raise TypeError(f"Unhandled response spec: {type(value).__name__}")
 
 
 class ResponderNext(Protocol):
@@ -251,7 +263,7 @@ class HeaderContext:
     connection: ConnectionMeta
     services: ServerServices
     send: SendHeaderResponse
-    state: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 class HeaderNext(Protocol):
@@ -285,7 +297,7 @@ def compose_headers(
             index = i
 
             if i >= len(middlewares):
-                return cast(bool, await maybe_await(terminal(current_ctx)))
+                return await maybe_await(terminal(current_ctx))
 
             mw = middlewares[i]
 
@@ -296,7 +308,7 @@ def compose_headers(
                 next_ctx = current_ctx if ctx is None else ctx
                 return await dispatch(i + 1, next_ctx)
 
-            return cast(bool, await maybe_await(mw(current_ctx, call_next)))
+            return await maybe_await(mw(current_ctx, call_next))
 
         return await dispatch(0, ctx)
 

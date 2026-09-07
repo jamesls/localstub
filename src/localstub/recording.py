@@ -20,11 +20,11 @@ import logging
 from datetime import datetime
 from typing import Final
 
+from localstub.clock import Clock, MonotonicClock
 from localstub.http.exchange import RecordedExchange
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.middleware import SystemTimestampProvider, TimestampProvider
-from localstub.throttle import Clock, MonotonicClock
 
 LOG = logging.getLogger(__name__)
 

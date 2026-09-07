@@ -5,6 +5,7 @@ import logging
 import ssl
 from asyncio import transports
 from datetime import datetime
+from types import TracebackType
 from typing import TYPE_CHECKING, Self, cast
 
 from rich.markup import escape as rich_escape
@@ -64,14 +65,14 @@ def _hexdump(data: bytes, bytes_per_line: int = 32) -> str:
     Returns:
         Formatted hexdump string with Rich markup for consistent coloring.
     """
-    lines = []
+    lines: list[str] = []
     # Calculate width for hex part: pairs * 4 chars + (pairs - 1) spaces
     num_pairs = bytes_per_line // 2
     hex_width = num_pairs * 4 + (num_pairs - 1)
     for offset in range(0, len(data), bytes_per_line):
         chunk = data[offset : offset + bytes_per_line]
         # Build hex pairs
-        hex_pairs = []
+        hex_pairs: list[str] = []
         for i in range(0, len(chunk), 2):
             pair = chunk[i : i + 2]
             hex_pairs.append(pair.hex())
@@ -122,9 +123,7 @@ class TLSStreamReaderProtocol(asyncio.StreamReaderProtocol):
         self._reader_ref = stream_reader
 
     def eof_received(self) -> bool:
-        reader = self._reader_ref
-        if reader is not None:
-            reader.feed_eof()
+        self._reader_ref.feed_eof()
         return False
 
 
@@ -302,7 +301,12 @@ class AsyncTLSInterceptProxy:
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         await self.aclose()
 
     async def _handle_client(
@@ -348,17 +352,7 @@ class AsyncTLSInterceptProxy:
                     self._ca.ca_pem_path(),
                     exc,
                 )
-                try:
-                    _close_log(
-                        f"lstub --> {client_id}", "TLS handshake failed"
-                    )
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    LOG.debug(
-                        "Failed to close client writer after TLS handshake",
-                        exc_info=True,
-                    )
+                _close_log(f"lstub --> {client_id}", "TLS handshake failed")
                 return
             active_writer = self._replace_client_writer(writer, tls_writer)
 
@@ -380,32 +374,37 @@ class AsyncTLSInterceptProxy:
 
             await self._server.handle_http_connection(tls_reader, tls_writer)
         except asyncio.CancelledError:
-            try:
-                _close_log(f"lstub --> {client_id}", "task cancelled")
-                active_writer.close()
-                await active_writer.wait_closed()
-            except Exception:
-                LOG.debug(
-                    "Failed to close client writer after cancellation",
-                    exc_info=True,
-                )
+            _close_log(f"lstub --> {client_id}", "task cancelled")
+            # Cancellation must not wait for the peer's TLS shutdown reply.
+            writer.transport.abort()
             raise
         except Exception:
             # Any other exception is unexpected; keep the traceback to aid
             # debugging.
             LOG.exception("TLS proxy error")
+            _close_log(f"lstub --> {client_id}", "unexpected error")
+        finally:
             try:
-                _close_log(f"lstub --> {client_id}", "unexpected error")
                 active_writer.close()
-                await active_writer.wait_closed()
-            except Exception:
+                close_task = asyncio.create_task(active_writer.wait_closed())
+                try:
+                    # aclose() also awaits this protocol's close waiter.
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    writer.transport.abort()
+                    await asyncio.gather(close_task, return_exceptions=True)
+                    raise
+            except OSError:
                 LOG.debug(
-                    "Failed to close client writer after proxy error",
+                    "Failed to close TLS proxy client writer",
                     exc_info=True,
                 )
-        finally:
-            self._client_writers.discard(writer)
-            self._client_writers.discard(active_writer)
+            finally:
+                # Retain the original writer until TLS shutdown finishes.
+                # Close its transport if shutdown fails or is cancelled.
+                writer.close()
+                self._client_writers.discard(writer)
+                self._client_writers.discard(active_writer)
 
     def _replace_client_writer(
         self,
@@ -497,10 +496,6 @@ class AsyncTLSInterceptProxy:
         ssl_context = self._ca.issue_context(host)
 
         transport = writer.transport
-        if transport is None:
-            raise RuntimeError(
-                "Stream transport unavailable during TLS upgrade"
-            )
 
         tls_reader = asyncio.StreamReader()
         tls_protocol = TLSStreamReaderProtocol(tls_reader)
@@ -690,6 +685,13 @@ class AsyncTLSInterceptProxy:
             return response_allows_keep_alive(request, final_response)
         finally:
             upstream_writer.close()
+            try:
+                await upstream_writer.wait_closed()
+            except OSError:
+                LOG.debug(
+                    "Failed to close upstream writer",
+                    exc_info=True,
+                )
 
     async def _forward_100_continue_request(
         self,

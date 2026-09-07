@@ -13,7 +13,6 @@ from localstub.http.proxy import (
 )
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.responsespec import HTTPResponse
-from localstub.http.utils import maybe_await
 from localstub.middleware.core import (
     ForwardProxyResponse,
     ResponderContext,
@@ -21,7 +20,6 @@ from localstub.middleware.core import (
     ResponderNext,
     ResponseSpec,
 )
-from localstub.router import ResponderHandler, Router
 from localstub.throttle import RequestThrottler, ThrottleDecision
 
 ThrottleResponseFunc = Callable[
@@ -145,36 +143,6 @@ class RawForwardProxyMiddleware:
             request_method=recorded.method,
             forwarder=self.forwarder,
         )
-
-
-@dataclass
-class RouterMiddleware:
-    router: Router
-
-    async def __call__(
-        self,
-        ctx: ResponderContext,
-        call_next: ResponderNext,
-    ) -> ResponseSpec:
-        result = await self.router.handle(ctx)
-        if result is None:
-            return await call_next()
-        return result
-
-
-@dataclass
-class HandlerMiddleware:
-    get_handler: Callable[[], ResponderHandler | None]
-
-    async def __call__(
-        self,
-        ctx: ResponderContext,
-        call_next: ResponderNext,
-    ) -> ResponseSpec:
-        handler = self.get_handler()
-        if handler is None:
-            return await call_next()
-        return await maybe_await(handler(ctx))
 
 
 type SlotName = Literal["throttle", "sequence", "raw_proxy", "proxy"]

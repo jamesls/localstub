@@ -26,6 +26,8 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --all-extras --dev
       - name: Run prcheck
+        env:
+          PYTHONASYNCIODEBUG: "1"
         run: uv run poe prcheck
 
       - name: Check tag matches pyproject.toml version

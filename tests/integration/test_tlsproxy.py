@@ -266,6 +266,51 @@ async def test_aclose_closes_half_accepted_client_connection(
         await proxy.aclose()
 
 
+@pytest.mark.parametrize("connection", ["keep-alive", "close"])
+@pytest.mark.asyncio
+async def test_aclose_finishes_when_tls_client_stops_reading(
+    connection: str,
+) -> None:
+    async with (
+        AsyncHTTPTestServer() as upstream,
+        AsyncTLSInterceptProxy(
+            default_mode="forward", upstream_tls=False
+        ) as proxy,
+    ):
+        reader, writer = await asyncio.open_connection(*proxy.address)
+        try:
+            upstream_host, upstream_port = upstream.host, upstream.port
+            assert upstream_host is not None
+            assert upstream_port is not None
+            authority = f"{upstream_host}:{upstream_port}"
+            writer.write(
+                f"CONNECT {authority} HTTP/1.1\r\n"
+                f"Host: {authority}\r\n\r\n".encode()
+            )
+            await writer.drain()
+            response = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"), timeout=1.0
+            )
+            assert response.startswith(b"HTTP/1.1 200")
+            context = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+            await writer.start_tls(context, server_hostname=upstream_host)
+            writer.transport.pause_reading()
+            writer.write(
+                f"GET / HTTP/1.1\r\nHost: {authority}\r\n"
+                f"Connection: {connection}\r\n\r\n".encode()
+            )
+            await writer.drain()
+            await upstream.next_request(timeout=1.0)
+
+            await asyncio.wait_for(proxy.aclose(), timeout=2.0)
+        finally:
+            writer.transport.resume_reading()
+            writer.close()
+            await writer.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_aclose_cancels_forward_connection_after_tls_upgrade() -> None:
     request_received = asyncio.Event()
