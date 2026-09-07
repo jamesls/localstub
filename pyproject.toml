@@ -50,7 +50,8 @@ dev = [
   "pyright[nodejs]>=1.1.405",
   "hypothesis>=6.165.10",
   "import-linter",
-  "zensical"
+  "zensical",
+  "mutmut>=3.6,<4",
 ]
 
 
@@ -84,6 +85,13 @@ extend-select = [
 [tool.ruff.format]
 quote-style = "preserve"
 preview = true
+
+[tool.mutmut]
+source_paths = ["src/localstub/"]
+pytest_add_cli_args_test_selection = ["tests/"]
+also_copy = ["scripts/"]
+# Coverage is collected by `poe test`, not on every mutant's test run.
+pytest_add_cli_args = ["--no-cov"]
 
 [tool.pytest.ini_options]
 asyncio_debug = true
@@ -133,6 +141,8 @@ check = [
   { shell = "out=$(uv run lint-imports --no-logo 2>&1) || { printf '%s\\n' \"$out\"; exit 1; }" },
 ]
 test = "uv run pytest tests/"
+mutate = "uv run mutmut run --max-children 4"
+mutate-decorated = "uv run python scripts/mutate_decorated.py run"
 format-code = [
   { cmd = "uv run ruff format ." },
 ]
@@ -196,6 +206,9 @@ source_modules = [
   "localstub.ca",
 ]
 forbidden_modules = ["localstub.console"]
+
+[tool.uv.sources]
+mutmut = { git = "https://github.com/boxed/mutmut.git", rev = "dc58270d5234752e22247f814431750eafcf6e5f" }
 
 # Uncomment if you want to add a CLI script.
 [project.scripts]

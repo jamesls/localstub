@@ -65,13 +65,17 @@ async def test_router_handle_async_handler_returning_none_raises() -> None:
 @pytest.mark.asyncio
 async def test_router_handle_returns_response_spec() -> None:
     router = Router()
+    ctx = _ctx("GET", "/")
+    assert not router.has_routes
 
-    def handler(_: ResponderContext) -> HTTPResponse:
+    def handler(received: ResponderContext) -> HTTPResponse:
+        assert received is ctx
         return HTTPResponse.text("ok")
 
     router.add("GET", "/", handler)
+    assert router.has_routes
 
-    result = await router.handle(_ctx("GET", "/"))
+    result = await router.handle(ctx)
     assert isinstance(result, HTTPResponse)
     assert result.body == b"ok"
 

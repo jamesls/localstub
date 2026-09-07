@@ -105,3 +105,49 @@ Before submitting a PR, ensure the `prcheck` task runs successfully:
 ```sh
 poe prcheck
 ```
+
+### Mutation testing
+
+[mutmut](https://mutmut.readthedocs.io/en/latest/) is included in the dev
+dependencies. It changes small pieces of code and checks whether the tests
+fail: a "killed" mutant was caught; a "survived" mutant needs inspection.
+It requires fork support (Linux/macOS, or WSL on Windows).
+
+```sh
+# Run the full source scan with four workers (can take a while).
+uv run poe mutate
+
+# Also exercise property and other decorated bodies in an isolated copy.
+uv run poe mutate-decorated
+
+# Start with a smaller module instead; quote patterns to avoid shell expansion.
+uv run poe mutate 'localstub.http.responsespec.*'
+
+# Inspect results and individual diffs, or open the interactive browser.
+uv run mutmut results
+uv run mutmut show localstub.http.responsespec.x__with_defaults__mutmut_2
+uv run mutmut browse
+```
+
+Mutation runs use `tests/`, with pytest coverage disabled to avoid collecting
+coverage on every mutant. Normal `poe test` coverage is unchanged. Generated
+code and cached results live in the git-ignored `mutants/` directory. After
+changing tests, explicitly rerun the relevant mutant name or module pattern
+with `poe mutate` to refresh its results. Mutation testing is deliberately
+separate from `prcheck`; survivors are not automatically bugs.
+
+The uv lock pins an upstream fix for mutmut's decorated-class exclusion;
+`HTTPResponse`, `Headers`, `Router`, and the other dataclasses now generate
+mutants. The supplemental runner exposes decorator-hidden bodies only in
+the git-ignored `mutants-decorated/` copy, preserving the original library.
+It starts fresh each time so renamed helpers cannot reuse stale test tracking.
+Inspect its separate results with:
+
+```sh
+uv run python scripts/mutate_decorated.py results
+uv run python scripts/mutate_decorated.py browse
+```
+
+See [the mutation-testing report](docs/mutation-testing.md) for the setup,
+coverage limitations, and findings. A completed scan is not a guarantee that
+every source construct can be mutated, or that every survivor is a bug.
