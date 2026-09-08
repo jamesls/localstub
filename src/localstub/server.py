@@ -170,19 +170,22 @@ class RecordingStreamWriter:
     ) -> None:
         self._writer = writer
         self._sent_buffer = sent_buffer
-        self._recorded = bytearray()
+        self._recorded: list[bytes] = []
 
     @property
     def bytes_sent(self) -> bytes:
         """Return bytes written for the current response."""
-        return bytes(self._recorded)
+        return b"".join(self._recorded)
 
     def start_response(self) -> None:
         """Start recording a new response."""
         self._recorded.clear()
 
     def write(self, data: bytes) -> None:
-        self._recorded.extend(data)
+        if data:
+            # Joining one immutable chunk reuses it; multiple chunks are
+            # copied only when the completed recording is requested.
+            self._recorded.append(data)
         if self._sent_buffer is not None:
             self._sent_buffer.extend(data)
         self._writer.write(data)

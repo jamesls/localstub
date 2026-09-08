@@ -6,7 +6,7 @@ import pytest
 
 from localstub.http.clients.asyncio import AsyncioClient
 from localstub.middleware import ResponderContext
-from localstub.recording import TrafficRecorder
+from localstub.recording import BoundedByteBuffer, TrafficRecorder
 from localstub.server import (
     AsyncHTTPTestServer,
     ByteFlip,
@@ -73,6 +73,71 @@ def test_recording_writer_holds_only_current_response() -> None:
     recorder.write(b"second response")
 
     assert recorder.bytes_sent == b"second response"
+
+
+def test_recording_writer_reuses_single_write_through_empty_writes() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    recorder = RecordingStreamWriter(writer)
+    body = b"x" * 10000
+
+    assert recorder.bytes_sent == b""
+    recorder.write(b"")
+    recorder.write(body)
+    recorder.write(b"")
+
+    assert recorder.bytes_sent is body
+    assert [call.args[0] for call in writer.write.call_args_list] == [
+        b"",
+        body,
+        b"",
+    ]
+
+
+def test_recording_writer_snapshots_survive_more_writes_and_reset() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    sent = BoundedByteBuffer(5)
+    recorder = RecordingStreamWriter(writer, sent)
+    recorder.write(b"ab")
+    first = recorder.bytes_sent
+    recorder.write(b"cd")
+    second = recorder.bytes_sent
+    recorder.writelines([b"", b"ef", b"gh"])
+    third = recorder.bytes_sent
+    recorder.start_response()
+
+    assert recorder.bytes_sent == b""
+    recorder.write(b"ij")
+    assert first == b"ab"
+    assert second == b"abcd"
+    assert third == b"abcdefgh"
+    assert recorder.bytes_sent == b"ij"
+    assert bytes(sent) == b"fghij"
+    assert sent.dropped == 5
+    assert [call.args[0] for call in writer.write.call_args_list] == [
+        b"ab",
+        b"cd",
+        b"",
+        b"ef",
+        b"gh",
+        b"ij",
+    ]
+
+
+@pytest.mark.parametrize("prefix", [b"", b"previous"])
+def test_recording_writer_preserves_capture_on_write_failure(
+    prefix: bytes,
+) -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    sent = BoundedByteBuffer(100)
+    recorder = RecordingStreamWriter(writer, sent)
+    recorder.write(prefix)
+    writer.write.side_effect = ConnectionError("closed")
+
+    with pytest.raises(ConnectionError, match="closed"):
+        recorder.write(b"failed")
+
+    assert recorder.bytes_sent == prefix + b"failed"
+    assert bytes(sent) == prefix + b"failed"
 
 
 @pytest.mark.asyncio
