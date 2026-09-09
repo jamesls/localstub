@@ -3,6 +3,8 @@ import time
 from unittest.mock import AsyncMock, create_autospec
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from localstub.http.clients.asyncio import AsyncioClient
 from localstub.middleware import ResponderContext
@@ -91,6 +93,41 @@ def test_recording_writer_reuses_single_write_through_empty_writes() -> None:
         body,
         b"",
     ]
+
+
+def test_recording_writer_coalesces_small_writes_around_large_write() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    recorder = RecordingStreamWriter(writer, coalesce_size=4)
+
+    recorder.writelines([b"ab", b"c", b"defgh", b"i", b"jkl", b"m"])
+
+    assert recorder.bytes_sent == b"abcdefghijklm"
+
+
+def test_recording_writer_coalesce_size_below_one_raises_value_error() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+
+    with pytest.raises(ValueError, match="coalesce_size"):
+        RecordingStreamWriter(writer, coalesce_size=0)
+
+
+@given(
+    coalesce_size=st.integers(min_value=1, max_value=16),
+    chunks=st.lists(st.binary(max_size=64), max_size=40),
+)
+def test_recording_writer_bytes_sent_matches_every_write(
+    coalesce_size: int, chunks: list[bytes]
+) -> None:
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    recorder = RecordingStreamWriter(writer, coalesce_size=coalesce_size)
+
+    expected = b""
+    for chunk in chunks:
+        recorder.write(chunk)
+        expected += chunk
+        assert recorder.bytes_sent == expected
+
+    assert [call.args[0] for call in writer.write.call_args_list] == chunks
 
 
 def test_recording_writer_snapshots_survive_more_writes_and_reset() -> None:
@@ -209,6 +246,22 @@ async def test_throttled_transmission_single_chunk() -> None:
     assert writer.drain.call_count == 1
     assert recorder.bytes_sent == body
     sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_throttled_transmission_one_byte_chunks_records_body() -> None:
+    sleep = create_autospec(asyncio.sleep)
+    strategy = ThrottledTransmission(chunk_size=1, delay=0, sleep=sleep)
+    body = bytes(range(256)) * 17
+
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    recorder = RecordingStreamWriter(writer)
+
+    await strategy.write_body(recorder, body)
+
+    assert writer.write.call_count == len(body)
+    assert recorder.bytes_sent == body
+    assert sleep.await_count == len(body) - 1
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,8 @@ RESPONSE_BODY = json.dumps(RESPONSE_OBJECT).encode("utf-8")
 LARGE_BODY = b"b" * (64 * 1024)
 BODY_PIECE = b"p" * 8192
 BODY_PIECE_COUNT = 128
+SMALL_PIECE = b"s" * 16
+SMALL_PIECE_COUNT = 4096
 REQUEST = (
     b"GET /v1/items?page=2 HTTP/1.1\r\n"
     b"Host: localhost\r\n"
@@ -139,3 +141,20 @@ def test_recording_writer_body_in_many_writes(
     sent = benchmark(respond)
 
     assert sent == BODY_PIECE * BODY_PIECE_COUNT
+
+
+def test_recording_writer_body_in_small_writes(
+    benchmark: BenchmarkFixture,
+    recording_writer: RecordingStreamWriter,
+) -> None:
+    # A tightly throttled body goes out in many small writes; recording
+    # coalesces them so the join at the end touches few pieces.
+    def respond() -> bytes:
+        recording_writer.start_response()
+        for _ in range(SMALL_PIECE_COUNT):
+            recording_writer.write(SMALL_PIECE)
+        return recording_writer.bytes_sent
+
+    sent = benchmark(respond)
+
+    assert sent == SMALL_PIECE * SMALL_PIECE_COUNT
