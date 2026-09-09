@@ -50,7 +50,8 @@ dev = [
   "pyright[nodejs]>=1.1.405",
   "hypothesis>=6.165.10",
   "import-linter",
-  "zensical"
+  "zensical",
+  "pytest-codspeed>=5.0.3",
 ]
 
 
@@ -133,6 +134,7 @@ check = [
   { shell = "out=$(uv run lint-imports --no-logo 2>&1) || { printf '%s\\n' \"$out\"; exit 1; }" },
 ]
 test = "uv run pytest tests/"
+bench = "uv run pytest tests/benchmarks/ --codspeed --no-cov"
 format-code = [
   { cmd = "uv run ruff format ." },
 ]
