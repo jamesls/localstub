@@ -65,6 +65,7 @@ from localstub.middleware.builtins import (
     default_throttle_response,
 )
 from localstub.recording import (
+    DEFAULT_COALESCE_SIZE,
     DEFAULT_MAX_CONNECTION_BYTES,
     DEFAULT_RECORDING_BUFFER_SIZE,
     BoundedByteBuffer,
@@ -161,28 +162,59 @@ class Writer(Protocol):
 
 
 class RecordingStreamWriter:
-    """Wrapper that records the current response and connection bytes."""
+    """Wrapper that records the current response and connection bytes.
+
+    The current response is retained the same way ``BoundedByteBuffer``
+    retains bytes: a write of at least ``coalesce_size`` bytes is kept
+    as a chunk of its own without a copy, and smaller writes accumulate
+    in a pending ``bytearray`` that is sealed into a chunk once it
+    reaches ``coalesce_size``.  A body sent in one write is therefore
+    returned without copying, and a body sent one byte at a time is
+    joined from a bounded number of chunks rather than one per write.
+    The logic is inlined here rather than delegated because this is the
+    hot path for every byte the server sends.
+    """
 
     def __init__(
         self,
         writer: asyncio.StreamWriter,
         sent_buffer: BoundedByteBuffer | None = None,
+        *,
+        coalesce_size: int = DEFAULT_COALESCE_SIZE,
     ) -> None:
+        if coalesce_size < 1:
+            raise ValueError(
+                f"coalesce_size must be at least 1, got {coalesce_size}"
+            )
         self._writer = writer
         self._sent_buffer = sent_buffer
-        self._recorded = bytearray()
+        self._coalesce_size = coalesce_size
+        self._chunks: list[bytes] = []
+        self._pending = bytearray()
 
     @property
     def bytes_sent(self) -> bytes:
         """Return bytes written for the current response."""
-        return bytes(self._recorded)
+        if not self._pending:
+            return b"".join(self._chunks)
+        return b"".join((*self._chunks, self._pending))
 
     def start_response(self) -> None:
         """Start recording a new response."""
-        self._recorded.clear()
+        self._chunks.clear()
+        self._pending.clear()
 
     def write(self, data: bytes) -> None:
-        self._recorded.extend(data)
+        if len(data) >= self._coalesce_size:
+            if self._pending:
+                self._chunks.append(bytes(self._pending))
+                self._pending.clear()
+            self._chunks.append(data)
+        elif data:
+            self._pending += data
+            if len(self._pending) >= self._coalesce_size:
+                self._chunks.append(bytes(self._pending))
+                self._pending.clear()
         if self._sent_buffer is not None:
             self._sent_buffer.extend(data)
         self._writer.write(data)

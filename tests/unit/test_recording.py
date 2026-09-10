@@ -4,6 +4,8 @@ import asyncio
 from datetime import UTC, datetime
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest, RecordedHTTPRequest
@@ -115,6 +117,184 @@ def test_bounded_byte_buffer_zero_maxsize_raises_value_error() -> None:
 def test_bounded_byte_buffer_maxsize_reports_capacity() -> None:
     buffer = BoundedByteBuffer(7)
     assert buffer.maxsize == 7
+
+
+@given(
+    maxsize=st.one_of(st.none(), st.integers(min_value=1, max_value=64)),
+    coalesce_size=st.integers(min_value=1, max_value=16),
+    chunks=st.lists(st.binary(max_size=64), max_size=40),
+)
+def test_byte_buffer_matches_contiguous_tail(
+    maxsize: int | None, coalesce_size: int, chunks: list[bytes]
+) -> None:
+    buffer = BoundedByteBuffer(maxsize, coalesce_size=coalesce_size)
+    expected = b""
+    dropped = 0
+    for chunk in chunks:
+        buffer.extend(chunk)
+        expected += chunk
+        if maxsize is not None and len(expected) > maxsize:
+            dropped += len(expected) - maxsize
+            expected = expected[-maxsize:]
+        assert bytes(buffer) == expected
+        assert len(buffer) == len(expected)
+        assert buffer.dropped == dropped
+
+
+@given(
+    maxsize=st.one_of(st.none(), st.integers(min_value=1, max_value=64)),
+    coalesce_size=st.integers(min_value=1, max_value=16),
+    chunks=st.lists(st.binary(max_size=64), max_size=40),
+)
+def test_byte_buffer_materialized_once_matches_contiguous_tail(
+    maxsize: int | None, coalesce_size: int, chunks: list[bytes]
+) -> None:
+    buffer = BoundedByteBuffer(maxsize, coalesce_size=coalesce_size)
+    for chunk in chunks:
+        buffer.extend(chunk)
+    joined = b"".join(chunks)
+    expected = joined if maxsize is None else joined[-maxsize:]
+    assert len(buffer) == len(expected)
+    assert buffer.dropped == len(joined) - len(expected)
+    assert bytes(buffer) == expected
+    assert len(buffer) == len(expected)
+    assert buffer.dropped == len(joined) - len(expected)
+
+
+@pytest.mark.parametrize("maxsize", [None, 3, 10])
+def test_byte_buffer_snapshots_mutable_input(maxsize: int | None) -> None:
+    buffer = BoundedByteBuffer(maxsize)
+    data = bytearray(b"abcdef")
+    buffer.extend(data)
+    snapshot = bytes(buffer)
+    data[:] = b"changed"
+    buffer.extend(b"gh")
+    expected = b"abcdefgh" if maxsize is None else b"abcdefgh"[-maxsize:]
+    assert bytes(buffer) == expected
+    assert snapshot == (b"abcdef" if maxsize is None else b"abcdef"[-maxsize:])
+    buffer.clear()
+    buffer.extend(b"ij")
+    assert bytes(buffer) == b"ij"
+
+
+def test_byte_buffer_evicts_multiple_chunks_and_partial_chunk() -> None:
+    buffer = BoundedByteBuffer(8, coalesce_size=2)
+    for chunk in (b"ab", b"cd", b"efgh", b"ijklm"):
+        buffer.extend(chunk)
+    assert bytes(buffer) == b"fghijklm"
+    assert buffer.dropped == 5
+    buffer.extend(b"nop")
+    assert bytes(buffer) == b"ijklmnop"
+    assert buffer.dropped == 8
+
+
+def test_byte_buffer_repeated_partial_evictions_before_materializing() -> None:
+    buffer = BoundedByteBuffer(8)
+    buffer.extend(b"abcdefgh")
+    for chunk in (b"i", b"j", b"k"):
+        buffer.extend(chunk)
+    assert bytes(buffer) == b"defghijk"
+    assert bytes(buffer) == b"defghijk"
+    assert buffer.dropped == 3
+    buffer.extend(b"lm")
+    buffer.extend(b"n")
+    assert bytes(buffer) == b"ghijklmn"
+    assert len(buffer) == 8
+    assert buffer.dropped == 6
+
+
+def test_byte_buffer_clear_after_partial_eviction_forgets_offset() -> None:
+    buffer = BoundedByteBuffer(4)
+    buffer.extend(b"abcd")
+    buffer.extend(b"e")
+    buffer.clear()
+    buffer.extend(b"wxyz")
+    assert bytes(buffer) == b"wxyz"
+    assert buffer.dropped == 1
+
+
+def test_byte_buffer_coalesce_size_below_one_raises_value_error() -> None:
+    with pytest.raises(ValueError, match="coalesce_size"):
+        BoundedByteBuffer(None, coalesce_size=0)
+
+
+def test_byte_buffer_single_large_write_is_returned_without_copy() -> None:
+    buffer = BoundedByteBuffer(None, coalesce_size=4)
+    data = b"abcdef"
+    buffer.extend(data)
+    assert bytes(buffer) is data
+
+
+def test_byte_buffer_small_writes_keep_order_around_large_write() -> None:
+    buffer = BoundedByteBuffer(None, coalesce_size=4)
+    for chunk in (b"ab", b"c", b"defgh", b"i"):
+        buffer.extend(chunk)
+    assert bytes(buffer) == b"abcdefghi"
+    assert len(buffer) == 9
+    assert buffer.dropped == 0
+
+
+def test_byte_buffer_evicts_pending_bytes_once_chunks_are_gone() -> None:
+    buffer = BoundedByteBuffer(3, coalesce_size=4)
+    buffer.extend(b"abcd")
+    buffer.extend(b"e")
+    assert bytes(buffer) == b"cde"
+    buffer.extend(b"fg")
+    assert bytes(buffer) == b"efg"
+    buffer.extend(b"h")
+    assert bytes(buffer) == b"fgh"
+    assert len(buffer) == 3
+    assert buffer.dropped == 5
+
+
+def test_byte_buffer_eviction_spills_from_chunks_into_pending_bytes() -> None:
+    buffer = BoundedByteBuffer(2, coalesce_size=4)
+    buffer.extend(b"abcd")
+    buffer.extend(b"efg")
+    assert bytes(buffer) == b"fg"
+    assert len(buffer) == 2
+    assert buffer.dropped == 5
+
+
+def test_byte_buffer_large_append_discards_pending_bytes() -> None:
+    buffer = BoundedByteBuffer(3, coalesce_size=8)
+    buffer.extend(b"ab")
+    buffer.extend(b"cdef")
+    assert bytes(buffer) == b"def"
+    assert len(buffer) == 3
+    assert buffer.dropped == 3
+
+
+def test_byte_buffer_reports_bounded_view_before_eviction_runs() -> None:
+    buffer = BoundedByteBuffer(4, coalesce_size=8)
+    buffer.extend(b"abc")
+    buffer.extend(b"de")
+    assert len(buffer) == 4
+    assert buffer.dropped == 1
+    assert bytes(buffer) == b"bcde"
+
+
+def test_byte_buffer_clear_keeps_deferred_drops_counted() -> None:
+    buffer = BoundedByteBuffer(4, coalesce_size=8)
+    buffer.extend(b"abc")
+    buffer.extend(b"de")
+    buffer.clear()
+    assert len(buffer) == 0
+    assert buffer.dropped == 1
+    buffer.extend(b"x")
+    assert bytes(buffer) == b"x"
+    assert buffer.dropped == 1
+
+
+def test_byte_buffer_clear_discards_pending_bytes() -> None:
+    buffer = BoundedByteBuffer(None, coalesce_size=4)
+    buffer.extend(b"abcd")
+    buffer.extend(b"ef")
+    buffer.clear()
+    assert bytes(buffer) == b""
+    assert len(buffer) == 0
+    buffer.extend(b"g")
+    assert bytes(buffer) == b"g"
 
 
 def test_put_and_get_nowait_preserves_fifo_order() -> None:
