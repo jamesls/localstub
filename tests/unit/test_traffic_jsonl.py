@@ -4,12 +4,13 @@ import base64
 import io
 import json
 from datetime import UTC, datetime, timedelta, timezone
+from unittest.mock import create_autospec
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from localstub.http.exchange import RecordedExchange
+from localstub.http.exchange import ConnectionClosed, RecordedExchange
 from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
@@ -30,6 +31,7 @@ def _recorded_request(
     body: bytes | None = None,
     wire_raw_bytes: bytes = b"",
     client: tuple[str, int] | None = None,
+    body_complete: bool = True,
 ) -> RecordedHTTPRequest:
     request = HTTPRequest(
         method=method,
@@ -43,6 +45,45 @@ def _recorded_request(
         wire_raw_bytes=wire_raw_bytes,
         http_version="1.1",
         client=client,
+        body_complete=body_complete,
+    )
+
+
+_TIMESTAMP = datetime(2026, 1, 27, tzinfo=UTC)
+
+
+def _closed_event(
+    *,
+    client: tuple[str, int] | None = ("127.0.0.1", 12345),
+    timestamp: datetime = _TIMESTAMP,
+) -> ConnectionClosed:
+    return ConnectionClosed(
+        client=client,
+        reason="request_read",
+        phase="request_body",
+        reset=True,
+        requests_completed=0,
+        bytes_read=120,
+        bytes_consumed=96,
+        bytes_written=25,
+        timestamp=timestamp,
+    )
+
+
+def _exchange(
+    request: RecordedHTTPRequest,
+    *,
+    response: RecordedHTTPResponse | None = None,
+    interim_responses: tuple[RecordedHTTPResponse, ...] = (),
+    closed: ConnectionClosed | None = None,
+) -> RecordedExchange:
+    return RecordedExchange(
+        request=request,
+        response=response,
+        request_timestamp=_TIMESTAMP,
+        response_timestamp=None,
+        interim_responses=interim_responses,
+        closed=closed,
     )
 
 
@@ -224,6 +265,170 @@ def test_dump_server_traffic_jsonl_rejects_negative_start() -> None:
         dump_server_traffic_jsonl(server, io.StringIO(), start=-1)
 
 
+@pytest.mark.parametrize("body_complete", [True, False])
+def test_exchange_to_json_obj_reports_request_body_complete(
+    body_complete: bool,
+) -> None:
+    request = _recorded_request(
+        "PUT", "/upload", body=b"par", body_complete=body_complete
+    )
+
+    obj = exchange_to_json_obj(_exchange(request))
+
+    request_obj = obj["request"]
+    assert isinstance(request_obj, dict)
+    assert request_obj["body_complete"] == body_complete
+
+
+def test_exchange_to_json_obj_interim_responses_empty_by_default() -> None:
+    obj = exchange_to_json_obj(_exchange(_recorded_request("GET", "/")))
+
+    assert obj["interim_responses"] == []
+
+
+def test_exchange_to_json_obj_serializes_interim_responses() -> None:
+    interim_wire = b"HTTP/1.1 100 Continue\r\n\r\n"
+    interim = RecordedHTTPResponse(
+        response=HTTPResponse(status=100),
+        reason="Continue",
+        wire_raw_bytes=interim_wire,
+    )
+    final = RecordedHTTPResponse(
+        response=HTTPResponse(status=403, body=b"Forbidden"),
+        reason="Forbidden",
+        wire_raw_bytes=b"HTTP/1.1 403 Forbidden\r\n\r\nForbidden",
+    )
+    exchange = _exchange(
+        _recorded_request("PUT", "/upload"),
+        response=final,
+        interim_responses=(interim,),
+    )
+
+    obj = exchange_to_json_obj(exchange)
+
+    assert obj["interim_responses"] == [
+        {
+            "status": 100,
+            "reason": "Continue",
+            "headers": {},
+            "body": "",
+            "raw_wire_bytes": base64.b64encode(interim_wire).decode("ascii"),
+        }
+    ]
+    response_obj = obj["response"]
+    assert isinstance(response_obj, dict)
+    assert response_obj["status"] == 403
+
+
+def test_exchange_to_json_obj_closed_is_null_without_close_event() -> None:
+    obj = exchange_to_json_obj(_exchange(_recorded_request("GET", "/")))
+
+    assert obj["closed"] is None
+
+
+def test_exchange_to_json_obj_serializes_close_event() -> None:
+    exchange = _exchange(
+        _recorded_request("PUT", "/upload", body_complete=False),
+        closed=_closed_event(),
+    )
+
+    obj = exchange_to_json_obj(exchange)
+
+    assert obj["closed"] == {
+        "client": {"host": "127.0.0.1", "port": 12345},
+        "reason": "request_read",
+        "phase": "request_body",
+        "reset": True,
+        "requests_completed": 0,
+        "bytes_read": 120,
+        "bytes_consumed": 96,
+        "bytes_written": 25,
+        "timestamp": "2026-01-27T00:00:00+00:00",
+    }
+
+
+def test_exchange_to_json_obj_close_event_client_none_is_null() -> None:
+    exchange = _exchange(
+        _recorded_request("GET", "/"), closed=_closed_event(client=None)
+    )
+
+    obj = exchange_to_json_obj(exchange)
+
+    closed_obj = obj["closed"]
+    assert isinstance(closed_obj, dict)
+    assert closed_obj["client"] is None
+
+
+def test_exchange_to_json_obj_close_event_naive_timestamp_is_utc() -> None:
+    exchange = _exchange(
+        _recorded_request("GET", "/"),
+        closed=_closed_event(timestamp=datetime(2026, 1, 27, 12, 30)),
+    )
+
+    obj = exchange_to_json_obj(exchange)
+
+    closed_obj = obj["closed"]
+    assert isinstance(closed_obj, dict)
+    assert closed_obj["timestamp"] == "2026-01-27T12:30:00+00:00"
+
+
+def test_exchange_to_json_obj_headerless_response_body_is_wire() -> None:
+    response = RecordedHTTPResponse(
+        response=HTTPResponse(status=200),
+        reason="OK",
+        wire_raw_bytes=b"HTTP/1.1 200 OK",
+    )
+    exchange = _exchange(_recorded_request("GET", "/"), response=response)
+
+    obj = exchange_to_json_obj(exchange)
+
+    response_obj = obj["response"]
+    assert isinstance(response_obj, dict)
+    assert response_obj["body"] == "HTTP/1.1 200 OK"
+
+
+def test_jsonl_writer_flushes_after_each_exchange_by_default() -> None:
+    fp = create_autospec(io.StringIO, instance=True)
+    writer = JSONLTrafficWriter(fp)
+
+    writer.write_exchange(_exchange(_recorded_request("GET", "/")))
+
+    fp.write.assert_called_once()
+    fp.flush.assert_called_once_with()
+
+
+def test_jsonl_writer_without_flush_each_does_not_flush() -> None:
+    fp = create_autospec(io.StringIO, instance=True)
+    writer = JSONLTrafficWriter(fp, flush_each=False)
+
+    writer.write_exchange(_exchange(_recorded_request("GET", "/")))
+
+    fp.write.assert_called_once()
+    fp.flush.assert_not_called()
+
+
+def test_dump_server_traffic_jsonl_writes_to_text_stream() -> None:
+    server = AsyncHTTPTestServer()
+    server.exchanges.extend([
+        _exchange(_recorded_request("GET", "/a")),
+        _exchange(_recorded_request("GET", "/b")),
+    ])
+    out = io.StringIO()
+
+    written = dump_server_traffic_jsonl(server, out, end=1)
+
+    assert written == 1
+    records = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [record["request"]["path"] for record in records] == ["/a"]
+
+
+def test_dump_server_traffic_jsonl_rejects_negative_end() -> None:
+    server = AsyncHTTPTestServer()
+
+    with pytest.raises(ValueError, match="end must be non-negative or None"):
+        dump_server_traffic_jsonl(server, io.StringIO(), end=-1)
+
+
 _FIELD_NAME_CHARS = (
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
 )
@@ -267,6 +472,35 @@ _TIMESTAMPS = st.datetimes(
     timezones=_TIMEZONES,
 )
 _RESPONSE_HEAD = b"HTTP/1.1 200 OK\r\nX-Head: v"
+_UTC_TIMESTAMPS = st.datetimes(
+    min_value=datetime(1970, 1, 1),
+    max_value=datetime(2200, 1, 1),
+).map(lambda ts: ts.replace(tzinfo=UTC))
+_INTERIM_RESPONSES = st.lists(
+    st.builds(
+        RecordedHTTPResponse,
+        response=st.builds(
+            HTTPResponse,
+            status=st.integers(min_value=100, max_value=199),
+            headers=_HEADERS,
+        ),
+        reason=st.one_of(st.none(), st.text(max_size=8)),
+        wire_raw_bytes=st.binary(max_size=64),
+    ),
+    max_size=2,
+).map(tuple)
+_CLOSED_EVENTS = st.builds(
+    ConnectionClosed,
+    client=_CLIENTS,
+    reason=st.sampled_from(["close_response", "request_read", "client"]),
+    phase=st.sampled_from(["request_body", "response", "after_response"]),
+    reset=st.booleans(),
+    requests_completed=st.integers(min_value=0, max_value=8),
+    bytes_read=st.integers(min_value=0, max_value=1 << 20),
+    bytes_consumed=st.integers(min_value=0, max_value=1 << 20),
+    bytes_written=st.integers(min_value=0, max_value=1 << 20),
+    timestamp=_UTC_TIMESTAMPS,
+)
 
 
 @st.composite
@@ -283,6 +517,7 @@ def _recorded_requests(draw: st.DrawFn) -> RecordedHTTPRequest:
         wire_raw_bytes=draw(st.binary(max_size=64)),
         http_version="1.1",
         client=draw(_CLIENTS),
+        body_complete=draw(st.booleans()),
     )
 
 
@@ -312,6 +547,8 @@ def _exchanges(draw: st.DrawFn) -> RecordedExchange:
         response=response,
         request_timestamp=draw(_TIMESTAMPS),
         response_timestamp=draw(st.one_of(st.none(), _TIMESTAMPS)),
+        interim_responses=draw(_INTERIM_RESPONSES),
+        closed=draw(st.one_of(st.none(), _CLOSED_EVENTS)),
     )
 
 

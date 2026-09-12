@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from localstub.config import ResponseConfig, load_config
-from localstub.server import HTTPResponse
+from localstub.server import CloseConnection, HTTPResponse
 
 
 def write_config_file(tmp_path: Path, data: dict[str, Any]) -> Path:
@@ -160,6 +160,51 @@ class TestParseResponseSpec:
         with pytest.raises(ValueError, match="Unknown response type"):
             load_config(config_file)
 
+    def test_parse_raw_response_with_non_string_body_raises_error(
+        self, tmp_path: Path
+    ) -> None:
+        spec = {"type": "raw", "body": 123}
+        config_file = write_config_file(tmp_path, {"response": spec})
+
+        with pytest.raises(ValueError, match="Invalid body type"):
+            load_config(config_file)
+
+    def test_parse_close_response_uses_defaults(self, tmp_path: Path) -> None:
+        spec = {"type": "close"}
+        config_file = write_config_file(tmp_path, {"response": spec})
+
+        config = load_config(config_file)
+
+        assert config.single_response == CloseConnection()
+
+    def test_parse_close_response_with_reset_and_delay(
+        self, tmp_path: Path
+    ) -> None:
+        spec = {"type": "close", "reset": True, "delay": 0.5}
+        config_file = write_config_file(tmp_path, {"response": spec})
+
+        config = load_config(config_file)
+
+        assert config.single_response == CloseConnection(reset=True, delay=0.5)
+
+    def test_parse_close_response_negative_delay_raises_error(
+        self, tmp_path: Path
+    ) -> None:
+        spec = {"type": "close", "delay": -1}
+        config_file = write_config_file(tmp_path, {"response": spec})
+
+        with pytest.raises(ValueError, match="delay must be non-negative"):
+            load_config(config_file)
+
+    def test_parse_close_response_non_bool_reset_raises_error(
+        self, tmp_path: Path
+    ) -> None:
+        spec = {"type": "close", "reset": "false"}
+        config_file = write_config_file(tmp_path, {"response": spec})
+
+        with pytest.raises(ValueError, match="Invalid reset value"):
+            load_config(config_file)
+
 
 class TestParseConfig:
     def test_parse_config_with_single_response(self, tmp_path: Path) -> None:
@@ -195,6 +240,29 @@ class TestParseConfig:
 
         with pytest.raises(ValueError, match="must have either"):
             load_config(config_file)
+
+    def test_parse_config_sequence_with_close_entries_keeps_order(
+        self, tmp_path: Path
+    ) -> None:
+        data = {
+            "responses": [
+                {"type": "close"},
+                {"type": "close", "reset": True},
+                {"type": "json", "body": {"ok": True}},
+            ]
+        }
+        config_file = write_config_file(tmp_path, data)
+
+        config = load_config(config_file)
+
+        assert config.response_sequence is not None
+        assert config.response_sequence[:2] == [
+            CloseConnection(),
+            CloseConnection(reset=True),
+        ]
+        final = config.response_sequence[2]
+        assert isinstance(final, HTTPResponse)
+        assert json.loads(final.body) == {"ok": True}
 
 
 class TestLoadConfig:
@@ -265,3 +333,12 @@ class TestResponseConfig:
 
         assert config.single_response is None
         assert config.response_sequence is responses
+
+    def test_response_config_accepts_close_connection(self) -> None:
+        close = CloseConnection(delay=0.25)
+        config = ResponseConfig(
+            single_response=close,
+            response_sequence=None,
+        )
+
+        assert config.single_response is close

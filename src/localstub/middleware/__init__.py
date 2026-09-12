@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from .core import (
+    CloseConnection,
+    CloseDuringRequest,
     ConnectionMeta,
     ForwardProxyResponse,
     HeaderContext,
+    HeaderDecision,
     HeaderMiddleware,
     HeaderNext,
     ResponderContext,
@@ -25,9 +28,12 @@ from .core import (
 )
 
 __all__ = [
+    'CloseConnection',
+    'CloseDuringRequest',
     'ConnectionMeta',
     'ForwardProxyResponse',
     'HeaderContext',
+    'HeaderDecision',
     'HeaderMiddleware',
     'HeaderNext',
     'ResponderContext',

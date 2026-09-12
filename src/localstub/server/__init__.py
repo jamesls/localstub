@@ -1,20 +1,19 @@
-"""localstub: an asyncio HTTP test server for testing HTTP clients.
+"""The asyncio HTTP test server.
 
-The names exported here are localstub's public API.  Deeper modules
-(``localstub.http``, ``localstub.middleware``, and friends) are
-internal and may change without notice.
+``core`` holds ``AsyncHTTPTestServer``, ``connection`` the per-connection
+loop and state, and ``transmission`` the response body strategies and
+fault steps.  Every name the former ``localstub.server`` module exported
+is re-exported here, so public imports do not change.
 """
 
 from __future__ import annotations
 
-from localstub.http.clients.asyncio import AsyncioClient
 from localstub.http.exchange import (
     ClosePhase,
     CloseReason,
     ConnectionClosed,
     RecordedExchange,
 )
-from localstub.http.headers import Headers
 from localstub.http.request import (
     HTTPRequest,
     HTTPRequestHeaders,
@@ -22,79 +21,81 @@ from localstub.http.request import (
 )
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
-from localstub.http.uri import ParsedURI
 from localstub.middleware import (
     CloseConnection,
     CloseDuringRequest,
-    HeaderContext,
     HeaderDecision,
-    HeaderMiddleware,
-    HeaderNext,
-    ResponderContext,
-    ResponderMiddleware,
-    ResponderNext,
     ResponseSpec,
-    SenderContext,
-    SenderMiddleware,
-    SenderNext,
     SendResult,
 )
-from localstub.middleware.builtins import close_during_request
-from localstub.server import (
-    AbortTransmission,
+from localstub.router import ResponderHandler
+from localstub.server.connection import (
+    ConnectionState,
+    CountingStreamReader,
+    HTTPConnection,
+    KeepAlivePolicy,
+    RecordingStreamWriter,
+    RequestPipeline,
+    pack_linger_option,
+)
+from localstub.server.core import (
     AsyncHTTPTestServer,
+    OnHeadersReceived,
+    SendResponse,
+    ThrottleResponse,
+)
+from localstub.server.transmission import (
+    AbortTransmission,
+    ApplyResult,
     ByteFlip,
     Delay,
     DropConnection,
+    FaultStep,
     FaultyTransmission,
     ImmediateTransmission,
-    OnHeadersReceived,
-    SendResponse,
     ThrottledTransmission,
+    TransmissionStrategy,
     TruncateBody,
+    Writer,
 )
-from localstub.tlsproxy import AsyncTLSInterceptProxy
-from localstub.traffic_jsonl import dump_server_traffic_jsonl
 
 __all__ = [
     "AbortTransmission",
+    "ApplyResult",
     "AsyncHTTPTestServer",
-    "AsyncTLSInterceptProxy",
-    "AsyncioClient",
     "ByteFlip",
     "CloseConnection",
     "CloseDuringRequest",
     "ClosePhase",
     "CloseReason",
     "ConnectionClosed",
+    "ConnectionState",
+    "CountingStreamReader",
     "Delay",
     "DropConnection",
+    "FaultStep",
     "FaultyTransmission",
+    "HTTPConnection",
     "HTTPRequest",
     "HTTPRequestHeaders",
     "HTTPResponse",
-    "HeaderContext",
     "HeaderDecision",
-    "HeaderMiddleware",
-    "HeaderNext",
-    "Headers",
     "ImmediateTransmission",
+    "KeepAlivePolicy",
     "OnHeadersReceived",
-    "ParsedURI",
     "RecordedExchange",
     "RecordedHTTPRequest",
     "RecordedHTTPResponse",
-    "ResponderContext",
-    "ResponderMiddleware",
-    "ResponderNext",
+    "RecordingStreamWriter",
+    "RequestPipeline",
+    "ResponderHandler",
     "ResponseSpec",
     "SendResponse",
     "SendResult",
-    "SenderContext",
-    "SenderMiddleware",
-    "SenderNext",
+    "ThrottleResponse",
     "ThrottledTransmission",
+    "TransmissionStrategy",
     "TruncateBody",
-    "close_during_request",
-    "dump_server_traffic_jsonl",
+    "Writer",
+    "pack_linger_option",
 ]

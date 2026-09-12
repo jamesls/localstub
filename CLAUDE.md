@@ -30,7 +30,7 @@ uv sync --all-extras --dev
 poe test
 
 # Run specific test file
-uv run pytest tests/unit/test_server.py
+uv run pytest tests/unit/server/test_core.py
 
 # Run specific test function
 uv run pytest tests/integration/test_server.py::test_server_receives_request_and_returns_json_response
@@ -69,19 +69,26 @@ exceptions. The expectation is: code change → `poe auto-check` → `poe test`.
 
 ### Core Components
 
-**AsyncHTTPTestServer** (`src/localstub/server.py`)
+**AsyncHTTPTestServer** (`src/localstub/server/core.py`)
 - Main test server class using asyncio's `start_server`
 - Records all incoming requests in `.requests` list and `.last_request`
 - Supports both static responses and dynamic handler functions
 - Handler can be sync or async: `Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]`
+- Keep-alive policy via `set_keep_alive(...)`; connection faults via
+  `CloseConnection`, `CloseDuringRequest`, and `DropConnection`
 
-**HTTPRequest** (`src/localstub/server.py`)
+**HTTPConnection** (`src/localstub/server/connection.py`)
+- Runs the per-connection request loop and owns a `ConnectionState`
+- Publishes exactly one `ConnectionClosed` event per connection
+  (`.closed_connections`, `.last_closed_connection`, `.next_closed_connection()`)
+
+**HTTPRequest** (`src/localstub/http/request.py`)
 - Captures HTTP request details including method, path, headers, body
 - `wire_raw_bytes` contains exact bytes received from the wire, including chunked framing
 - `json_body` property for convenient JSON access
 - `client` tuple contains (host, port) of the client
 
-**HTTPResponse** (`src/localstub/server.py`)
+**HTTPResponse** (`src/localstub/http/responsespec.py`)
 - Dataclass for configuring HTTP responses
 - Factory methods: `.json()`, `.text()`, `.raw()` for common response types
 - Automatically sets appropriate Content-Type and Content-Length headers
@@ -98,8 +105,11 @@ exceptions. The expectation is: code change → `poe auto-check` → `poe test`.
 
 ```
 src/localstub/
-  __init__.py      # Empty, package marker
-  server.py        # All core functionality
+  __init__.py      # Public re-exports
+  server/          # AsyncHTTPTestServer (core.py), HTTPConnection
+                   # (connection.py), transmission strategies
+  http/            # Parser, headers, responses, exchange records
+  middleware/      # Responder / sender / header middleware and faults
 
 tests/
   unit/            # Unit tests

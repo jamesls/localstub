@@ -1,12 +1,21 @@
 import asyncio
+import logging
 import socket
 
 import pytest
 
 from localstub.forward import RawForwarder
 from localstub.http.clients.asyncio import AsyncioClient
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest
-from localstub.middleware import ResponderContext, ResponderNext, ResponseSpec
+from localstub.middleware import (
+    HeaderContext,
+    HeaderDecision,
+    HeaderNext,
+    ResponderContext,
+    ResponderNext,
+    ResponseSpec,
+)
 from localstub.server import (
     AsyncHTTPTestServer,
     HTTPResponse,
@@ -295,6 +304,141 @@ async def test_bodyless_response_preserves_keep_alive_connection(
         finally:
             writer.close()
             await writer.wait_closed()
+
+
+@pytest.mark.parametrize(
+    ("method", "status"),
+    [("HEAD", 200), ("GET", 204), ("GET", 304)],
+)
+@pytest.mark.asyncio
+async def test_header_phase_bodyless_response_keeps_pipelined_response_intact(
+    method: str,
+    status: int,
+) -> None:
+    async def respond_early(
+        ctx: HeaderContext, call_next: HeaderNext
+    ) -> HeaderDecision:
+        _ = call_next
+        if ctx.headers.path == "/bodyless":
+            await ctx.send(
+                HTTPResponse(status=status, body=b"unexpected-body")
+            )
+        return True
+
+    async with AsyncHTTPTestServer(
+        default_response=HTTPResponse.text("next-response")
+    ) as server:
+        server.use_headers(respond_early)
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        try:
+            writer.write(
+                f"{method} /bodyless HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "\r\n".encode()
+                + b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            )
+            await writer.drain()
+
+            first_response = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"),
+                timeout=1.0,
+            )
+            assert first_response.startswith(f"HTTP/1.1 {status} ".encode())
+            if status == 204:
+                assert b"content-length:" not in first_response.lower()
+            else:
+                assert b"Content-Length: 15\r\n" in first_response
+
+            next_response = await _read_http_response(reader)
+            assert next_response.startswith(b"HTTP/1.1 200 OK\r\n")
+            assert next_response.endswith(b"next-response")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_header_phase_101_closes_without_further_http_response() -> None:
+    async def switch_protocols(
+        ctx: HeaderContext, call_next: HeaderNext
+    ) -> HeaderDecision:
+        _ = call_next
+        await ctx.send(
+            HTTPResponse(
+                status=101,
+                headers=Headers.from_items([
+                    ("Connection", "Upgrade"),
+                    ("Upgrade", "custom"),
+                ]),
+            )
+        )
+        return True
+
+    async with AsyncHTTPTestServer(
+        default_response=HTTPResponse.text("unexpected")
+    ) as server:
+        server.use_headers(switch_protocols)
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        try:
+            writer.write(
+                b"GET /upgrade HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Upgrade: custom\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+            wire = await asyncio.wait_for(reader.read(), timeout=1.0)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        closed = await server.next_closed_connection(timeout=1.0)
+
+    assert wire.startswith(b"HTTP/1.1 101 Switching Protocols\r\n")
+    assert wire.count(b"HTTP/1.1") == 1
+    assert b"unexpected" not in wire
+    exchange = server.exchanges[0]
+    assert exchange.response is not None
+    assert exchange.response.status == 101
+    assert exchange.interim_responses == ()
+    assert closed.reason == "connection_close"
+
+
+@pytest.mark.asyncio
+async def test_rejected_transfer_encoding_closes_without_logging_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with AsyncHTTPTestServer() as server:
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        try:
+            with caplog.at_level(logging.ERROR, logger="localstub"):
+                writer.write(
+                    b"POST / HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    b"Transfer-Encoding: gzip\r\n"
+                    b"\r\n"
+                    b"body"
+                )
+                await writer.drain()
+                wire = await asyncio.wait_for(reader.read(), timeout=1.0)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        request = await server.next_request(timeout=1.0)
+        closed = await server.next_closed_connection(timeout=1.0)
+
+    assert wire == b""
+    assert not request.body_complete
+    assert request.headers.get("Transfer-Encoding") == "gzip"
+    assert closed.reason == "protocol_error"
+    assert closed.phase == "request_body"
+    assert caplog.records == []
 
 
 @pytest.mark.asyncio

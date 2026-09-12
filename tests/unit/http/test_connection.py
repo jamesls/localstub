@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from email.message import Message
+
 from hypothesis import given
 from hypothesis import strategies as st
 
 from localstub.http.connection import (
+    connection_tokens_from_headers,
+    parse_connection_tokens,
     response_allows_reuse,
     should_close_connection,
 )
 from localstub.http.headers import Headers
-from localstub.http.request import HTTPRequest, RecordedHTTPRequest
+from localstub.http.request import (
+    HTTPRequest,
+    HTTPRequestHeaders,
+    RecordedHTTPRequest,
+)
 from localstub.http.response import ParsedResponse
 
 _CONNECTION_TOKENS = ("close", "keep-alive", "upgrade", "custom")
@@ -68,6 +76,154 @@ def test_should_close_connection_http11_response_version_persists():
 def test_should_close_connection_unknown_response_version_persists():
     assert not should_close_connection(
         _request(),
+        response_headers={},
+    )
+
+
+def _partial_request(
+    http_version: str | None = "1.1",
+    headers: dict[str, str] | None = None,
+) -> HTTPRequestHeaders:
+    return HTTPRequestHeaders(
+        method="POST",
+        path="/upload",
+        http_version=http_version,
+        headers=Headers.from_items((headers or {}).items()),
+        wire_raw_bytes=b"",
+    )
+
+
+def test_parse_connection_tokens_lowercases_and_strips_tokens() -> None:
+    assert parse_connection_tokens(" Keep-Alive , CLOSE,, upgrade") == {
+        "keep-alive",
+        "close",
+        "upgrade",
+    }
+
+
+def test_parse_connection_tokens_with_empty_value_returns_empty() -> None:
+    assert parse_connection_tokens("") == set()
+
+
+def test_connection_tokens_from_headers_with_none_returns_empty() -> None:
+    assert connection_tokens_from_headers(None) == set()
+
+
+def test_connection_tokens_from_headers_merges_repeated_headers() -> None:
+    headers = Headers.from_items([
+        ("Connection", "keep-alive"),
+        ("connection", "Upgrade, close"),
+    ])
+
+    assert connection_tokens_from_headers(headers) == {
+        "keep-alive",
+        "upgrade",
+        "close",
+    }
+
+
+def test_connection_tokens_from_headers_accepts_email_message() -> None:
+    message = Message()
+    message["Connection"] = "close"
+
+    assert connection_tokens_from_headers(message) == {"close"}
+
+
+def test_should_close_connection_101_status_closes_despite_keep_alive() -> (
+    None
+):
+    assert should_close_connection(
+        _request(headers={"Connection": "keep-alive"}),
+        response_headers={"Connection": "keep-alive"},
+        response_version="1.1",
+        response_status=101,
+    )
+
+
+def test_should_close_connection_non_switching_status_persists() -> None:
+    assert not should_close_connection(
+        _request(),
+        response_headers={},
+        response_status=200,
+    )
+
+
+def test_should_close_connection_without_response_headers_persists() -> None:
+    assert not should_close_connection(_request(), response_headers=None)
+
+
+def test_should_close_connection_response_dict_close_token_closes() -> None:
+    assert should_close_connection(
+        _request(),
+        response_headers={"connection": "Close"},
+    )
+
+
+def test_should_close_connection_response_headers_close_token_closes() -> None:
+    assert should_close_connection(
+        _request(),
+        response_headers=Headers.from_items([("Connection", "close")]),
+    )
+
+
+def test_should_close_connection_dict_without_connection_persists() -> None:
+    assert not should_close_connection(
+        _request(),
+        response_headers={"Content-Type": "text/plain"},
+    )
+
+
+def test_should_close_connection_http11_request_close_token_closes() -> None:
+    assert should_close_connection(
+        _request(headers={"Connection": "close"}),
+        response_headers={},
+    )
+
+
+def test_should_close_connection_http11_request_without_close_persists() -> (
+    None
+):
+    assert not should_close_connection(
+        _request(headers={"Connection": "keep-alive"}),
+        response_headers={},
+    )
+
+
+def test_should_close_connection_http10_request_no_keep_alive_closes() -> None:
+    assert should_close_connection(
+        _request(http_version="1.0"),
+        response_headers={},
+    )
+
+
+def test_should_close_connection_http10_request_with_keep_alive_persists() -> (
+    None
+):
+    assert not should_close_connection(
+        _request(http_version="1.0", headers={"Connection": "keep-alive"}),
+        response_headers={},
+    )
+
+
+def test_should_close_connection_unknown_request_version_closes() -> None:
+    assert should_close_connection(
+        _partial_request(http_version=None),
+        response_headers={},
+    )
+
+
+def test_should_close_connection_partial_request_close_token_closes() -> None:
+    assert should_close_connection(
+        _partial_request(headers={"Connection": "close"}),
+        response_headers={},
+    )
+
+
+def test_should_close_connection_partial_request_without_close_persists() -> (
+    None
+):
+    assert not should_close_connection(
+        _partial_request(),
         response_headers={},
     )
 

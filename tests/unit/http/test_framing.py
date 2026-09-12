@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sys
 
 import pytest
@@ -8,6 +10,8 @@ from localstub.http.framing import (
     ChunkScanError,
     chunk_payloads,
     content_length,
+    is_chunked_transfer,
+    scan_chunk_payloads,
     scan_chunked_body,
 )
 
@@ -32,8 +36,9 @@ def test_content_length_with_arbitrary_value_accepts_only_digits(
     result = content_length([(b"Content-Length", value)])
 
     digits = value.strip()
-    if digits.isdigit() and len(digits) <= sys.get_int_max_str_digits():
-        assert result == int(digits)
+    significant = digits.lstrip(b"0")
+    if digits.isdigit() and len(significant) <= sys.get_int_max_str_digits():
+        assert result == int(significant or b"0")
     else:
         assert result is None
 
@@ -42,6 +47,16 @@ def test_content_length_with_over_limit_digits_returns_none() -> None:
     value = b"1" * (sys.get_int_max_str_digits() + 1)
 
     assert content_length([(b"Content-Length", value)]) is None
+
+
+def test_content_length_with_over_limit_leading_zeros_returns_value() -> None:
+    value = b"0" * sys.get_int_max_str_digits() + b"42"
+
+    assert content_length([(b"Content-Length", value)]) == 42
+
+
+def test_content_length_with_only_zeros_returns_zero() -> None:
+    assert content_length([(b"Content-Length", b"000")]) == 0
 
 
 def test_scan_chunked_body_resumes_after_complete_chunks() -> None:
@@ -56,6 +71,121 @@ def test_scan_chunked_body_resumes_after_complete_chunks() -> None:
     second_scan = scan_chunked_body(buffer, first_scan.resume_from)
 
     assert second_scan.end == len(buffer)
+
+
+def test_is_chunked_transfer_with_chunked_token_returns_true() -> None:
+    assert is_chunked_transfer([(b"Transfer-Encoding", b"gzip, chunked")])
+
+
+def test_is_chunked_transfer_with_other_encodings_only_returns_false() -> None:
+    assert not is_chunked_transfer([(b"Transfer-Encoding", b"gzip")])
+
+
+def test_is_chunked_transfer_finds_chunked_in_later_header() -> None:
+    headers = [
+        (b"Transfer-Encoding", b"gzip"),
+        (b"transfer-encoding", b"chunked"),
+    ]
+
+    assert is_chunked_transfer(headers)
+
+
+def test_is_chunked_transfer_without_transfer_encoding_returns_false() -> None:
+    assert not is_chunked_transfer([(b"Content-Length", b"5")])
+
+
+def test_scan_chunk_payloads_empty_chunk_size_raises_error_at_first_byte() -> (
+    None
+):
+    with pytest.raises(ChunkScanError) as excinfo:
+        scan_chunk_payloads(bytearray(b"\r\nhello\r\n"))
+
+    assert excinfo.value.offset == 1
+
+
+def test_scan_chunk_payloads_bare_cr_after_size_raises_error() -> None:
+    with pytest.raises(ChunkScanError) as excinfo:
+        scan_chunk_payloads(bytearray(b"5\rXhello\r\n"))
+
+    assert excinfo.value.offset == 2
+
+
+def test_scan_chunk_payloads_extension_without_size_raises_error() -> None:
+    with pytest.raises(ChunkScanError) as excinfo:
+        scan_chunk_payloads(bytearray(b";ext=1\r\nhello\r\n"))
+
+    assert excinfo.value.offset == 1
+
+
+def test_scan_chunk_payloads_reports_complete_chunk_data_ranges() -> None:
+    buffer = bytearray(b"5\r\nhello\r\n3\r\nabc\r\n")
+
+    scan = scan_chunk_payloads(buffer)
+
+    assert scan.payloads == ((3, 8), (13, 16))
+    assert scan.partial is None
+    assert scan.end is None
+    assert scan.resume_from == len(buffer)
+
+
+def test_scan_chunk_payloads_reports_partial_chunk_data() -> None:
+    buffer = bytearray(b"5\r\nhello\r\n3\r\nab")
+
+    scan = scan_chunk_payloads(buffer)
+
+    assert scan.payloads == ((3, 8),)
+    assert scan.partial == (13, 15)
+    assert scan.end is None
+    assert scan.resume_from == 10
+
+
+def test_scan_chunk_payloads_size_line_cut_after_cr_is_incomplete() -> None:
+    scan = scan_chunk_payloads(bytearray(b"5\r\nhello\r\n5\r"))
+
+    assert scan.payloads == ((3, 8),)
+    assert scan.partial is None
+    assert scan.end is None
+    assert scan.resume_from == 10
+
+
+@pytest.mark.parametrize(
+    ("buffer", "payloads", "partial", "resume_from"),
+    [
+        (b"5\r\n", (), (3, 3), 0),
+        (b"5\r\nhello\r\n3;ext=1\r\n", ((3, 8),), (19, 19), 10),
+    ],
+)
+def test_scan_chunk_payloads_chunk_without_data_has_empty_partial(
+    buffer: bytes,
+    payloads: tuple[tuple[int, int], ...],
+    partial: tuple[int, int],
+    resume_from: int,
+) -> None:
+    scan = scan_chunk_payloads(bytearray(buffer))
+
+    assert scan.payloads == payloads
+    assert scan.partial == partial
+    assert scan.end is None
+    assert scan.resume_from == resume_from
+
+
+def test_scan_chunk_payloads_terminal_chunk_with_trailers_sets_end() -> None:
+    buffer = bytearray(b"5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n")
+
+    scan = scan_chunk_payloads(buffer)
+
+    assert scan.payloads == ((3, 8),)
+    assert scan.end == len(buffer)
+    assert scan.resume_from == len(buffer)
+
+
+def test_scan_chunk_payloads_incomplete_trailers_resume_at_terminal() -> None:
+    buffer = bytearray(b"5\r\nhello\r\n0\r\nX-Checksum: abc")
+
+    scan = scan_chunk_payloads(buffer)
+
+    assert scan.end is None
+    assert scan.resume_from == 10
 
 
 def test_chunk_payloads_returns_single_chunk_data() -> None:

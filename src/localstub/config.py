@@ -6,15 +6,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from localstub.server import HTTPResponse
+from localstub.server import CloseConnection, HTTPResponse
+
+type ConfiguredResponse = HTTPResponse | CloseConnection
 
 
 @dataclass
 class ResponseConfig:
-    """Parsed response configuration from a JSON config file."""
+    """Parsed response configuration from a JSON config file.
 
-    single_response: HTTPResponse | None
-    response_sequence: list[HTTPResponse] | None
+    A ``{"type": "close"}`` entry becomes a ``CloseConnection``, with
+    optional ``reset`` and ``delay`` keys.
+    """
+
+    single_response: ConfiguredResponse | None
+    response_sequence: list[ConfiguredResponse] | None
 
 
 def load_config(config_path: Path) -> ResponseConfig:
@@ -53,14 +59,22 @@ def _parse_config(data: dict[str, Any]) -> ResponseConfig:
         )
 
 
-def _parse_response_spec(spec: dict[str, Any]) -> HTTPResponse:
-    """Parse a single response specification into HTTPResponse."""
+def _parse_response_spec(spec: dict[str, Any]) -> ConfiguredResponse:
+    """Parse a single response specification into a response or close."""
     resp_type = spec.get("type", "json")
     status = spec.get("status", 200)
     headers = spec.get("headers")
     body = spec.get("body")
     encoding = spec.get("encoding", "utf-8")
 
+    if resp_type == "close":
+        reset = spec.get("reset", False)
+        if not isinstance(reset, bool):
+            msg = f"Invalid reset value for close response: {reset!r}"
+            raise ValueError(msg)
+        return CloseConnection(
+            reset=reset, delay=float(spec.get("delay", 0.0))
+        )
     if resp_type == "json":
         return HTTPResponse.json(body, status=status, headers=headers)
     elif resp_type == "text":
@@ -76,8 +90,6 @@ def _parse_response_spec(spec: dict[str, Any]) -> HTTPResponse:
             raw_bytes = base64.b64decode(body)
         elif isinstance(body, str):
             raw_bytes = body.encode("utf-8")
-        elif isinstance(body, bytes):
-            raw_bytes = body
         else:
             msg = f"Invalid body type for raw response: {type(body)}"
             raise ValueError(msg)

@@ -1902,9 +1902,20 @@ async def test_on_headers_received_can_reject_with_response():
                 content=b"x" * 200,
             )
 
-        assert response.status_code == 413
-        # Request should not be recorded since we rejected early
-        assert len(server.requests) == 0
+        closed = await server.next_closed_connection(timeout=1.0)
+
+    assert response.status_code == 413
+    # The headers completed, so the partial request, the early
+    # response, and the close are all recorded.
+    assert len(server.requests) == 1
+    assert not server.requests[0].body_complete
+    assert server.requests[0].body == b""
+    assert len(server.exchanges) == 1
+    assert server.exchanges[0].response is not None
+    assert server.exchanges[0].response.status == 413
+    assert server.exchanges[0].closed is closed
+    assert closed.reason == "request_read"
+    assert closed.phase == "request_body"
 
 
 @pytest.mark.asyncio
@@ -1988,10 +1999,16 @@ async def test_on_headers_received_rejection_stops_body_read():
                 content=b"secret data that should not be read",
             )
 
-        assert response.status_code == 403
-        # Handler should never have been called
-        assert len(body_received) == 0
-        assert len(server.requests) == 0
+        closed = await server.next_closed_connection(timeout=1.0)
+
+    assert response.status_code == 403
+    # Handler should never have been called
+    assert len(body_received) == 0
+    assert len(server.requests) == 1
+    assert not server.requests[0].body_complete
+    assert server.exchanges[0].response is not None
+    assert server.exchanges[0].response.status == 403
+    assert closed.reason == "request_read"
 
 
 @pytest.mark.asyncio
@@ -2077,6 +2094,7 @@ async def test_exchange_timestamps_use_timestamp_provider():
         datetime(2026, 1, 27, 12, 0, 1, tzinfo=UTC),
         datetime(2026, 1, 27, 12, 0, 2, tzinfo=UTC),
         datetime(2026, 1, 27, 12, 0, 3, tzinfo=UTC),
+        datetime(2026, 1, 27, 12, 0, 4, tzinfo=UTC),
     ]
     provider = ManualTimestampProvider(timestamps)
 
@@ -2085,12 +2103,14 @@ async def test_exchange_timestamps_use_timestamp_provider():
         async with httpx.AsyncClient() as client:
             await client.get(server.url)
             await client.get(server.url)
+        closed = await server.next_closed_connection(timeout=1.0)
 
     assert len(server.exchanges) == 2
     assert server.exchanges[0].request_timestamp == timestamps[0]
     assert server.exchanges[0].response_timestamp == timestamps[1]
     assert server.exchanges[1].request_timestamp == timestamps[2]
     assert server.exchanges[1].response_timestamp == timestamps[3]
+    assert closed.timestamp == timestamps[4]
 
 
 @pytest.mark.asyncio

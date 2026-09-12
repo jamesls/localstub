@@ -4,7 +4,7 @@ import asyncio
 
 from pytest_codspeed import BenchmarkFixture
 
-from localstub.http.request import AsyncRequestParser, ParsedRequest
+from localstub.http.request import AsyncRequestParser, ParseOutcome
 
 SIMPLE_GET = (
     b"GET /v1/items?page=2 HTTP/1.1\r\n"
@@ -44,7 +44,7 @@ CHUNKED_POST = (
 )
 
 
-async def parse_request(wire: bytes) -> tuple[ParsedRequest | None, bytes]:
+async def parse_request(wire: bytes) -> ParseOutcome:
     # parse() consumes both the reader and the parser, so they are
     # rebuilt for every sample; feeding prebuilt bytes into a reader is
     # a small constant next to the parse itself.
@@ -58,31 +58,31 @@ def test_parse_simple_get(
     benchmark: BenchmarkFixture,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
-    def parse_once() -> tuple[ParsedRequest | None, bytes]:
+    def parse_once() -> ParseOutcome:
         return loop.run_until_complete(parse_request(SIMPLE_GET))
 
-    parsed, wire = benchmark(parse_once)
+    outcome = benchmark(parse_once)
 
+    parsed = outcome.complete_request
     assert parsed is not None
-    assert parsed.is_complete
     assert parsed.method == "GET"
     assert parsed.url == b"/v1/items?page=2"
     assert len(parsed.headers) == SIMPLE_GET_HEADER_COUNT
     assert parsed.body == b""
-    assert wire == SIMPLE_GET
+    assert outcome.wire_bytes == SIMPLE_GET
 
 
 def test_parse_chunked_post_with_trailer(
     benchmark: BenchmarkFixture,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
-    def parse_once() -> tuple[ParsedRequest | None, bytes]:
+    def parse_once() -> ParseOutcome:
         return loop.run_until_complete(parse_request(CHUNKED_POST))
 
-    parsed, wire = benchmark(parse_once)
+    outcome = benchmark(parse_once)
 
+    parsed = outcome.complete_request
     assert parsed is not None
-    assert parsed.is_complete
     assert parsed.method == "POST"
     assert parsed.body == CHUNKED_BODY
-    assert wire == CHUNKED_POST
+    assert outcome.wire_bytes == CHUNKED_POST

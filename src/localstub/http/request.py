@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from dataclasses import dataclass, field, replace
+from enum import Enum, auto
 from typing import Any, Protocol
 
 import httptools
@@ -11,13 +11,14 @@ import httptools
 from localstub.http import stream
 from localstub.http.framing import (
     HEADER_TERMINATOR,
+    ChunkPayloadScan,
     ChunkScanError,
-    chunk_payloads,
     content_length,
     is_chunked_transfer,
-    scan_chunked_body,
+    scan_chunk_payloads,
 )
 from localstub.http.headers import HeaderItem, Headers
+from localstub.http.stream import ByteStream
 from localstub.http.uri import ParsedURI, parse_absolute_uri
 from localstub.http.utils import headers_to_headers
 
@@ -37,7 +38,7 @@ class WireSink(Protocol):
     retention policy.  The parser only ever appends to it.
     """
 
-    def extend(self, data: bytes | bytearray) -> None: ...
+    def extend(self, data: bytes | bytearray, /) -> None: ...
 
 
 def client_address(writer: Writer) -> tuple[str, int] | None:
@@ -184,6 +185,14 @@ class RecordedHTTPRequest:
     Reads delegate to ``request``; writes (``with_method`` etc.) rebuild
     ``request`` while ``as_received`` and the wire evidence never change
     after construction.
+
+    ``body_complete`` is ``False`` when the request was recorded before
+    its body reached the message boundary: the server stopped reading
+    it, the client disconnected, or the body failed to parse.  The
+    ``body`` is then the payload prefix consumed before the close and
+    ``wire_raw_bytes`` the wire prefix including framing.  It is a fact
+    about the observation, not the message, so it lives here and not on
+    ``HTTPRequest``.
     """
 
     request: HTTPRequest
@@ -191,6 +200,7 @@ class RecordedHTTPRequest:
     wire_raw_bytes: bytes
     http_version: str
     client: tuple[str, int] | None = None
+    body_complete: bool = True
 
     @classmethod
     def from_parsed(
@@ -221,6 +231,7 @@ class RecordedHTTPRequest:
             wire_raw_bytes=wire_raw_bytes,
             http_version=parsed.http_version or "",
             client=client,
+            body_complete=parsed.is_complete,
         )
 
     @property
@@ -390,6 +401,92 @@ def _build_request_parser() -> tuple[
     return protocol, parser
 
 
+class ParseStop(Enum):
+    """Why a parse call returned."""
+
+    COMPLETE = auto()
+    """The requested parse stage finished; check ``parsed.is_complete``
+    to learn whether the whole message reached its boundary."""
+
+    EOF = auto()
+    """The stream ended before the stage finished."""
+
+    PARSE_ERROR = auto()
+    """The bytes could not be parsed as HTTP."""
+
+    READ_ERROR = auto()
+    """Reading the stream raised; ``error`` carries the exception."""
+
+
+@dataclass(frozen=True)
+class ParseOutcome:
+    """Result of a request parse call.
+
+    ``parsed`` is ``None`` until the headers complete.  After that it
+    is present for every stop kind, with the body parts consumed so
+    far, so a caller can record a partial request.  ``wire_bytes`` is
+    exact for every stop kind: everything attributed to this request,
+    including framing, up to the point the parse stopped.
+    """
+
+    parsed: ParsedRequest | None
+    wire_bytes: bytes
+    stop: ParseStop
+    error: Exception | None = None
+
+    @property
+    def complete_request(self) -> ParsedRequest | None:
+        """The parsed request when the whole message reached its boundary."""
+        if self.parsed is None or self.stop is not ParseStop.COMPLETE:
+            return None
+        if not self.parsed.is_complete:
+            return None
+        return self.parsed
+
+
+class _ReadStatus(Enum):
+    DATA = auto()
+    EOF = auto()
+    ERROR = auto()
+
+
+def _chunk_limit_offset(
+    scan: ChunkPayloadScan,
+    scan_from: int,
+    budget: int,
+) -> int | None:
+    """Map a remaining payload budget to the wire offset to stop at.
+
+    Returns the offset just past the last allowed payload byte and its
+    framing. A partial chunk stops as soon as its payload reaches the
+    budget. A budget spent exactly at a chunk boundary stops there as
+    soon as the scan shows another chunk follows, even before any of
+    that chunk's data arrives. Otherwise, ``None`` means the caller
+    needs the message boundary or more data to decide.
+    """
+    spans = [*scan.payloads]
+    if scan.partial is not None:
+        spans.append(scan.partial)
+    if budget == 0:
+        return scan_from if spans else None
+
+    boundary = scan_from
+    for index, (start, end) in enumerate(scan.payloads):
+        size = end - start
+        if size > budget:
+            return start + budget
+        budget -= size
+        boundary = end + 2
+        if budget == 0:
+            return boundary if len(spans) > index + 1 else None
+
+    if scan.partial is not None:
+        start, end = scan.partial
+        if end - start >= budget:
+            return start + budget
+    return None
+
+
 class AsyncRequestParser:
     """Async wrapper for httptools.HttpRequestParser with wire tracking.
 
@@ -406,22 +503,24 @@ class AsyncRequestParser:
         self._connection_wire_offset = 0
         self._max_read = max_read
         self._upgraded = False
+        self._read_error: Exception | None = None
+        self._header_error: Exception | None = None
 
     async def parse(
         self,
-        reader: asyncio.StreamReader,
+        reader: ByteStream,
         connection_wire: WireSink | None = None,
-    ) -> tuple[ParsedRequest | None, bytes]:
+    ) -> ParseOutcome:
         """Parse a complete HTTP request from the stream.
 
         Args:
-            reader: The asyncio stream to read from.
+            reader: The stream to read from.
             connection_wire: Optional buffer to accumulate connection-level
                 bytes (for tracking across multiple requests).
 
         Returns:
-            Tuple of (parsed_request, wire_bytes).
-            Returns (None, wire_bytes) on parse error or EOF before complete.
+            The parse outcome; ``complete_request`` is the request when
+            it reached its message boundary.
 
         Note:
             This method parses headers and bodies in buffered segments while
@@ -430,16 +529,17 @@ class AsyncRequestParser:
             ``localstub.http.stream.unread_data()`` for the next consumer
             of the reader.
         """
-        parsed, wire_bytes, remaining = await self.parse_headers(
+        outcome, remaining = await self.parse_headers(
             reader,
             connection_wire,
         )
-        if parsed is None:
-            return None, wire_bytes
+        parsed = outcome.parsed
+        if parsed is None or outcome.stop is not ParseStop.COMPLETE:
+            return outcome
 
         if parsed.is_complete:
             stream.unread_data(reader, remaining)
-            return parsed, wire_bytes
+            return outcome
 
         return await self.continue_parse_body(
             reader,
@@ -454,30 +554,37 @@ class AsyncRequestParser:
 
     async def parse_headers(
         self,
-        reader: asyncio.StreamReader,
+        reader: ByteStream,
         connection_wire: WireSink | None = None,
-    ) -> tuple[ParsedRequest | None, bytes, bytearray]:
+    ) -> tuple[ParseOutcome, bytearray]:
         """Parse request headers only, stopping before body.
 
         Args:
-            reader: The asyncio stream to read from.
+            reader: The stream to read from.
             connection_wire: Optional buffer to accumulate connection-level
                 bytes (for tracking across multiple requests).
 
         Returns:
-            Tuple of (parsed_request, header_wire_bytes, remaining_buffer).
-            The remaining_buffer contains bytes read but not yet processed,
-            which should be passed to continue_parse_body().
-            Returns (None, wire_bytes, empty_buffer) on parse error or EOF.
+            Tuple of (outcome, remaining_buffer).  The outcome's
+            ``parsed`` is present once the headers are complete, and
+            ``remaining_buffer`` holds bytes read but not yet processed,
+            which should be passed to continue_parse_body().  On any
+            other stop the remaining buffer is empty.  A ``PARSE_ERROR``
+            stop can carry ``parsed``: the parser rejects some requests
+            at the header boundary, after the headers completed, such
+            as a ``Transfer-Encoding`` whose final coding is not
+            ``chunked`` (RFC 9112 §6.1).  Check ``stop`` before reading
+            the body.
         """
         buffer = bytearray()
         fed = 0
+        status = _ReadStatus.DATA
 
         while not self._protocol.result.headers_complete:
             header_end = buffer.find(HEADER_TERMINATOR)
             if header_end == -1:
-                has_more = await self._read_more(reader, buffer)
-                if not has_more:
+                status = await self._read_more(reader, buffer)
+                if status is not _ReadStatus.DATA:
                     break
                 header_end = buffer.find(HEADER_TERMINATOR)
 
@@ -494,119 +601,155 @@ class AsyncRequestParser:
                 self._parser.feed_data(segment)
             except httptools.HttpParserUpgrade:
                 self._note_upgrade()
-            except httptools.HttpParserError:
+            except httptools.HttpParserError as exc:
+                self._header_error = exc
                 error_offset = self._precise_error_offset(
                     bytes(buffer[:feed_end])
                 )
                 self._wire.extend(buffer[:error_offset])
                 self._sync_connection_wire(connection_wire)
                 stream.unread_data(reader, buffer[error_offset:])
-                return None, bytes(self._wire), bytearray()
+                return self._outcome(ParseStop.PARSE_ERROR, exc), bytearray()
 
             fed = feed_end
 
         if not self._protocol.result.headers_complete:
             self._wire.extend(buffer)
             self._sync_connection_wire(connection_wire)
-            return None, bytes(self._wire), bytearray()
+            return self._headers_stopped(status), bytearray()
 
         header_end = buffer.find(HEADER_TERMINATOR) + len(HEADER_TERMINATOR)
         self._wire.extend(buffer[:header_end])
         self._sync_connection_wire(connection_wire)
-        return (
-            self._protocol.result,
-            bytes(self._wire),
-            buffer[header_end:],
-        )
+        return self._outcome(ParseStop.COMPLETE), buffer[header_end:]
 
     async def continue_parse_body(
         self,
-        reader: asyncio.StreamReader,
+        reader: ByteStream,
         remaining_buffer: bytearray,
         connection_wire: WireSink | None = None,
-    ) -> tuple[ParsedRequest | None, bytes]:
+        *,
+        max_body_bytes: int | None = None,
+    ) -> ParseOutcome:
         """Continue parsing the request body after headers.
 
         Call this after parse_headers() and after sending any interim
         response (like 100 Continue).
 
         Args:
-            reader: The asyncio stream to continue reading from.
+            reader: The stream to continue reading from.
             remaining_buffer: Buffer returned from parse_headers().
             connection_wire: Optional buffer for connection-level tracking.
+            max_body_bytes: Stop after consuming this many payload bytes,
+                excluding transfer framing, or at the message boundary,
+                whichever comes first.  ``None`` reads to the boundary.
 
         Returns:
-            Tuple of (parsed_request, complete_wire_bytes).
-            Returns (None, wire_bytes) on parse error or EOF.
+            The parse outcome.  Its ``wire_bytes`` covers the whole
+            request read so far; bytes beyond the stopping point are
+            returned to the stream.
         """
         buffer = remaining_buffer
+        result = self._protocol.result
 
-        if self._protocol.result.is_complete:
+        if result.is_complete or max_body_bytes == 0:
             stream.unread_data(reader, buffer)
             self._sync_connection_wire(connection_wire)
-            return self._protocol.result, bytes(self._wire)
+            return self._outcome(ParseStop.COMPLETE)
 
-        if is_chunked_transfer(self._protocol.result.headers):
+        if is_chunked_transfer(result.headers):
             return await self._parse_chunked_body(
                 reader,
                 buffer,
                 connection_wire,
+                max_body_bytes,
             )
 
-        body_length = content_length(self._protocol.result.headers)
-        if body_length is not None:
-            return await self._parse_content_length_body(
-                reader,
-                buffer,
-                body_length,
-                connection_wire,
-            )
+        body_length = content_length(result.headers)
+        if body_length is None:
+            return self._unframed_body(reader, buffer, connection_wire)
+        return await self._parse_content_length_body(
+            reader,
+            buffer,
+            body_length,
+            connection_wire,
+            max_body_bytes,
+        )
 
-        while not self._protocol.result.is_complete:
-            if not buffer:
-                has_more = await self._read_more(reader, buffer)
-                if not has_more:
-                    break
+    def _unframed_body(
+        self,
+        reader: ByteStream,
+        buffer: bytearray,
+        connection_wire: WireSink | None,
+    ) -> ParseOutcome:
+        """Refuse to read a body whose length the headers do not give.
 
-            segment = bytes(buffer)
-            try:
-                self._parser.feed_data(segment)
-            except httptools.HttpParserError:
-                return self._body_parse_error(
-                    reader,
-                    buffer,
-                    len(buffer),
-                    connection_wire,
-                )
-
-            self._wire.extend(segment)
-            buffer.clear()
-
-        if not self._protocol.result.is_complete:
-            self._wire.extend(buffer)
-            self._sync_connection_wire(connection_wire)
-            return None, bytes(self._wire)
-
+        httptools leaves a request open past its headers only when
+        they framed a body, so reaching here means it rejected the
+        request at the header boundary and ``parse_headers()`` already
+        reported that.  The stage stays a parse error rather than
+        reading an undelimited body; the buffered bytes go back to the
+        stream.
+        """
         stream.unread_data(reader, buffer)
         self._sync_connection_wire(connection_wire)
-        return self._protocol.result, bytes(self._wire)
+        return self._outcome(ParseStop.PARSE_ERROR, self._header_error)
+
+    def snapshot(self) -> ParseOutcome:
+        """Describe what has been parsed so far without reading further.
+
+        For a parse call that was cancelled: the outcome carries the
+        headers and the body parts delivered before the interruption,
+        as a ``COMPLETE`` stop whose message is incomplete, the same
+        shape as a stage the caller limited on purpose.
+        """
+        return self._outcome(ParseStop.COMPLETE)
+
+    def _outcome(
+        self,
+        stop: ParseStop,
+        error: Exception | None = None,
+    ) -> ParseOutcome:
+        result = self._protocol.result
+        parsed = result if result.headers_complete else None
+        return ParseOutcome(parsed, bytes(self._wire), stop, error)
+
+    def _headers_stopped(self, status: _ReadStatus) -> ParseOutcome:
+        """Outcome for a header read that ended before they completed.
+
+        With data still flowing the loop only stops when the parser
+        refused to complete the headers, which is a parse failure.
+        """
+        if status is _ReadStatus.DATA:
+            return self._outcome(ParseStop.PARSE_ERROR)
+        return self._body_outcome(status)
+
+    def _body_outcome(self, status: _ReadStatus) -> ParseOutcome:
+        """Outcome for a body read; the stage completed unless the
+        stream ended or failed first."""
+        if status is _ReadStatus.ERROR:
+            return self._outcome(ParseStop.READ_ERROR, self._read_error)
+        if status is _ReadStatus.EOF:
+            return self._outcome(ParseStop.EOF)
+        return self._outcome(ParseStop.COMPLETE)
 
     async def _read_more(
         self,
-        reader: asyncio.StreamReader,
+        reader: ByteStream,
         buffer: bytearray,
-    ) -> bool:
+    ) -> _ReadStatus:
         try:
             data = await stream.read(reader, self._max_read)
-        except Exception:
+        except Exception as exc:
             LOG.debug("Failed to read request data", exc_info=True)
-            return False
+            self._read_error = exc
+            return _ReadStatus.ERROR
 
         if not data:
-            return False
+            return _ReadStatus.EOF
 
         buffer.extend(data)
-        return True
+        return _ReadStatus.DATA
 
     def _sync_connection_wire(
         self,
@@ -637,18 +780,19 @@ class AsyncRequestParser:
 
     def _body_parse_error(
         self,
-        reader: asyncio.StreamReader,
+        reader: ByteStream,
         buffer: bytearray,
         consumed_guess: int,
         connection_wire: WireSink | None,
-    ) -> tuple[ParsedRequest | None, bytes]:
+        error: Exception,
+    ) -> ParseOutcome:
         candidate = bytes(self._wire) + bytes(buffer[:consumed_guess])
         error_offset = self._precise_error_offset(candidate)
         body_offset = max(0, error_offset - len(self._wire))
         self._wire.extend(buffer[:body_offset])
         self._sync_connection_wire(connection_wire)
         stream.unread_data(reader, buffer[body_offset:])
-        return None, bytes(self._wire)
+        return self._outcome(ParseStop.PARSE_ERROR, error)
 
     def _note_upgrade(self) -> None:
         """Arrange for an Upgrade request's declared body to be read.
@@ -659,18 +803,26 @@ class AsyncRequestParser:
         the premature completion flag so the body framing logic runs;
         the body is then consumed without the parser, which accepts
         no further data after the upgrade.  CONNECT requests have no
-        content, so their tunnel bytes are never mistaken for a body.
+        content, so their tunnel bytes are never mistaken for a body,
+        and ``Content-Length: 0`` declares none, so the header boundary
+        stays the message boundary.
         """
         self._upgraded = True
         result = self._protocol.result
         if result.method == "CONNECT":
             return
+        declared = content_length(result.headers)
         if is_chunked_transfer(result.headers) or (
-            content_length(result.headers) is not None
+            declared is not None and declared > 0
         ):
             result.is_complete = False
 
-    def _complete_upgrade_body(self, parts: list[bytes]) -> None:
+    def _deliver_upgrade_body(
+        self,
+        parts: list[bytes],
+        *,
+        complete: bool,
+    ) -> None:
         """Record an Upgrade request's body via the protocol callbacks.
 
         The httptools parser refuses data after an upgrade, so the
@@ -678,92 +830,247 @@ class AsyncRequestParser:
         """
         for part in parts:
             self._protocol.on_body(part)
-        self._protocol.on_message_complete()
+        if complete:
+            self._protocol.on_message_complete()
 
     async def _parse_content_length_body(
         self,
-        reader: asyncio.StreamReader,
+        reader: ByteStream,
         buffer: bytearray,
         content_length: int,
         connection_wire: WireSink | None,
-    ) -> tuple[ParsedRequest | None, bytes]:
-        while len(buffer) < content_length:
-            has_more = await self._read_more(reader, buffer)
-            if not has_more:
-                self._wire.extend(buffer)
+        max_body_bytes: int | None,
+    ) -> ParseOutcome:
+        target = (
+            content_length
+            if max_body_bytes is None
+            else min(max_body_bytes, content_length)
+        )
+        consumed = 0
+        status = _ReadStatus.DATA
+        while True:
+            take = min(len(buffer), target - consumed)
+            if take:
+                # Body bytes under a Content-Length cannot fail to parse.
+                self._feed_body(buffer, take)
+                consumed += take
                 self._sync_connection_wire(connection_wire)
-                return None, bytes(self._wire)
+            if consumed >= target:
+                break
+            status = await self._read_more(reader, buffer)
+            if status is not _ReadStatus.DATA:
+                break
 
-        body = bytes(buffer[:content_length])
-        if self._upgraded:
-            self._complete_upgrade_body([body] if body else [])
-        else:
-            try:
-                self._parser.feed_data(body)
-            except httptools.HttpParserError:
-                return self._body_parse_error(
-                    reader,
-                    buffer,
-                    content_length,
-                    connection_wire,
-                )
-
-        self._wire.extend(body)
-        stream.unread_data(reader, buffer[content_length:])
+        if self._upgraded and consumed == content_length:
+            self._protocol.on_message_complete()
+        stream.unread_data(reader, buffer)
         self._sync_connection_wire(connection_wire)
+        return self._body_outcome(status)
 
-        if not self._protocol.result.is_complete:
-            return None, bytes(self._wire)
+    def _feed_body(
+        self,
+        buffer: bytearray,
+        length: int,
+        *,
+        chunked: bool = False,
+    ) -> None:
+        """Deliver ``buffer[:length]`` as body bytes and attribute them.
 
-        return self._protocol.result, bytes(self._wire)
+        The bytes are removed from the buffer once the parser accepted
+        them; when the parser raises they stay so the error offset can
+        be located.  ``chunked`` bytes are complete chunks whose
+        framing is stripped when the parser cannot be fed after an
+        upgrade.
+        """
+        segment = bytes(buffer[:length])
+        if self._upgraded:
+            parts = (
+                _chunk_payload_parts(buffer[:length]) if chunked else [segment]
+            )
+            self._deliver_upgrade_body(parts, complete=False)
+        else:
+            self._parser.feed_data(segment)
+        self._wire.extend(segment)
+        del buffer[:length]
 
     async def _parse_chunked_body(
         self,
-        reader: asyncio.StreamReader,
+        reader: ByteStream,
         buffer: bytearray,
         connection_wire: WireSink | None,
-    ) -> tuple[ParsedRequest | None, bytes]:
-        scan_from = 0
+        max_body_bytes: int | None,
+    ) -> ParseOutcome:
+        """Consume chunk framing, feeding complete chunks as they arrive.
+
+        ``buffer`` only ever holds bytes not yet delivered to the
+        parser, so every scan starts at a chunk-size boundary at offset
+        zero and a cancelled parse leaves the delivered prefix recorded.
+        """
+        counted = 0
         while True:
             try:
-                scan = scan_chunked_body(buffer, scan_from)
+                scan = scan_chunk_payloads(buffer)
             except ChunkScanError as exc:
-                self._wire.extend(buffer[: exc.offset])
-                self._sync_connection_wire(connection_wire)
-                stream.unread_data(reader, buffer[exc.offset :])
-                return None, bytes(self._wire)
+                return self._chunk_scan_error(
+                    reader,
+                    buffer,
+                    exc,
+                    connection_wire,
+                    budget=(
+                        None
+                        if max_body_bytes is None
+                        else max_body_bytes - counted
+                    ),
+                )
+
+            if max_body_bytes is not None:
+                stop_at = _chunk_limit_offset(
+                    scan, 0, max_body_bytes - counted
+                )
+                if stop_at is not None:
+                    return self._finish_chunked_prefix(
+                        reader,
+                        buffer,
+                        stop_at,
+                        connection_wire,
+                        _ReadStatus.DATA,
+                        complete=False,
+                    )
 
             if scan.end is not None:
-                chunked_end = scan.end
-                chunked_body = bytes(buffer[:chunked_end])
-                if self._upgraded:
-                    self._complete_upgrade_body(chunk_payloads(buffer))
-                else:
-                    try:
-                        self._parser.feed_data(chunked_body)
-                    except httptools.HttpParserError:
-                        return self._body_parse_error(
-                            reader,
-                            buffer,
-                            chunked_end,
-                            connection_wire,
-                        )
+                return self._finish_chunked_prefix(
+                    reader,
+                    buffer,
+                    scan.end,
+                    connection_wire,
+                    _ReadStatus.DATA,
+                    complete=True,
+                )
 
-                self._wire.extend(chunked_body)
-                stream.unread_data(reader, buffer[chunked_end:])
+            counted += sum(end - start for start, end in scan.payloads)
+            if scan.resume_from:
+                try:
+                    self._feed_body(buffer, scan.resume_from, chunked=True)
+                except httptools.HttpParserError as exc:
+                    return self._body_parse_error(
+                        reader,
+                        buffer,
+                        scan.resume_from,
+                        connection_wire,
+                        exc,
+                    )
                 self._sync_connection_wire(connection_wire)
+            status = await self._read_more(reader, buffer)
+            if status is not _ReadStatus.DATA:
+                return self._finish_chunked_prefix(
+                    reader,
+                    buffer,
+                    len(buffer),
+                    connection_wire,
+                    status,
+                    complete=False,
+                )
 
-                if not self._protocol.result.is_complete:
-                    return None, bytes(self._wire)
+    def _chunk_scan_error(
+        self,
+        reader: ByteStream,
+        buffer: bytearray,
+        error: ChunkScanError,
+        connection_wire: WireSink | None,
+        *,
+        budget: int | None,
+    ) -> ParseOutcome:
+        """Attribute the bytes up to a bad chunk-framing byte to the request.
 
-                return self._protocol.result, bytes(self._wire)
+        The payload before the bad byte is still delivered, to the
+        parser or, after an upgrade, through the upgrade-body callbacks,
+        so the recorded body reflects what was consumed before the
+        error however the reads were split.
+        """
+        if budget is not None:
+            # The scanner may have reached an error beyond the payload
+            # limit. Rescan only the valid prefix before attributing it.
+            scan = scan_chunk_payloads(buffer[: error.offset - 1])
+            stop_at = _chunk_limit_offset(scan, 0, budget)
+            if (
+                stop_at is None
+                and sum(end - start for start, end in scan.payloads) == budget
+            ):
+                stop_at = scan.resume_from
+            if stop_at is not None:
+                return self._finish_chunked_prefix(
+                    reader,
+                    buffer,
+                    stop_at,
+                    connection_wire,
+                    _ReadStatus.DATA,
+                    complete=False,
+                )
 
-            scan_from = scan.resume_from
-            has_more = await self._read_more(reader, buffer)
-            if not has_more:
-                self._wire.extend(buffer)
-                self._sync_connection_wire(connection_wire)
-                return None, bytes(self._wire)
+        prefix = bytes(buffer[: error.offset])
+        if self._upgraded:
+            self._deliver_upgrade_body(
+                _chunk_payload_parts(buffer[: error.offset - 1]),
+                complete=False,
+            )
+        else:
+            try:
+                self._parser.feed_data(prefix)
+            except httptools.HttpParserError:
+                LOG.debug("Parser rejected chunk prefix", exc_info=True)
+        self._wire.extend(prefix)
+        self._sync_connection_wire(connection_wire)
+        stream.unread_data(reader, buffer[error.offset :])
+        return self._outcome(ParseStop.PARSE_ERROR, error)
+
+    def _finish_chunked_prefix(
+        self,
+        reader: ByteStream,
+        buffer: bytearray,
+        offset: int,
+        connection_wire: WireSink | None,
+        status: _ReadStatus,
+        *,
+        complete: bool,
+    ) -> ParseOutcome:
+        """Consume the undelivered chunked bytes up to ``offset``.
+
+        ``offset`` is the message boundary when the terminal chunk was
+        reached, the threshold stop inside the body, or the end of the
+        buffer when the stream ended first.
+        """
+        if self._upgraded:
+            self._deliver_upgrade_body(
+                _chunk_payload_parts(buffer[:offset]), complete=complete
+            )
+            self._wire.extend(buffer[:offset])
+        else:
+            try:
+                self._parser.feed_data(bytes(buffer[:offset]))
+            except httptools.HttpParserError as exc:
+                return self._body_parse_error(
+                    reader, buffer, offset, connection_wire, exc
+                )
+            self._wire.extend(buffer[:offset])
+
+        stream.unread_data(reader, buffer[offset:])
+        self._sync_connection_wire(connection_wire)
+        return self._body_outcome(status)
+
+
+def _chunk_payload_parts(buffer: bytearray) -> list[bytes]:
+    """Extract chunk payloads, including a trailing partial chunk.
+
+    A partial chunk whose data has not started yet contributes no
+    part, so a bare size line never records an empty body part.
+    """
+    scan = scan_chunk_payloads(buffer)
+    parts = [bytes(buffer[start:end]) for start, end in scan.payloads]
+    if scan.partial is not None:
+        start, end = scan.partial
+        if end > start:
+            parts.append(bytes(buffer[start:end]))
+    return parts
 
 
 class HTTPRequestReader:
@@ -778,26 +1085,28 @@ class HTTPRequestReader:
 
     async def read_request(
         self,
-        reader: asyncio.StreamReader,
+        reader: ByteStream,
         writer: Writer | None = None,
         connection_wire: WireSink | None = None,
     ) -> RecordedHTTPRequest | None:
         """Parse a complete HTTP request from the stream.
 
         Args:
-            reader: The asyncio stream to read from
+            reader: The stream to read from
             writer: Optional writer to extract client info from
             connection_wire: Optional buffer for connection-level tracking
 
         Returns:
-            RecordedHTTPRequest or None on EOF/parse error
+            RecordedHTTPRequest or None on EOF/parse error, or when the
+            request did not reach its message boundary
         """
         parser = AsyncRequestParser(max_read=self._max_read)
-        parsed, wire_bytes = await parser.parse(reader, connection_wire)
+        outcome = await parser.parse(reader, connection_wire)
 
+        parsed = outcome.complete_request
         if parsed is None:
             return None
 
         return RecordedHTTPRequest.from_parsed(
-            parsed, wire_bytes, writer=writer
+            parsed, outcome.wire_bytes, writer=writer
         )

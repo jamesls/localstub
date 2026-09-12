@@ -4,6 +4,7 @@ import asyncio
 import logging
 import ssl
 from asyncio import transports
+from contextvars import ContextVar
 from datetime import datetime
 from types import TracebackType
 from typing import TYPE_CHECKING, Self, cast
@@ -22,10 +23,11 @@ from localstub.forward import (
     TransformResult,
     response_allows_keep_alive,
 )
-from localstub.http.exchange import RecordedExchange
+from localstub.http.exchange import ConnectionClosed, RecordedExchange
 from localstub.http.request import (
     AsyncRequestParser,
     ParsedRequest,
+    ParseStop,
     RecordedHTTPRequest,
 )
 from localstub.http.response import (
@@ -35,10 +37,18 @@ from localstub.recording import (
     DEFAULT_RECORDING_BUFFER_SIZE,
     TrafficRecorder,
 )
-from localstub.server import AsyncHTTPTestServer
+from localstub.server import AsyncHTTPTestServer, RecordingStreamWriter
 
 LOG = logging.getLogger(__name__)
 _SHUTDOWN_DRAIN_TURNS = 8
+
+# The proxy task serving the connection that the current code runs on
+# behalf of.  Tasks inherit it, so a request handler that shuts the
+# proxy down from the server's connection loop is still attributed to
+# the proxy task that owns its conversation.
+_CLIENT_TASK: ContextVar[asyncio.Task[None] | None] = ContextVar(
+    "localstub_tlsproxy_client_task", default=None
+)
 
 
 def _pause_listener_accepts(listener: asyncio.Server) -> None:
@@ -146,10 +156,11 @@ class AsyncTLSInterceptProxy:
         recording_buffer_size: int | None = DEFAULT_RECORDING_BUFFER_SIZE,
         recorder: TrafficRecorder | None = None,
     ) -> None:
-        # Recording state for forwarded traffic.  Bounded so memory stays
-        # flat when a consumer never drains a stream (e.g. the CLI only
-        # reads exchanges).  Created first so an invalid buffer size fails
-        # before the CA default resolution generates keys and writes files.
+        # Share intercepted and forwarded traffic with the server unless
+        # a recorder is supplied explicitly. Resolve recording first so
+        # an invalid buffer size fails before CA key generation.
+        if recorder is None and server is not None:
+            recorder = server.recorder
         self._recorder = recorder or TrafficRecorder(recording_buffer_size)
 
         self._listen_host = listen_host
@@ -225,6 +236,32 @@ class AsyncTLSInterceptProxy:
         """Exchanges evicted unread from the next_exchange() buffer."""
         return self._recorder.dropped_exchanges
 
+    @property
+    def closed_connections(self) -> list[ConnectionClosed]:
+        """Close events recorded through this proxy's recorder.
+
+        By default, this recorder is shared with the embedded server.
+        An explicitly supplied recorder overrides that default.
+        """
+        return self._recorder.closed_connections
+
+    @property
+    def last_closed_connection(self) -> ConnectionClosed | None:
+        """The most recently recorded close event."""
+        return self._recorder.last_closed_connection
+
+    async def next_closed_connection(
+        self, timeout: float | None = None
+    ) -> ConnectionClosed:
+        """Await and return the next connection close event."""
+        return await self._recorder.next_closed_connection(timeout)
+
+    @property
+    def dropped_closed_connections(self) -> int:
+        """Close events evicted unread from the next_closed_connection()
+        buffer."""
+        return self._recorder.dropped_closed_connections
+
     async def start(self) -> None:
         if self._listener is not None:
             return
@@ -243,10 +280,20 @@ class AsyncTLSInterceptProxy:
         if listener is None:
             return
         self._closing = True
+        # Intercepted conversations are shut down through the server so
+        # an idle or delayed one records its event and stops without
+        # holding the grace wait below, which stays for forward-mode
+        # relays.  This runs in the caller's task so a handler shutting
+        # the proxy down only has its own decision recorded rather than
+        # being cancelled mid-request.  Writers the server never saw are
+        # ignored.
+        if self._server is not None:
+            for writer in tuple(self._client_writers):
+                self._server.close_http_connection(writer)
         # aclose() may be called from inside a client task (e.g. a request
         # handler shutting down the proxy); waiting on that task would
         # deadlock, so it is excluded from the drain.
-        caller = asyncio.current_task()
+        caller = _CLIENT_TASK.get() or asyncio.current_task()
         shutdown_task = asyncio.create_task(
             self._finish_close(listener, exclude=caller)
         )
@@ -314,6 +361,7 @@ class AsyncTLSInterceptProxy:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        _CLIENT_TASK.set(asyncio.current_task())
         active_writer = writer
         # Extract client port for logging
         peername = writer.get_extra_info("peername")
@@ -528,11 +576,11 @@ class AsyncTLSInterceptProxy:
 
         while True:
             parser = AsyncRequestParser(max_read=self._max_read)
-            parsed, header_wire, remaining = await parser.parse_headers(
-                client_reader
-            )
-            if parsed is None:
-                # Bytes received but unparseable is a malformed request; an
+            outcome, remaining = await parser.parse_headers(client_reader)
+            parsed = outcome.parsed
+            header_wire = outcome.wire_bytes
+            if outcome.stop is not ParseStop.COMPLETE or parsed is None:
+                # Bytes received but rejected is a malformed request; an
                 # empty read is a clean EOF from a client that closed a
                 # persistent connection, so just close our side.
                 if header_wire:
@@ -631,9 +679,11 @@ class AsyncTLSInterceptProxy:
                     client_id=client_id,
                 )
 
-            final_parsed, full_wire = await parser.continue_parse_body(
+            outcome = await parser.continue_parse_body(
                 client_reader, remaining
             )
+            final_parsed = outcome.complete_request
+            full_wire = outcome.wire_bytes
             if final_parsed is None:
                 await self._send_and_close(
                     client_writer,
@@ -655,7 +705,7 @@ class AsyncTLSInterceptProxy:
 
             final_response = await self._forwarder.read_and_relay_responses(
                 upstream_reader=upstream_reader,
-                client_writer=client_writer,
+                client_writer=RecordingStreamWriter(client_writer),
                 request_method=final_parsed.method,
                 upstream_id=upstream_id,
                 client_id=client_id,
@@ -713,7 +763,7 @@ class AsyncTLSInterceptProxy:
             header_wire_bytes=header_wire,
             remaining_buffer=remaining,
             client_reader=client_reader,
-            client_writer=client_writer,
+            client_writer=RecordingStreamWriter(client_writer),
             upstream_reader=upstream_reader,
             upstream_writer=upstream_writer,
             request_method=parsed.method,
@@ -852,6 +902,7 @@ def fault_step_transformer(
         body = context.body
         total_delay = 0.0
         drop_after: int | None = None
+        drop_reset = False
 
         for step in steps:
             result = step.apply(body)
@@ -859,11 +910,13 @@ def fault_step_transformer(
             total_delay += result.delay_before
             if drop_after is None and result.drop_after is not None:
                 drop_after = result.drop_after
+                drop_reset = result.drop_reset
 
         return TransformResult(
             body=body,
             delay_before=total_delay,
             drop_after=drop_after,
+            drop_reset=drop_reset,
         )
 
     return transform
