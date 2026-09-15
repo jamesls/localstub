@@ -2729,3 +2729,45 @@ async def test_body_cutoffs_preserve_payload_prefix_and_remaining_stream(
             assert recorded.body_complete == (cutoff >= len(payload))
         if recorded.body_complete:
             assert rest == _NEXT_REQUEST
+
+
+@pytest.mark.asyncio
+@given(payload=st.binary(max_size=32), data=st.data())
+async def test_initial_data_preserves_body_and_pipelined_request(
+    payload: bytes, data: st.DataObject
+) -> None:
+    head = _content_length_headers(len(payload))
+    encoded = head + payload
+    original = encoded + _NEXT_REQUEST
+    split = data.draw(st.integers(min_value=0, max_value=len(original)))
+    reader = _ScriptedReader([original[split:]])
+    sink = bytearray()
+    parser = AsyncRequestParser()
+
+    staged, remaining = await parser.parse_headers(
+        reader, sink, initial_data=original[:split]
+    )
+    assert staged.wire_bytes == head
+    outcome = await parser.continue_parse_body(reader, remaining, sink)
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == payload
+    assert outcome.wire_bytes == encoded
+    assert sink == encoded
+    following = await AsyncRequestParser().parse(reader, sink)
+    assert following.complete_request is not None
+    assert following.wire_bytes == _NEXT_REQUEST
+    assert sink == original
+
+
+@pytest.mark.asyncio
+async def test_invalid_initial_data_is_rejected_without_another_read() -> None:
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    outcome, remaining = await AsyncRequestParser().parse_headers(
+        reader, initial_data=b"\x00unconsumed"
+    )
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert outcome.wire_bytes == b"\x00"
+    assert remaining == b""
+    assert take_unread_data(reader) == b"unconsumed"
+    reader.read.assert_not_awaited()

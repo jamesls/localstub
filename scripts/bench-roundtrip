@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Measure the CodSpeed roundtrip workload without instrumentation.
+
+Use PYTHONPATH=<checkout>/src with the same interpreter for comparisons.
+Optional cProfile output measures call counts separately from timings.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import cProfile
+import json
+import statistics
+import time
+
+from localstub import AsyncHTTPTestServer
+
+REQUEST = (
+    b"GET /v1/items?page=2 HTTP/1.1\r\n"
+    b"Host: localhost\r\n"
+    b"User-Agent: localstub-bench/1.0\r\n"
+    b"Accept: application/json\r\n\r\n"
+)
+RESPONSE = {"ok": True, "items": [1, 2, 3]}
+BODY = json.dumps(RESPONSE).encode("utf-8")
+
+
+async def exchange(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    writer.write(REQUEST)
+    await writer.drain()
+    head = await reader.readuntil(b"\r\n\r\n")
+    body = await reader.readexactly(len(BODY))
+    assert head.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert body == BODY
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--samples", type=int, default=15)
+    parser.add_argument("--iterations", type=int, default=2000)
+    parser.add_argument("--profile")
+    args = parser.parse_args()
+    loop = asyncio.new_event_loop()
+    server = AsyncHTTPTestServer()
+    server.set_json_response(RESPONSE)
+    loop.run_until_complete(server.start())
+    reader, writer = loop.run_until_complete(
+        asyncio.open_connection(server.host, server.port)
+    )
+    profiler = cProfile.Profile()
+    try:
+        for _ in range(1000):
+            loop.run_until_complete(exchange(reader, writer))
+        if args.profile:
+            profiler.enable()
+        samples: list[float] = []
+        for _ in range(args.samples):
+            start = time.perf_counter()
+            for _ in range(args.iterations):
+                loop.run_until_complete(exchange(reader, writer))
+            samples.append(
+                (time.perf_counter() - start) * 1e6 / args.iterations
+            )
+        if args.profile:
+            profiler.disable()
+            profiler.dump_stats(args.profile)
+        print(
+            json.dumps({
+                "samples_us": samples,
+                "median_us": statistics.median(samples),
+                "iterations": args.iterations,
+            })
+        )
+    finally:
+        writer.close()
+        loop.run_until_complete(writer.wait_closed())
+        loop.run_until_complete(server.aclose())
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()

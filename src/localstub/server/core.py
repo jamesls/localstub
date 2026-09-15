@@ -962,14 +962,10 @@ class AsyncHTTPTestServer:
     def _build_responder(
         self,
         capture_ctx: CaptureContext | None,
-    ) -> ResponderApp:
+    ) -> ResponderApp | ResponseSpec:
         default_response = self._default_response
         if self._uses_static_response():
-
-            async def static(_: ResponderContext) -> ResponseSpec:
-                return default_response
-
-            return static
+            return default_response
 
         middlewares: list[ResponderMiddleware] = [
             *self.responder_middlewares,

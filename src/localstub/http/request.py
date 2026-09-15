@@ -556,6 +556,8 @@ class AsyncRequestParser:
         self,
         reader: ByteStream,
         connection_wire: WireSink | None = None,
+        *,
+        initial_data: bytes = b"",
     ) -> tuple[ParseOutcome, bytearray]:
         """Parse request headers only, stopping before body.
 
@@ -563,6 +565,8 @@ class AsyncRequestParser:
             reader: The stream to read from.
             connection_wire: Optional buffer to accumulate connection-level
                 bytes (for tracking across multiple requests).
+            initial_data: Bytes already read from this stream, before any
+                bytes still buffered in reader.
 
         Returns:
             Tuple of (outcome, remaining_buffer).  The outcome's
@@ -576,13 +580,13 @@ class AsyncRequestParser:
             ``chunked`` (RFC 9112 §6.1).  Check ``stop`` before reading
             the body.
         """
-        buffer = bytearray()
+        buffer = bytearray(initial_data)
         fed = 0
         status = _ReadStatus.DATA
 
         while not self._protocol.result.headers_complete:
             header_end = buffer.find(HEADER_TERMINATOR)
-            if header_end == -1:
+            if header_end == -1 and fed == len(buffer):
                 status = await self._read_more(reader, buffer)
                 if status is not _ReadStatus.DATA:
                     break

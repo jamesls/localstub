@@ -12,6 +12,7 @@ from localstub.forward import RawForwarder
 from localstub.http.client import HTTPClient
 from localstub.http.clients.asyncio import AsyncioClient
 from localstub.http.exchange import ConnectionClosed
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequestHeaders, HTTPRequestReader
 from localstub.middleware import (
     CloseConnection,
@@ -19,6 +20,10 @@ from localstub.middleware import (
     HeaderDecision,
     HeaderNext,
     ResponderContext,
+    ResponseSpec,
+    SenderContext,
+    SenderNext,
+    SendResult,
 )
 from localstub.recording import TrafficRecorder
 from localstub.server import (
@@ -728,3 +733,98 @@ async def test_repeated_aclose_without_listener_is_idempotent() -> None:
     await proxy.aclose()
 
     assert proxy.closed_connections == []
+
+
+@pytest.mark.asyncio
+async def test_static_response_still_runs_sender_middleware() -> None:
+    response = HTTPResponse.text("default")
+    server = AsyncHTTPTestServer(default_response=response)
+    seen: list[str] = []
+
+    async def sender(
+        ctx: SenderContext, spec: ResponseSpec, call_next: SenderNext
+    ) -> SendResult:
+        assert spec is response
+        assert ctx.connection.client == CLIENT
+        seen.append(ctx.request.target)
+        return await call_next(HTTPResponse.text("wrapped", status=202))
+
+    server.use_sender(sender)
+    await _converse(server, GET)
+
+    assert seen == ["/one"]
+    assert server.last_response is not None
+    assert server.last_response.status == 202
+    assert server.last_response.body == b"wrapped"
+
+
+@pytest.mark.asyncio
+async def test_cached_head_tracks_response_mutations_and_live_policy() -> None:
+    response = HTTPResponse(body=b"x")
+    server = AsyncHTTPTestServer(default_response=response)
+    reader = _reader(eof=False)
+    writer = _fake_writer()
+    task = asyncio.create_task(server.handle_http_connection(reader, writer))
+    cases = [
+        (200, "a", b"x", b"X-Test: a\r\nContent-Length: 1\r\n\r\nx"),
+        (
+            200,
+            "a",
+            b"longer",
+            b"X-Test: a\r\nContent-Length: 6\r\n\r\nlonger",
+        ),
+        (
+            200,
+            "b",
+            b"longer",
+            b"X-Test: b\r\nContent-Length: 6\r\n\r\nlonger",
+        ),
+        (204, "b", b"longer", b"X-Test: b\r\n\r\n"),
+        (
+            200,
+            "b",
+            b"longer",
+            (
+                b"X-Test: b\r\nContent-Length: 6\r\n"
+                b"Keep-Alive: timeout=5\r\n"
+                b"Connection: keep-alive\r\n\r\nlonger"
+            ),
+        ),
+        (
+            200,
+            "b",
+            b"longer",
+            (
+                b"X-Test: b\r\nContent-Length: 6\r\n"
+                b"Connection: close\r\n\r\nlonger"
+            ),
+        ),
+    ]
+    try:
+        for index, (status, tag, body, expected) in enumerate(cases):
+            response.status = status
+            response.headers = Headers.from_items([("X-Test", tag)])
+            response.body = body
+            if index == 4:
+                server.set_keep_alive(timeout=5, advertise=True)
+            elif index == 5:
+                server.set_keep_alive(max_requests=6)
+            reader.feed_data(GET)
+            exchange = await server.next_exchange(timeout=1.0)
+            assert exchange.response is not None
+            line = (
+                b"HTTP/1.1 204 No Content\r\n"
+                if status == 204
+                else b"HTTP/1.1 200 OK\r\n"
+            )
+            assert exchange.response.wire_raw_bytes == line + expected
+        await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        reader.feed_eof()
+        await server.aclose()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    assert server.last_closed_connection is not None
+    assert server.last_closed_connection.reason == "max_requests"
+    assert server.last_closed_connection.requests_completed == 6
+    assert server.responses[0].body == b"x"

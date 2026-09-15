@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
-from typing import Any
+from typing import Any, NamedTuple
 
 from localstub.forward import response_allows_keep_alive
 from localstub.http import stream
@@ -106,10 +106,33 @@ def pack_linger_option(*, platform: str = sys.platform) -> bytes:
 def _serialize_response_head(
     status: int,
     headers: tuple[HeaderItem, ...],
+    body_length: int,
+    should_close: bool,
+    keep_alive_hint: str | None,
 ) -> bytes:
+    # Cache header preparation as well as encoding, keyed on response
+    # values rather than the mutable HTTPResponse object. Policy changes
+    # and request-specific closure must produce different keys.
+    items = list(headers)
+    header_names = {name.lower() for name, _ in items}
+    is_informational = 100 <= status < 200
+    if is_informational or status == 204:
+        items = [
+            (name, value)
+            for name, value in items
+            if name.lower() != "content-length"
+        ]
+    elif "content-length" not in header_names:
+        items.append(("Content-Length", str(body_length)))
+    if should_close:
+        items = _with_connection_token(items, "close")
+    elif not is_informational and keep_alive_hint is not None:
+        items.append(("Keep-Alive", keep_alive_hint))
+        items = _with_connection_token(items, "keep-alive")
+
     reason = status_phrase(status, "UNKNOWN")
     head = bytearray(f"HTTP/1.1 {status} {reason}\r\n".encode("ascii"))
-    for name, value in headers:
+    for name, value in items:
         head.extend(serialize_header_line(name, value))
     head.extend(b"\r\n")
     return bytes(head)
@@ -218,11 +241,13 @@ class RequestPipeline:
     ``header`` builder returns ``None`` when no header middleware is
     registered, which lets the loop parse the request in one step.
     The ``sender`` builder receives the loop's terminal and returns
-    ``None`` when no sender middleware wraps it.
+    ``None`` when no sender middleware wraps it. The ``responder``
+    builder returns the response directly when no middleware or handler
+    needs a context.
     """
 
     header: Callable[[], HeaderApp | None]
-    responder: Callable[[CaptureContext | None], ResponderApp]
+    responder: Callable[[CaptureContext | None], ResponderApp | ResponseSpec]
     sender: Callable[[SenderApp], SenderApp | None]
     transmission: Callable[[], TransmissionStrategy]
     keep_alive: Callable[[], KeepAlivePolicy]
@@ -471,8 +496,7 @@ class _ConnectionWriter:
         await self.wait_for_close()
 
 
-@dataclass(frozen=True)
-class _Reading:
+class _Reading(NamedTuple):
     """A request read to its message boundary, ready to respond to."""
 
     request: RecordedHTTPRequest
@@ -627,10 +651,11 @@ class HTTPConnection:
         try:
             while state.closed is None:
                 self._policy = self._pipeline.keep_alive()
-                if not await self._await_first_byte():
+                first = await self._await_first_byte()
+                if first is None:
                     break
                 self._policy = self._pipeline.keep_alive()
-                reading = await self._read_request()
+                reading = await self._read_request(first)
                 if reading is None:
                     break
                 if await self._handle_request(reading):
@@ -643,44 +668,45 @@ class HTTPConnection:
             self._decide("error", state.phase)
             LOG.exception("Error in AsyncHTTPTestServer handler")
 
-    async def _await_first_byte(self) -> bool:
+    async def _await_first_byte(self) -> bytes | None:
         """Wait for the next request's first byte.
 
-        Returns ``False`` once the connection is to close: the keep-alive
+        Returns ``None`` once the connection is to close: the keep-alive
         timer fired, or the client closed or reset while idle.  Otherwise
-        the byte is returned to the stream for the parser.
+        pass the buffered data directly to the parser. ``read(8192)``
+        returns as soon as any bytes arrive; reading just one byte would
+        split buffered headers and require another read and parser feed.
         """
         state = self._state
         state.phase = "idle"
         timeout = self._policy.timeout if state.requests_completed else None
         try:
             if timeout is None or timeout <= 0:
-                first = await stream.read(self._reader, 1)
+                first = await stream.read(self._reader, 8192)
             else:
                 first = await self._race_first_byte(timeout)
         except OSError as exc:
             self._decide(
                 "client", "idle", reset=isinstance(exc, ConnectionResetError)
             )
-            return False
+            return None
         if first is None:
             self._decide("idle_timeout", "idle", reset=self._policy.reset)
-            return False
+            return None
         if not first:
             self._decide("client", "idle")
-            return False
-        stream.unread_data(self._reader, first)
+            return None
         state.phase = "request_headers"
-        return True
+        return first
 
     async def _race_first_byte(self, timeout: float) -> bytes | None:
-        """Race the one-byte read against the injected sleep.
+        """Race the first buffered read against the injected sleep.
 
-        Returns the byte, or ``None`` when the timer won.  The loser is
+        Returns the data, or ``None`` when the timer won.  The loser is
         cancelled before returning; cancelling a pending read loses no
         data.  If both finish in the same turn, the byte wins.
         """
-        read_task = asyncio.ensure_future(stream.read(self._reader, 1))
+        read_task = asyncio.ensure_future(stream.read(self._reader, 8192))
         timer = asyncio.ensure_future(self._sleep(timeout))
         try:
             done, _ = await asyncio.wait(
@@ -699,7 +725,7 @@ class HTTPConnection:
         await asyncio.gather(read_task, return_exceptions=True)
         return None
 
-    async def _read_request(self) -> _Reading | None:
+    async def _read_request(self, initial_data: bytes) -> _Reading | None:
         """Read one request, running the header chain when configured.
 
         Returns ``None`` when the connection is to close instead of
@@ -715,7 +741,7 @@ class HTTPConnection:
         parser = AsyncRequestParser()
 
         outcome, remaining = await parser.parse_headers(
-            self._reader, self._sink
+            self._reader, self._sink, initial_data=initial_data
         )
         parsed = outcome.parsed
         if parsed is None:
@@ -738,12 +764,15 @@ class HTTPConnection:
                 parser, self._header_stage(header_app, ctx)
             )
         if fault is None:
-            outcome = await self._interruptible(
-                parser,
-                parser.continue_parse_body(
-                    self._reader, remaining, self._sink
-                ),
-            )
+            if parsed.is_complete:
+                stream.unread_data(self._reader, remaining)
+            else:
+                outcome = await self._interruptible(
+                    parser,
+                    parser.continue_parse_body(
+                        self._reader, remaining, self._sink
+                    ),
+                )
             return self._complete_reading(outcome, request_state)
 
         outcome = await self._interruptible(
@@ -787,7 +816,9 @@ class HTTPConnection:
         state = self._state
         parsed = outcome.parsed
         assert parsed is not None
-        request = self._build_request(parsed, outcome.wire_bytes)
+        request = RecordedHTTPRequest.from_parsed(
+            parsed, outcome.wire_bytes, client=state.client
+        )
         request_timestamp, _ = self._recorder.record_request(request)
         self._track_boundary(parsed)
         self._decide(reason, state.phase)
@@ -884,13 +915,17 @@ class HTTPConnection:
         writer = self._writer
         writer.start_response()
         body = _normalize_body(response.body)
-        headers = self._build_response_headers(response, body, close)
+        head = _serialize_response_head(
+            response.status,
+            tuple(response.headers.items()),
+            len(body),
+            close,
+            self._policy.keep_alive_hint(),
+        )
         wire_body = (
             body if _body_allowed(partial.method, response.status) else b""
         )
-        self._write(
-            _serialize_response_head(response.status, headers) + wire_body
-        )
+        self._write(head + wire_body)
         return self._build_recorded_response(response, writer.bytes_sent)
 
     def _complete_reading(
@@ -902,18 +937,21 @@ class HTTPConnection:
         state = self._state
         parsed = outcome.parsed
         assert parsed is not None
-        request = self._build_request(parsed, outcome.wire_bytes)
+        request = RecordedHTTPRequest.from_parsed(
+            parsed, outcome.wire_bytes, client=state.client
+        )
         request_timestamp, received_monotonic = self._recorder.record_request(
             request
         )
-        if outcome.complete_request is not None:
-            self._track_boundary(parsed)
+        if parsed.is_complete and outcome.stop is ParseStop.COMPLETE:
+            if state.phase != "response":
+                self._track_boundary(parsed)
             return _Reading(
-                request=request,
-                state=request_state,
-                request_timestamp=request_timestamp,
-                received_monotonic=received_monotonic,
-                responded=state.final_response is not None,
+                request,
+                request_state,
+                request_timestamp,
+                received_monotonic,
+                state.final_response is not None,
             )
         state.phase = "request_body"
         self._decide_read_stop(outcome)
@@ -948,7 +986,9 @@ class HTTPConnection:
         state = self._state
         parsed = outcome.parsed
         assert parsed is not None
-        request = self._build_request(parsed, outcome.wire_bytes)
+        request = RecordedHTTPRequest.from_parsed(
+            parsed, outcome.wire_bytes, client=state.client
+        )
         request_timestamp, _ = self._recorder.record_request(request)
         self._track_boundary(parsed)
         event = self._decide("request_read", state.phase, reset=reset)
@@ -978,17 +1018,6 @@ class HTTPConnection:
         if state.phase == "response":
             return state.requests_completed
         return state.requests_completed + 1
-
-    def _build_request(
-        self,
-        parsed: ParsedRequest,
-        wire_bytes: bytes,
-    ) -> RecordedHTTPRequest:
-        return RecordedHTTPRequest.from_parsed(
-            parsed,
-            wire_bytes,
-            client=self._state.client,
-        )
 
     def _record_exchange(
         self,
@@ -1096,24 +1125,32 @@ class HTTPConnection:
 
         sender = self._pipeline.sender(self._send_response)
         responder = self._pipeline.responder(capture)
-        connection = ConnectionMeta(client=self._state.client)
-        response_spec = await responder(
-            ResponderContext(
-                request=request,
-                connection=connection,
-                services=self._services,
-                state=reading.state,
-                received_monotonic=reading.received_monotonic,
+        connection: ConnectionMeta | None = None
+        if callable(responder):
+            connection = ConnectionMeta(client=self._state.client)
+            response_spec = await responder(
+                ResponderContext(
+                    request=request,
+                    connection=connection,
+                    services=self._services,
+                    state=reading.state,
+                    received_monotonic=reading.received_monotonic,
+                )
             )
-        )
+        else:
+            response_spec = responder
+        if sender is None:
+            return await self._send_request_response(
+                sender_request, response_spec
+            )
+        if connection is None:
+            connection = ConnectionMeta(client=self._state.client)
         sender_ctx = SenderContext(
             request=sender_request,
             connection=connection,
             services=self._services,
             state=reading.state,
         )
-        if sender is None:
-            return await self._send_response(sender_ctx, response_spec)
         return await sender(sender_ctx, response_spec)
 
     async def _send_response(
@@ -1122,6 +1159,13 @@ class HTTPConnection:
         response: ResponseSpec,
     ) -> SendResult:
         """Terminal of the sender chain: put one response spec on the wire."""
+        return await self._send_request_response(ctx.request, response)
+
+    async def _send_request_response(
+        self,
+        request: RecordedHTTPRequest,
+        response: ResponseSpec,
+    ) -> SendResult:
         response = ensure_response_spec(response)
         if isinstance(response, CloseConnection):
             return await self._close_response(response)
@@ -1129,10 +1173,10 @@ class HTTPConnection:
         writer = self._writer
         writer.start_response()
         if isinstance(response, ForwardProxyResponse):
-            return await self._relay(ctx, response)
+            return await self._relay(request, response)
 
         self._sending = response
-        should_close, abort = await self._write_response(response, ctx.request)
+        should_close, abort = await self._write_response(response, request)
         recorded = self._build_recorded_response(response, writer.bytes_sent)
         if abort is None:
             return SendResult(recorded=recorded, should_close=should_close)
@@ -1151,7 +1195,7 @@ class HTTPConnection:
 
     async def _relay(
         self,
-        ctx: SenderContext,
+        request: RecordedHTTPRequest,
         response: ForwardProxyResponse,
     ) -> SendResult:
         writer = self._writer
@@ -1182,14 +1226,14 @@ class HTTPConnection:
             upstream_tls=response.upstream_tls,
         )
         if result is None:
-            return await self._send_response(
-                ctx, HTTPResponse.text("Bad Gateway", status=502)
+            return await self._send_request_response(
+                request, HTTPResponse.text("Bad Gateway", status=502)
             )
         recorded = result.to_recorded_response(
             wire_raw_bytes=writer.bytes_sent,
         )
         should_close = writer.is_closing() or not response_allows_keep_alive(
-            ctx.request, result
+            request, result
         )
         return SendResult(
             recorded=recorded,
@@ -1210,8 +1254,13 @@ class HTTPConnection:
         should_close = self._should_close_after(
             request, response, self._state.requests_completed
         )
-        headers = self._build_response_headers(response, body, should_close)
-        head = _serialize_response_head(response.status, headers)
+        head = _serialize_response_head(
+            response.status,
+            tuple(response.headers.items()),
+            len(body),
+            should_close,
+            self._policy.keep_alive_hint(),
+        )
 
         strategy = self._pipeline.transmission()
         self._state.phase = "response_body"
@@ -1271,36 +1320,6 @@ class HTTPConnection:
             return True
         max_requests = self._policy.max_requests
         return max_requests is not None and completed >= max_requests
-
-    def _build_response_headers(
-        self,
-        response: HTTPResponse,
-        body: bytes,
-        should_close: bool,
-    ) -> tuple[HeaderItem, ...]:
-        """Build the complete response header items, in order."""
-        items = list(response.headers.items())
-        header_names = {name.lower() for name, _ in items}
-        is_informational = 100 <= response.status < 200
-
-        if is_informational or response.status == 204:
-            items = [
-                (name, value)
-                for name, value in items
-                if name.lower() != "content-length"
-            ]
-        elif "content-length" not in header_names:
-            items.append(("Content-Length", str(len(body))))
-
-        if should_close:
-            items = _with_connection_token(items, "close")
-        elif not is_informational:
-            hint = self._policy.keep_alive_hint()
-            if hint is not None:
-                items.append(("Keep-Alive", hint))
-                items = _with_connection_token(items, "keep-alive")
-
-        return tuple(items)
 
     def _build_recorded_response(
         self,
