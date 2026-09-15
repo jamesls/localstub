@@ -18,7 +18,7 @@ from hypothesis import strategies as st
 from localstub.forward import ForwardResult, RawForwarder, RelayedResponse
 from localstub.http.exchange import ConnectionClosed
 from localstub.http.headers import Headers
-from localstub.http.stream import unread_data
+from localstub.http.stream import ByteStream, unread_data
 from localstub.http.utils import maybe_await
 from localstub.middleware import (
     CloseConnection,
@@ -56,6 +56,11 @@ from localstub.server import (
     TransmissionStrategy,
     Writer,
     pack_linger_option,
+)
+from localstub.server.connection import (
+    CaptureContext,
+    ResponderApp,
+    SenderApp,
 )
 from localstub.server.transmission import Delay, FaultStep
 
@@ -155,7 +160,7 @@ class _RaisingTransmission(TransmissionStrategy):
         raise self._error
 
 
-def _fake_writer(sock: Any = None) -> Any:
+def _fake_writer(sock: socket.socket | None = None) -> Mock:
     writer = create_autospec(asyncio.StreamWriter, instance=True)
     writer.is_closing.return_value = False
     writer.get_extra_info.return_value = sock
@@ -164,12 +169,12 @@ def _fake_writer(sock: Any = None) -> Any:
         writer.is_closing.return_value = True
 
     writer.close.side_effect = close
-    writer.transport = Mock()
+    writer.transport = create_autospec(asyncio.Transport, instance=True)
     writer.transport.abort.side_effect = close
     return writer
 
 
-def _held_close_writer() -> tuple[Any, asyncio.Event]:
+def _held_close_writer() -> tuple[Mock, asyncio.Event]:
     """A writer whose close finishes only once the returned event is set."""
     release = asyncio.Event()
 
@@ -183,8 +188,8 @@ def _held_close_writer() -> tuple[Any, asyncio.Event]:
 
 @dataclass
 class Harness:
-    reader: asyncio.StreamReader
-    writer: Any
+    reader: ByteStream
+    writer: Mock
     state: ConnectionState
     recorder: TrafficRecorder
     connection: HTTPConnection
@@ -201,10 +206,13 @@ class Harness:
         assert len(self.recorder.closed_connections) == 1
         return self.recorder.closed_connections[0]
 
-    def feed(self, data: bytes, *, eof: bool = False) -> None:
-        self.reader.feed_data(data)
+    def feed(self, data: bytes = b"", *, eof: bool = False) -> None:
+        reader = self.reader
+        assert isinstance(reader, asyncio.StreamReader)
+        if data:
+            reader.feed_data(data)
         if eof:
-            self.reader.feed_eof()
+            reader.feed_eof()
 
     async def run(self) -> ConnectionClosed:
         await self.connection.run()
@@ -219,8 +227,8 @@ def _harness(
     transmission: TransmissionStrategy | None = None,
     keep_alive: KeepAlivePolicy | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
-    writer: Any = None,
-    reader: Any = None,
+    writer: Mock | None = None,
+    reader: ByteStream | None = None,
     client: tuple[str, int] | None = CLIENT,
     received: BoundedByteBuffer | None = None,
     sent: BoundedByteBuffer | None = None,
@@ -234,7 +242,7 @@ def _harness(
     policy = keep_alive or KeepAlivePolicy()
     strategy = transmission or ImmediateTransmission()
 
-    def responder(capture: Callable[[ResponderContext], None] | None) -> Any:
+    def responder(capture: CaptureContext | None) -> ResponderApp:
         async def app(ctx: ResponderContext) -> ResponseSpec:
             responded.append(ctx.request.target)
             if capture is not None:
@@ -254,7 +262,7 @@ def _harness(
         else None
     )
 
-    def sender(terminal: Any) -> Any:
+    def sender(terminal: SenderApp) -> SenderApp | None:
         if not sender_middlewares:
             return None
         return compose_sender(sender_middlewares, terminal)
@@ -395,7 +403,7 @@ async def test_close_connection_without_delay_never_sleeps() -> None:
 
 @pytest.mark.asyncio
 async def test_close_connection_reset_arms_linger_and_aborts() -> None:
-    sock = Mock()
+    sock = create_autospec(socket.socket, instance=True)
     harness = _harness(
         response=CloseConnection(reset=True), writer=_fake_writer(sock)
     )
@@ -425,7 +433,7 @@ async def test_reset_without_socket_skips_linger_and_aborts() -> None:
 async def test_reset_setsockopt_failure_logs_warning_and_still_aborts(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    sock = Mock()
+    sock = create_autospec(socket.socket, instance=True)
     sock.setsockopt.side_effect = OSError("no linger here")
     harness = _harness(
         response=CloseConnection(reset=True), writer=_fake_writer(sock)
@@ -902,7 +910,7 @@ async def test_idle_timeout_reset_flag_aborts() -> None:
 )
 @pytest.mark.asyncio
 async def test_close_event_is_published_before_transport_close_completes(
-    build: Callable[[Any], Harness],
+    build: Callable[[Mock], Harness],
     data: bytes,
     reason: str,
 ) -> None:
@@ -971,7 +979,7 @@ async def test_idle_timer_disarmed_once_first_byte_arrives() -> None:
     assert not sleep.entered.is_set()
     harness.feed(GET_TWO[1:])
     await asyncio.wait_for(sleep.entered.wait(), timeout=1.0)
-    harness.reader.feed_eof()
+    harness.feed(eof=True)
     await asyncio.wait_for(task, timeout=1.0)
 
     assert harness.responded == ["/one", "/two"]
@@ -1220,7 +1228,7 @@ async def test_shutdown_during_drop_close_retains_truncated_response(
 
 @pytest.mark.asyncio
 async def test_drop_connection_reset_arms_linger() -> None:
-    sock = Mock()
+    sock = create_autospec(socket.socket, instance=True)
     harness = _harness(
         response=HTTPResponse.text("abcdef"),
         transmission=FaultyTransmission([
@@ -1809,7 +1817,7 @@ def _relayed(wire: bytes, *, status: int = 200) -> ForwardResult:
     )
 
 
-def _forward_response(forwarder: Any) -> ForwardProxyResponse:
+def _forward_response(forwarder: Mock) -> ForwardProxyResponse:
     return ForwardProxyResponse(
         host="upstream",
         port=80,
@@ -1925,7 +1933,7 @@ async def test_relayed_101_records_connection_close() -> None:
 
 
 @pytest.mark.asyncio
-async def test_relay_closed_by_forwarder_records_connection_close() -> None:
+async def test_relay_closed_by_forwarder_records_response_aborted() -> None:
     async def relay(**kwargs: Any) -> ForwardResult:
         kwargs["client_writer"].close()
         await kwargs["client_writer"].wait_closed()
@@ -1939,7 +1947,9 @@ async def test_relay_closed_by_forwarder_records_connection_close() -> None:
     closed = await harness.run()
 
     assert harness.responded == ["/one"]
-    assert closed.reason == "connection_close"
+    assert closed.reason == "response_aborted"
+    assert closed.phase == "response_body"
+    assert not closed.reset
 
 
 @pytest.mark.asyncio
@@ -1979,6 +1989,52 @@ async def test_sender_middleware_observes_close_result() -> None:
     assert seen[0].recorded is None
     assert seen[0].should_close
     assert seen[0].closed is closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forwarded", [False, True])
+@pytest.mark.parametrize("reason", ["shutdown", "error"])
+async def test_post_send_middleware_failure_records_after_response(
+    forwarded: bool,
+    reason: str,
+) -> None:
+    sent = asyncio.Event()
+    release = asyncio.Event()
+
+    async def post_send(
+        ctx: SenderContext, response: ResponseSpec, call_next: SenderNext
+    ) -> SendResult:
+        _ = ctx
+        await call_next(response)
+        sent.set()
+        await release.wait()
+        raise RuntimeError("post-send failure")
+
+    async def relay(**kwargs: Any) -> ForwardResult:
+        kwargs["client_writer"].write(JSON_RESPONSE)
+        await kwargs["client_writer"].drain()
+        return _relayed(JSON_RESPONSE)
+
+    response: ResponseSpec = DEFAULT_RESPONSE
+    if forwarded:
+        forwarder = Mock(spec=RawForwarder)
+        forwarder.forward_and_relay = AsyncMock(side_effect=relay)
+        response = _forward_response(forwarder)
+    harness = _harness(response=response, sender_middlewares=[post_send])
+    harness.feed(GET, eof=True)
+    task = asyncio.create_task(harness.connection.run())
+    await asyncio.wait_for(sent.wait(), timeout=1.0)
+
+    assert harness.written == JSON_RESPONSE
+    if reason == "shutdown":
+        harness.connection.shutdown()
+    else:
+        release.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert harness.closed.reason == reason
+    assert harness.closed.phase == "after_response"
+    assert harness.recorder.exchanges[0].closed is harness.closed
 
 
 @pytest.mark.asyncio
@@ -2106,6 +2162,159 @@ def test_recording_writer_feeds_state_bytes_written() -> None:
     recording.writelines([b"de", b"f"])
 
     assert state.bytes_written == 6
+
+
+def test_recording_writer_holds_only_current_response() -> None:
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    recorder = RecordingStreamWriter(writer)
+
+    recorder.start_response()
+    recorder.write(b"first response")
+    recorder.start_response()
+    recorder.write(b"second response")
+
+    assert recorder.bytes_sent == b"second response"
+
+
+def test_recording_writer_reuses_single_write_through_empty_writes() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    recorder = RecordingStreamWriter(writer)
+    body = b"x" * 10000
+
+    assert recorder.bytes_sent == b""
+    recorder.write(b"")
+    recorder.write(body)
+    recorder.write(b"")
+
+    assert recorder.bytes_sent is body
+    assert [call.args[0] for call in writer.write.call_args_list] == [
+        b"",
+        body,
+        b"",
+    ]
+
+
+def test_recording_writer_coalesces_small_writes_around_large_write() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    recorder = RecordingStreamWriter(writer, coalesce_size=4)
+
+    recorder.writelines([b"ab", b"c", b"defgh", b"i", b"jkl", b"m"])
+
+    assert recorder.bytes_sent == b"abcdefghijklm"
+
+
+def test_recording_writer_coalesce_size_below_one_raises_value_error() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+
+    with pytest.raises(ValueError, match="coalesce_size"):
+        RecordingStreamWriter(writer, coalesce_size=0)
+
+
+@given(
+    coalesce_size=st.integers(min_value=1, max_value=16),
+    chunks=st.lists(st.binary(max_size=64), max_size=40),
+)
+def test_recording_writer_bytes_sent_matches_every_write(
+    coalesce_size: int, chunks: list[bytes]
+) -> None:
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+    recorder = RecordingStreamWriter(writer, coalesce_size=coalesce_size)
+
+    expected = b""
+    for chunk in chunks:
+        recorder.write(chunk)
+        expected += chunk
+        assert recorder.bytes_sent == expected
+
+    assert [call.args[0] for call in writer.write.call_args_list] == chunks
+
+
+def test_recording_writer_snapshots_survive_more_writes_and_reset() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    sent = BoundedByteBuffer(5)
+    recorder = RecordingStreamWriter(writer, sent)
+    recorder.write(b"ab")
+    first = recorder.bytes_sent
+    recorder.write(b"cd")
+    second = recorder.bytes_sent
+    recorder.writelines([b"", b"ef", b"gh"])
+    third = recorder.bytes_sent
+    recorder.start_response()
+
+    assert recorder.bytes_sent == b""
+    recorder.write(b"ij")
+    assert first == b"ab"
+    assert second == b"abcd"
+    assert third == b"abcdefgh"
+    assert recorder.bytes_sent == b"ij"
+    assert bytes(sent) == b"fghij"
+    assert sent.dropped == 5
+    assert [call.args[0] for call in writer.write.call_args_list] == [
+        b"ab",
+        b"cd",
+        b"",
+        b"ef",
+        b"gh",
+        b"ij",
+    ]
+
+
+@pytest.mark.parametrize("prefix", [b"", b"previous"])
+def test_recording_writer_preserves_capture_on_write_failure(
+    prefix: bytes,
+) -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    sent = BoundedByteBuffer(100)
+    recorder = RecordingStreamWriter(writer, sent)
+    recorder.write(prefix)
+    writer.write.side_effect = ConnectionError("closed")
+
+    with pytest.raises(ConnectionError, match="closed"):
+        recorder.write(b"failed")
+
+    assert recorder.bytes_sent == prefix + b"failed"
+    assert bytes(sent) == prefix + b"failed"
+
+
+def test_recording_writer_write_eof_delegates_to_wrapped_writer() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    recorder = RecordingStreamWriter(writer)
+
+    recorder.write_eof()
+
+    writer.write_eof.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_recording_writer_wait_closed_awaits_wrapped_writer() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    recorder = RecordingStreamWriter(writer)
+
+    await recorder.wait_closed()
+
+    writer.wait_closed.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_recording_writer_cancelled_wait_keeps_shared_waiter() -> None:
+    shared = asyncio.get_running_loop().create_future()
+
+    async def wait_closed() -> None:
+        await shared
+
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.wait_closed.side_effect = wait_closed
+    recorder = RecordingStreamWriter(writer)
+    waiting = asyncio.create_task(recorder.wait_closed())
+    await asyncio.sleep(0)
+
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    assert not shared.cancelled()
+    shared.set_result(None)
+    await asyncio.sleep(0)
 
 
 def test_pack_linger_option_uses_shorts_on_windows() -> None:

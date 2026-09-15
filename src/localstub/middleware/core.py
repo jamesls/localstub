@@ -188,7 +188,7 @@ def ensure_response_spec(value: object) -> ResponseSpec:
     ``object`` rather than trusting the annotation.
     """
     if isinstance(
-        value, (HTTPResponse, ForwardProxyResponse, CloseConnection)
+        value, HTTPResponse | ForwardProxyResponse | CloseConnection
     ):
         return value
     raise TypeError(f"Unhandled response spec: {type(value).__name__}")

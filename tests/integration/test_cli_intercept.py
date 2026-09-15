@@ -79,10 +79,6 @@ async def test_cli_intercept_mode_writes_recorded_traffic(
             await cli_task
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="asyncio signal handlers are unavailable on Windows",
-)
 def _assert_interrupted_upload_record(output_path: Path) -> None:
     records = output_path.read_text().splitlines()
     assert len(records) == 1
@@ -96,6 +92,10 @@ def _assert_interrupted_upload_record(output_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="asyncio signal handlers are unavailable on Windows",
+)
 async def test_cli_writes_exchange_completed_during_shutdown(
     tmp_path: Path,
 ) -> None:

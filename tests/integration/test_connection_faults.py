@@ -108,8 +108,10 @@ async def _read_response(reader: asyncio.StreamReader) -> bytes:
 @reset_observable
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reset", [False, True])
+@pytest.mark.parametrize("max_requests", [None, 1])
 async def test_raw_proxy_fault_adapter_preserves_first_drop_reset(
     reset: bool,
+    max_requests: int | None,
 ) -> None:
     forwarder = RawForwarder(
         response_transformer=fault_step_transformer(
@@ -121,6 +123,7 @@ async def test_raw_proxy_fault_adapter_preserves_first_drop_reset(
         AsyncHTTPTestServer() as upstream,
         AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy,
     ):
+        proxy.set_keep_alive(max_requests=max_requests)
         request = (
             f"GET {upstream.url}/ HTTP/1.1\r\n"
             f"Host: {upstream.host}:{upstream.port}\r\n\r\n"
@@ -133,9 +136,8 @@ async def test_raw_proxy_fault_adapter_preserves_first_drop_reset(
     assert observed_reset == reset
     assert closed.reset == reset
     assert exchange.closed is closed
-    if reset:
-        assert closed.reason == "response_aborted"
-        assert closed.phase == "response_body"
+    assert closed.reason == "response_aborted"
+    assert closed.phase == "response_body"
 
 
 @pytest.mark.asyncio

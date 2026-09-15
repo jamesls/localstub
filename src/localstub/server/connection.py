@@ -341,7 +341,7 @@ class CountingStreamReader:
 
     def __init__(
         self,
-        reader: asyncio.StreamReader,
+        reader: stream.ByteStream,
         state: ConnectionState,
     ) -> None:
         self._reader = reader
@@ -1179,6 +1179,7 @@ class HTTPConnection:
         should_close, abort = await self._write_response(response, request)
         recorded = self._build_recorded_response(response, writer.bytes_sent)
         if abort is None:
+            self._state.phase = "after_response"
             return SendResult(recorded=recorded, should_close=should_close)
         event = self._decide(
             "response_aborted", "response_body", reset=abort.reset
@@ -1210,10 +1211,14 @@ class HTTPConnection:
             )
             self._start_close(event)
 
+        def close() -> None:
+            event = self._decide("response_aborted", "response_body")
+            self._start_close(event)
+
         client_writer = _ConnectionWriter(
             write_bytes=write,
             drain_stream=self._drain,
-            close_stream=writer.close,
+            close_stream=close,
             wait_for_close=writer.wait_closed,
             reset_stream=reset,
         )
@@ -1235,6 +1240,8 @@ class HTTPConnection:
         should_close = writer.is_closing() or not response_allows_keep_alive(
             request, result
         )
+        if self._state.closed is None:
+            self._state.phase = "after_response"
         return SendResult(
             recorded=recorded,
             should_close=should_close,

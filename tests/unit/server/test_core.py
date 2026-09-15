@@ -53,7 +53,7 @@ class _RecordingSleep:
         self.calls.append(seconds)
 
 
-def _fake_writer(peer: tuple[str, int] | None = CLIENT) -> Any:
+def _fake_writer(peer: tuple[str, int] | None = CLIENT) -> Mock:
     writer = create_autospec(asyncio.StreamWriter, instance=True)
     writer.is_closing.return_value = False
 
@@ -65,7 +65,7 @@ def _fake_writer(peer: tuple[str, int] | None = CLIENT) -> Any:
 
     writer.get_extra_info.side_effect = get_extra_info
     writer.close.side_effect = close
-    writer.transport = Mock()
+    writer.transport = create_autospec(asyncio.Transport, instance=True)
     writer.transport.abort.side_effect = close
     return writer
 
@@ -79,7 +79,7 @@ def _reader(data: bytes = b"", *, eof: bool = True) -> asyncio.StreamReader:
     return reader
 
 
-def _written(writer: Any) -> bytes:
+def _written(writer: Mock) -> bytes:
     return b"".join(call.args[0] for call in writer.write.call_args_list)
 
 
@@ -93,7 +93,7 @@ async def _converse(
     data: bytes,
     *,
     eof: bool = True,
-    writer: Any = None,
+    writer: Mock | None = None,
 ) -> ConnectionClosed:
     writer = _fake_writer() if writer is None else writer
     await server.handle_http_connection(_reader(data, eof=eof), writer)
