@@ -29,6 +29,7 @@ from localstub.http.response import (
     RecordedHTTPResponse,
 )
 from localstub.http.responsespec import HTTPResponse
+from localstub.http.stream import ByteStream
 from localstub.http.upstream import open_upstream_connection
 from localstub.http.utils import (
     decode_status_text,
@@ -52,6 +53,8 @@ class ClientWriter(Protocol):
 
     def close(self) -> None: ...
 
+    def reset(self) -> None: ...
+
     async def wait_closed(self) -> None: ...
 
 
@@ -74,6 +77,7 @@ class TransformResult:
     override_response: HTTPResponse | None = None
     delay_before: float = 0.0
     drop_after: int | None = None
+    drop_reset: bool = False
 
 
 ResponseTransformer = Callable[
@@ -392,7 +396,7 @@ class RawForwarder:
         parsed_headers: ParsedRequest,
         header_wire_bytes: bytes,
         remaining_buffer: bytearray,
-        client_reader: asyncio.StreamReader,
+        client_reader: ByteStream,
         client_writer: ClientWriter,
         upstream_reader: asyncio.StreamReader,
         upstream_writer: asyncio.StreamWriter,
@@ -435,15 +439,15 @@ class RawForwarder:
 
         status = parsed_response.status_code or 0
         if status == 100:
-            final_parsed, full_wire = await parser.continue_parse_body(
+            outcome = await parser.continue_parse_body(
                 client_reader, remaining_buffer
             )
+            final_parsed = outcome.complete_request
+            full_wire = outcome.wire_bytes
             if final_parsed is None:
                 return ForwardedRequest(
                     parsed_request=parsed_headers,
-                    request_wire_bytes=(
-                        header_wire_bytes + bytes(remaining_buffer)
-                    ),
+                    request_wire_bytes=full_wire,
                     response=None,
                     request_body_consumed=False,
                     error=ForwardError.REQUEST_PARSE_FAILED,
@@ -572,7 +576,10 @@ class RawForwarder:
                 self._wire_log(f"lstub --> {client_label}", partial)
             client_writer.write(partial)
             await client_writer.drain()
-            client_writer.close()
+            if result.drop_reset:
+                client_writer.reset()
+            else:
+                client_writer.close()
             try:
                 await client_writer.wait_closed()
             except Exception:

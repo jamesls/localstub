@@ -1,180 +1,21 @@
+from __future__ import annotations
+
 import asyncio
 import time
 from unittest.mock import AsyncMock, create_autospec
 
 import pytest
-from hypothesis import given
-from hypothesis import strategies as st
 
-from localstub.http.clients.asyncio import AsyncioClient
-from localstub.middleware import ResponderContext
-from localstub.recording import BoundedByteBuffer, TrafficRecorder
 from localstub.server import (
-    AsyncHTTPTestServer,
     ByteFlip,
     Delay,
     DropConnection,
     FaultyTransmission,
-    HTTPResponse,
     ImmediateTransmission,
     RecordingStreamWriter,
     ThrottledTransmission,
     TruncateBody,
 )
-
-
-def test_server_url_raises_when_not_started() -> None:
-    server = AsyncHTTPTestServer()
-    with pytest.raises(RuntimeError, match="Server not started yet"):
-        _ = server.url
-
-
-def test_forward_proxy_with_injected_client_raises_value_error() -> None:
-    with pytest.raises(ValueError, match="not both"):
-        AsyncHTTPTestServer(
-            forward_proxy=True, upstream_client=AsyncioClient()
-        )
-
-
-def test_server_handler_getter() -> None:
-    def handler(ctx: ResponderContext) -> HTTPResponse:
-        _ = ctx
-        return HTTPResponse.json({"test": "value"})
-
-    server = AsyncHTTPTestServer(handler=handler)
-    assert server.handler is handler
-
-
-def test_server_accepts_recorder_in_legacy_positional_slot() -> None:
-    recorder = TrafficRecorder(None)
-
-    server = AsyncHTTPTestServer(
-        "127.0.0.1",
-        0,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        recorder,
-    )
-
-    assert server.requests == []
-
-
-def test_recording_writer_holds_only_current_response() -> None:
-    writer = AsyncMock(spec=asyncio.StreamWriter)
-    recorder = RecordingStreamWriter(writer)
-
-    recorder.start_response()
-    recorder.write(b"first response")
-    recorder.start_response()
-    recorder.write(b"second response")
-
-    assert recorder.bytes_sent == b"second response"
-
-
-def test_recording_writer_reuses_single_write_through_empty_writes() -> None:
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    recorder = RecordingStreamWriter(writer)
-    body = b"x" * 10000
-
-    assert recorder.bytes_sent == b""
-    recorder.write(b"")
-    recorder.write(body)
-    recorder.write(b"")
-
-    assert recorder.bytes_sent is body
-    assert [call.args[0] for call in writer.write.call_args_list] == [
-        b"",
-        body,
-        b"",
-    ]
-
-
-def test_recording_writer_coalesces_small_writes_around_large_write() -> None:
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    recorder = RecordingStreamWriter(writer, coalesce_size=4)
-
-    recorder.writelines([b"ab", b"c", b"defgh", b"i", b"jkl", b"m"])
-
-    assert recorder.bytes_sent == b"abcdefghijklm"
-
-
-def test_recording_writer_coalesce_size_below_one_raises_value_error() -> None:
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-
-    with pytest.raises(ValueError, match="coalesce_size"):
-        RecordingStreamWriter(writer, coalesce_size=0)
-
-
-@given(
-    coalesce_size=st.integers(min_value=1, max_value=16),
-    chunks=st.lists(st.binary(max_size=64), max_size=40),
-)
-def test_recording_writer_bytes_sent_matches_every_write(
-    coalesce_size: int, chunks: list[bytes]
-) -> None:
-    writer = AsyncMock(spec=asyncio.StreamWriter)
-    recorder = RecordingStreamWriter(writer, coalesce_size=coalesce_size)
-
-    expected = b""
-    for chunk in chunks:
-        recorder.write(chunk)
-        expected += chunk
-        assert recorder.bytes_sent == expected
-
-    assert [call.args[0] for call in writer.write.call_args_list] == chunks
-
-
-def test_recording_writer_snapshots_survive_more_writes_and_reset() -> None:
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    sent = BoundedByteBuffer(5)
-    recorder = RecordingStreamWriter(writer, sent)
-    recorder.write(b"ab")
-    first = recorder.bytes_sent
-    recorder.write(b"cd")
-    second = recorder.bytes_sent
-    recorder.writelines([b"", b"ef", b"gh"])
-    third = recorder.bytes_sent
-    recorder.start_response()
-
-    assert recorder.bytes_sent == b""
-    recorder.write(b"ij")
-    assert first == b"ab"
-    assert second == b"abcd"
-    assert third == b"abcdefgh"
-    assert recorder.bytes_sent == b"ij"
-    assert bytes(sent) == b"fghij"
-    assert sent.dropped == 5
-    assert [call.args[0] for call in writer.write.call_args_list] == [
-        b"ab",
-        b"cd",
-        b"",
-        b"ef",
-        b"gh",
-        b"ij",
-    ]
-
-
-@pytest.mark.parametrize("prefix", [b"", b"previous"])
-def test_recording_writer_preserves_capture_on_write_failure(
-    prefix: bytes,
-) -> None:
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    sent = BoundedByteBuffer(100)
-    recorder = RecordingStreamWriter(writer, sent)
-    recorder.write(prefix)
-    writer.write.side_effect = ConnectionError("closed")
-
-    with pytest.raises(ConnectionError, match="closed"):
-        recorder.write(b"failed")
-
-    assert recorder.bytes_sent == prefix + b"failed"
-    assert bytes(sent) == prefix + b"failed"
 
 
 @pytest.mark.asyncio
@@ -347,31 +188,109 @@ async def test_faulty_transmission_byte_flip() -> None:
 
 
 @pytest.mark.asyncio
-async def test_faulty_transmission_drop_connection() -> None:
+async def test_faulty_transmission_drop_connection_returns_abort() -> None:
     strategy = FaultyTransmission(faults=[DropConnection(after_bytes=2)])
     body = b"abcdef"
 
     writer = AsyncMock(spec=asyncio.StreamWriter)
     recorder = RecordingStreamWriter(writer)
 
-    await strategy.write_body(recorder, body)
+    abort = await strategy.write_body(recorder, body)
 
     assert writer.write.call_args[0][0] == b"ab"
-    assert writer.close.call_count == 1
-    assert writer.wait_closed.call_count == 1
+    assert abort is not None
+    assert not abort.reset
+    writer.close.assert_not_called()
     assert recorder.bytes_sent == b"ab"
 
 
-def test_zero_recording_buffer_size_raises_value_error():
-    with pytest.raises(ValueError, match="at least 1"):
-        AsyncHTTPTestServer(recording_buffer_size=0)
+@pytest.mark.asyncio
+async def test_faulty_transmission_drop_connection_reset_propagates() -> None:
+    strategy = FaultyTransmission(
+        faults=[DropConnection(after_bytes=0, reset=True)]
+    )
+
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+
+    abort = await strategy.write_body(writer, b"abcdef")
+
+    assert abort is not None
+    assert abort.reset
+    writer.write.assert_not_called()
 
 
-def test_negative_recording_buffer_size_raises_value_error():
-    with pytest.raises(ValueError, match="at least 1"):
-        AsyncHTTPTestServer(recording_buffer_size=-1)
+@pytest.mark.asyncio
+async def test_faulty_transmission_first_drop_wins() -> None:
+    strategy = FaultyTransmission(
+        faults=[
+            DropConnection(after_bytes=1, reset=True),
+            DropConnection(after_bytes=3),
+        ]
+    )
+
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+
+    abort = await strategy.write_body(writer, b"abcdef")
+
+    assert writer.write.call_args[0][0] == b"a"
+    assert abort is not None
+    assert abort.reset
 
 
-def test_negative_max_connection_bytes_raises_value_error() -> None:
-    with pytest.raises(ValueError, match="must be non-negative or None"):
-        AsyncHTTPTestServer(max_connection_bytes=-1)
+@pytest.mark.asyncio
+async def test_faulty_transmission_uses_injected_sleep() -> None:
+    sleep = create_autospec(asyncio.sleep)
+    strategy = FaultyTransmission(faults=[Delay(0.5)], sleep=sleep)
+
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+
+    assert await strategy.write_body(writer, b"abc") is None
+    sleep.assert_awaited_once_with(0.5)
+
+
+@pytest.mark.asyncio
+async def test_immediate_transmission_returns_none() -> None:
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+
+    assert await ImmediateTransmission().write_body(writer, b"abc") is None
+
+
+@pytest.mark.asyncio
+async def test_throttled_transmission_returns_none() -> None:
+    sleep = create_autospec(asyncio.sleep)
+    strategy = ThrottledTransmission(chunk_size=1, delay=0, sleep=sleep)
+    writer = AsyncMock(spec=asyncio.StreamWriter)
+
+    assert await strategy.write_body(writer, b"abc") is None
+
+
+def test_drop_connection_rejects_negative_after_bytes() -> None:
+    with pytest.raises(ValueError, match="after_bytes"):
+        DropConnection(after_bytes=-1)
+
+
+def test_delay_rejects_negative_seconds() -> None:
+    with pytest.raises(ValueError, match="seconds must be non-negative"):
+        Delay(-0.1)
+
+
+def test_truncate_body_rejects_negative_keep_bytes() -> None:
+    with pytest.raises(ValueError, match="keep_bytes must be non-negative"):
+        TruncateBody(-1)
+
+
+def test_byte_flip_rejects_negative_offset() -> None:
+    with pytest.raises(ValueError, match="offset must be non-negative"):
+        ByteFlip(offset=-1)
+
+
+@pytest.mark.parametrize("mask", [-1, 256])
+def test_byte_flip_rejects_mask_outside_byte_range(mask: int) -> None:
+    with pytest.raises(ValueError, match="mask must be between 0 and 255"):
+        ByteFlip(offset=0, mask=mask)
+
+
+def test_byte_flip_beyond_body_length_leaves_body_unchanged() -> None:
+    result = ByteFlip(offset=3).apply(b"abc")
+
+    assert result.body == b"abc"

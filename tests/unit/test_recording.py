@@ -7,6 +7,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from localstub.http.exchange import CloseReason, ConnectionClosed
 from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
@@ -50,9 +51,9 @@ def _request(target: str = "/") -> RecordedHTTPRequest:
     )
 
 
-def _response() -> RecordedHTTPResponse:
+def _response(status: int = 200) -> RecordedHTTPResponse:
     return RecordedHTTPResponse(
-        response=HTTPResponse(status=200),
+        response=HTTPResponse(status=status),
         reason="OK",
         wire_raw_bytes=b"",
     )
@@ -69,6 +70,20 @@ def _recorder(
         buffer_size,
         clock=_ManualClock(clock_value),
         timestamp_provider=_FixedTimestampProvider(_WALL_TIME),
+    )
+
+
+def _closed(reason: CloseReason = "close_response") -> ConnectionClosed:
+    return ConnectionClosed(
+        client=("127.0.0.1", 4242),
+        reason=reason,
+        phase="response",
+        reset=False,
+        requests_completed=1,
+        bytes_read=64,
+        bytes_consumed=64,
+        bytes_written=0,
+        timestamp=_WALL_TIME,
     )
 
 
@@ -599,3 +614,112 @@ def test_reset_preserves_buffer_size() -> None:
 def test_recorder_with_invalid_buffer_size_raises_value_error() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         TrafficRecorder(0)
+
+
+def test_record_exchange_stores_interim_responses_and_closed() -> None:
+    recorder = _recorder()
+    interim = _response(status=100)
+    final = _response(status=403)
+    closed = _closed("request_read")
+
+    recorder.record_exchange(
+        request=_request(),
+        response=final,
+        request_timestamp=_WALL_TIME,
+        interim_responses=(interim,),
+        closed=closed,
+    )
+
+    exchange = recorder.last_exchange
+    assert exchange is not None
+    assert len(exchange.interim_responses) == 1
+    assert exchange.interim_responses[0] is interim
+    assert exchange.closed is closed
+    assert recorder.responses == [final]
+    assert not recorder.closed_connections
+
+
+def test_record_exchange_defaults_to_no_interim_responses_or_close() -> None:
+    recorder = _recorder()
+
+    recorder.record_exchange(
+        request=_request(),
+        response=_response(),
+        request_timestamp=_WALL_TIME,
+    )
+
+    exchange = recorder.last_exchange
+    assert exchange is not None
+    assert exchange.interim_responses == ()
+    assert exchange.closed is None
+
+
+def test_record_connection_closed_appends_history_and_sets_last() -> None:
+    recorder = _recorder()
+    first = _closed("close_response")
+    second = _closed("idle_timeout")
+
+    recorder.record_connection_closed(first)
+    recorder.record_connection_closed(second)
+
+    assert recorder.closed_connections == [first, second]
+    assert recorder.last_closed_connection is second
+    assert recorder.dropped_closed_connections == 0
+
+
+def test_closed_connection_history_trims_beyond_buffer() -> None:
+    recorder = _recorder(buffer_size=2)
+    first = _closed("close_response")
+    second = _closed("idle_timeout")
+    third = _closed("max_requests")
+
+    for event in (first, second, third):
+        recorder.record_connection_closed(event)
+
+    assert recorder.closed_connections == [second, third]
+    assert recorder.dropped_closed_connections == 1
+
+
+@pytest.mark.asyncio
+async def test_next_closed_connection_consumes_events_in_order() -> None:
+    recorder = _recorder()
+    first = _closed("close_response")
+    second = _closed("client")
+    recorder.record_connection_closed(first)
+    recorder.record_connection_closed(second)
+
+    assert await recorder.next_closed_connection() is first
+    assert await recorder.next_closed_connection() is second
+
+
+@pytest.mark.asyncio
+async def test_next_closed_connection_with_timeout_returns_event() -> None:
+    recorder = _recorder()
+    event = _closed()
+    recorder.record_connection_closed(event)
+
+    assert await recorder.next_closed_connection(timeout=1.0) is event
+
+
+@pytest.mark.asyncio
+async def test_next_closed_connection_times_out_when_empty() -> None:
+    recorder = _recorder()
+
+    with pytest.raises(TimeoutError):
+        await recorder.next_closed_connection(timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_reset_clears_closed_connections_history_and_queue() -> None:
+    recorder = _recorder(buffer_size=1)
+    recorder.record_connection_closed(_closed("close_response"))
+    recorder.record_connection_closed(_closed("idle_timeout"))
+    assert recorder.dropped_closed_connections == 1
+
+    recorder.reset()
+
+    assert not recorder.closed_connections
+    assert recorder.last_closed_connection is None
+    assert recorder.dropped_closed_connections == 0
+    with pytest.raises(TimeoutError):
+        await recorder.next_closed_connection(timeout=0.01)

@@ -84,3 +84,45 @@ async def test_read_returns_unread_bytes_after_eof() -> None:
     assert await read(reader, 4) == b"abcd"
     assert await read(reader, 4) == b"ef"
     assert await read(reader, 4) == b""
+
+
+class _ScriptedReader:
+    """A byte stream implementing only the ``read`` method."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def read(self, n: int = -1) -> bytes:
+        if n < 0:
+            data, self._data = self._data, b""
+            return data
+        data, self._data = self._data[:n], self._data[n:]
+        return data
+
+
+@pytest.mark.asyncio
+async def test_read_with_plain_byte_stream_yields_unread_bytes_first() -> None:
+    reader = _ScriptedReader(b"stream data")
+    unread_data(reader, b"held")
+
+    assert await read(reader, 1024) == b"held"
+    assert await read(reader, 1024) == b"stream data"
+    assert await read(reader, 1024) == b""
+
+
+def test_take_unread_data_with_plain_byte_stream_returns_held_bytes() -> None:
+    reader = _ScriptedReader(b"")
+    unread_data(reader, b"held")
+
+    assert take_unread_data(reader) == b"held"
+    assert take_unread_data(reader) == b""
+
+
+@pytest.mark.asyncio
+async def test_unread_data_is_held_per_reader_object() -> None:
+    first = _ScriptedReader(b"first")
+    second = _ScriptedReader(b"second")
+    unread_data(first, b"held")
+
+    assert await read(second, 1024) == b"second"
+    assert await read(first, 1024) == b"held"

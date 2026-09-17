@@ -6,12 +6,15 @@ import io
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from unittest.mock import create_autospec
 
 import httpx
 import pytest
 
 from localstub.cli import (
     DEFAULT_PORT,
+    configure_server,
     parse_args,
     process_http_proxy_traffic,
     process_traffic,
@@ -21,7 +24,11 @@ from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.middleware import ResponderContext
-from localstub.server import AsyncHTTPTestServer, HTTPResponse
+from localstub.server import (
+    AsyncHTTPTestServer,
+    CloseConnection,
+    HTTPResponse,
+)
 
 
 def _recorded_request(
@@ -44,6 +51,12 @@ def _recorded_request(
         http_version="1.1",
         client=client,
     )
+
+
+def _write_config(tmp_path: Path, data: dict[str, Any]) -> Path:
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps(data), encoding="utf-8")
+    return config_file
 
 
 class TestParseArgs:
@@ -118,6 +131,98 @@ class TestParseArgs:
         args = parse_args(["-m", "intercept", "-f", "/tmp/stub.json"])
         assert args.mode == "intercept"
         assert args.config_file == Path("/tmp/stub.json")
+
+    def test_parse_args_keep_alive_flags_default_to_none(self) -> None:
+        args = parse_args([])
+        assert args.keep_alive_timeout is None
+        assert args.max_requests_per_connection is None
+
+    def test_parse_args_keep_alive_timeout_parses_float(self) -> None:
+        args = parse_args(["--keep-alive-timeout", "2.5"])
+        assert args.keep_alive_timeout == pytest.approx(2.5)
+
+    def test_parse_args_max_requests_per_connection_parses_int(self) -> None:
+        args = parse_args(["--max-requests-per-connection", "100"])
+        assert args.max_requests_per_connection == 100
+
+
+class TestConfigureServer:
+    def test_configure_server_sets_keep_alive_from_flags(self) -> None:
+        server = create_autospec(AsyncHTTPTestServer, instance=True)
+        args = parse_args([
+            "--keep-alive-timeout",
+            "5",
+            "--max-requests-per-connection",
+            "100",
+        ])
+
+        configure_server(server, args)
+
+        server.set_keep_alive.assert_called_once_with(
+            timeout=5.0, max_requests=100
+        )
+
+    def test_configure_server_without_flags_sets_unlimited_keep_alive(
+        self,
+    ) -> None:
+        server = create_autospec(AsyncHTTPTestServer, instance=True)
+
+        configure_server(server, parse_args([]))
+
+        server.set_keep_alive.assert_called_once_with(
+            timeout=None, max_requests=None
+        )
+        server.set_response_sequence.assert_not_called()
+        server.set_default_response.assert_not_called()
+
+    def test_configure_server_applies_response_sequence_with_close(
+        self, tmp_path: Path
+    ) -> None:
+        config_file = _write_config(
+            tmp_path,
+            {
+                "responses": [
+                    {"type": "close"},
+                    {"type": "close", "reset": True},
+                    {"type": "json", "body": {"ok": True}},
+                ]
+            },
+        )
+        server = create_autospec(AsyncHTTPTestServer, instance=True)
+
+        configure_server(server, parse_args(["-f", str(config_file)]))
+
+        server.set_response_sequence.assert_called_once()
+        (sequence,) = server.set_response_sequence.call_args.args
+        assert sequence[:2] == [CloseConnection(), CloseConnection(reset=True)]
+        assert isinstance(sequence[2], HTTPResponse)
+        server.set_default_response.assert_not_called()
+
+    def test_configure_server_with_empty_sequence_configures_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        config_file = _write_config(tmp_path, {"responses": []})
+        server = create_autospec(AsyncHTTPTestServer, instance=True)
+
+        configure_server(server, parse_args(["-f", str(config_file)]))
+
+        server.set_response_sequence.assert_not_called()
+        server.set_default_response.assert_not_called()
+        server.set_keep_alive.assert_called_once_with(
+            timeout=None, max_requests=None
+        )
+
+    def test_configure_server_applies_single_close_as_default(
+        self, tmp_path: Path
+    ) -> None:
+        config_file = _write_config(
+            tmp_path, {"response": {"type": "close", "delay": 0.25}}
+        )
+        server = AsyncHTTPTestServer()
+
+        configure_server(server, parse_args(["-f", str(config_file)]))
+
+        assert server.default_response == CloseConnection(delay=0.25)
 
 
 class TestProcessTrafficNoResponse:

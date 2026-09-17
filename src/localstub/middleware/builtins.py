@@ -14,7 +14,13 @@ from localstub.http.proxy import (
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.responsespec import HTTPResponse
 from localstub.middleware.core import (
+    CloseConnection,
+    CloseDuringRequest,
     ForwardProxyResponse,
+    HeaderContext,
+    HeaderDecision,
+    HeaderMiddleware,
+    HeaderNext,
     ResponderContext,
     ResponderMiddleware,
     ResponderNext,
@@ -68,7 +74,7 @@ class ThrottleMiddleware:
 
 @dataclass
 class ResponseSequenceMiddleware:
-    responses: list[HTTPResponse]
+    responses: list[HTTPResponse | CloseConnection]
     index: int = 0
 
     def reset(self) -> None:
@@ -143,6 +149,44 @@ class RawForwardProxyMiddleware:
             request_method=recorded.method,
             forwarder=self.forwarder,
         )
+
+
+def close_during_request(
+    *,
+    after_body_bytes: int = 0,
+    reset: bool = False,
+    times: int | None = None,
+) -> HeaderMiddleware:
+    """Build header middleware that closes while the request is read.
+
+    The first ``times`` requests are closed with
+    ``CloseDuringRequest(after_body_bytes, reset)``; later requests
+    are delegated to the rest of the header chain.  ``None`` closes
+    every request.  The middleware does not send ``100 Continue``; a
+    client waiting for permission to upload a positive threshold of
+    bytes needs another middleware to send it first.
+    """
+    if times is not None and times < 1:
+        raise ValueError("times must be at least 1 or None")
+    decision = CloseDuringRequest(
+        after_body_bytes=after_body_bytes, reset=reset
+    )
+    remaining = times
+
+    async def middleware(
+        ctx: HeaderContext,
+        call_next: HeaderNext,
+    ) -> HeaderDecision:
+        nonlocal remaining
+        _ = ctx
+        if remaining is None:
+            return decision
+        if remaining > 0:
+            remaining -= 1
+            return decision
+        return await call_next()
+
+    return middleware
 
 
 type SlotName = Literal["throttle", "sequence", "raw_proxy", "proxy"]

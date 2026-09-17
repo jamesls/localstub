@@ -9,8 +9,8 @@ so memory stays bounded no matter how long the server or proxy runs.
 ``TrafficRecorder`` bundles those buffers into the recording subsystem
 shared by the test server and the TLS intercept proxy: bounded history
 lists, ``last_*`` convenience attributes, and the queues behind the
-``next_request()`` / ``next_response()`` / ``next_exchange()`` consumer
-API.
+``next_request()`` / ``next_response()`` / ``next_exchange()`` /
+``next_closed_connection()`` consumer API.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Final
 
 from localstub.clock import Clock, MonotonicClock
-from localstub.http.exchange import RecordedExchange
+from localstub.http.exchange import ConnectionClosed, RecordedExchange
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.middleware import SystemTimestampProvider, TimestampProvider
@@ -241,11 +241,11 @@ def trim_history[T](items: list[T], maxsize: int | None) -> list[T]:
 class TrafficRecorder:
     """Records HTTP traffic and hands it to recording consumers.
 
-    Owns the bounded request/response/exchange history lists, the
-    ``last_*`` convenience attributes, and the queues that back the
-    ``next_request()`` / ``next_response()`` / ``next_exchange()``
-    consumer API.  All buffers share one ``buffer_size``; ``None``
-    means unbounded.
+    Owns the bounded request/response/exchange/closed-connection
+    history lists, the ``last_*`` convenience attributes, and the
+    queues that back the ``next_request()`` / ``next_response()`` /
+    ``next_exchange()`` / ``next_closed_connection()`` consumer API.
+    All buffers share one ``buffer_size``; ``None`` means unbounded.
     """
 
     last_request: RecordedHTTPRequest | None
@@ -254,11 +254,14 @@ class TrafficRecorder:
     responses: list[RecordedHTTPResponse]
     last_exchange: RecordedExchange | None
     exchanges: list[RecordedExchange]
+    last_closed_connection: ConnectionClosed | None
+    closed_connections: list[ConnectionClosed]
 
     _request_timestamps: dict[int, float]
     _request_queue: BoundedRecordQueue[RecordedHTTPRequest]
     _response_queue: BoundedRecordQueue[RecordedHTTPResponse]
     _exchange_queue: BoundedRecordQueue[RecordedExchange]
+    _closed_connection_queue: BoundedRecordQueue[ConnectionClosed]
 
     def __init__(
         self,
@@ -282,6 +285,8 @@ class TrafficRecorder:
         self.responses = []
         self.last_exchange = None
         self.exchanges = []
+        self.last_closed_connection = None
+        self.closed_connections = []
         self._request_timestamps = {}
         self._request_queue = BoundedRecordQueue(
             self._buffer_size, name="requests"
@@ -291,6 +296,9 @@ class TrafficRecorder:
         )
         self._exchange_queue = BoundedRecordQueue(
             self._buffer_size, name="exchanges"
+        )
+        self._closed_connection_queue = BoundedRecordQueue(
+            self._buffer_size, name="closed connections"
         )
 
     def record_request(
@@ -319,13 +327,16 @@ class TrafficRecorder:
         request: RecordedHTTPRequest,
         response: RecordedHTTPResponse | None,
         request_timestamp: datetime,
+        interim_responses: tuple[RecordedHTTPResponse, ...] = (),
+        closed: ConnectionClosed | None = None,
     ) -> None:
         """Record a completed exchange and, when present, its response.
 
         ``response`` is ``None`` when the exchange failed before a
         response could be sent; the exchange is still recorded so
         consumers observe the request's outcome, but nothing is added
-        to the response history or queue.
+        to the response history or queue.  ``interim_responses`` and
+        ``closed`` are stored on the exchange only.
         """
         response_timestamp = (
             self._timestamp_provider.now() if response is not None else None
@@ -335,6 +346,8 @@ class TrafficRecorder:
             response=response,
             request_timestamp=request_timestamp,
             response_timestamp=response_timestamp,
+            interim_responses=interim_responses,
+            closed=closed,
         )
         self.exchanges.append(exchange)
         trim_history(self.exchanges, self._buffer_size)
@@ -345,6 +358,13 @@ class TrafficRecorder:
             trim_history(self.responses, self._buffer_size)
             self.last_response = response
             self._response_queue.put(response)
+
+    def record_connection_closed(self, event: ConnectionClosed) -> None:
+        """Record the terminal event of a connection."""
+        self.closed_connections.append(event)
+        trim_history(self.closed_connections, self._buffer_size)
+        self.last_closed_connection = event
+        self._closed_connection_queue.put(event)
 
     def get_request_timestamp(self, request: RecordedHTTPRequest) -> float:
         """Return the monotonic reception timestamp for *request*.
@@ -387,6 +407,16 @@ class TrafficRecorder:
         """Return the next completed exchange, or None if none is queued."""
         return self._exchange_queue.get_nowait()
 
+    async def next_closed_connection(
+        self, timeout: float | None = None
+    ) -> ConnectionClosed:
+        """Await and return the next connection close event.
+
+        Events are queued when a connection is finalized, so the order
+        is finalization order rather than decision order.
+        """
+        return await self._next(self._closed_connection_queue, timeout)
+
     @property
     def dropped_requests(self) -> int:
         """Requests evicted unread from the next_request() buffer."""
@@ -401,6 +431,12 @@ class TrafficRecorder:
     def dropped_exchanges(self) -> int:
         """Exchanges evicted unread from the next_exchange() buffer."""
         return self._exchange_queue.dropped
+
+    @property
+    def dropped_closed_connections(self) -> int:
+        """Close events evicted unread from the next_closed_connection()
+        buffer."""
+        return self._closed_connection_queue.dropped
 
     async def _next[T](
         self, queue: BoundedRecordQueue[T], timeout: float | None

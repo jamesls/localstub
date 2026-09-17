@@ -8,7 +8,7 @@ from email.message import Message
 from pathlib import Path
 from typing import Literal, TextIO
 
-from localstub.http.exchange import RecordedExchange
+from localstub.http.exchange import ConnectionClosed, RecordedExchange
 from localstub.http.headers import Headers
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
@@ -32,12 +32,12 @@ def _isoformat_utc(ts: datetime) -> str:
     return ts.astimezone(UTC).isoformat()
 
 
-def _request_client_json(
-    request: RecordedHTTPRequest,
+def _client_json(
+    client: tuple[str, int] | None,
 ) -> dict[str, object] | None:
-    if request.client is None:
+    if client is None:
         return None
-    host, port = request.client
+    host, port = client
     return {"host": host, "port": port}
 
 
@@ -67,6 +67,32 @@ def _response_body_json(response: RecordedHTTPResponse) -> str | None:
     return _safe_utf8_decode(body_bytes)
 
 
+def _response_json(response: RecordedHTTPResponse) -> dict[str, object]:
+    return {
+        "status": response.status,
+        "reason": response.reason,
+        "headers": _headers_json(response.headers),
+        "body": _response_body_json(response),
+        "raw_wire_bytes": _to_base64(response.wire_raw_bytes),
+    }
+
+
+def _closed_json(closed: ConnectionClosed | None) -> dict[str, object] | None:
+    if closed is None:
+        return None
+    return {
+        "client": _client_json(closed.client),
+        "reason": closed.reason,
+        "phase": closed.phase,
+        "reset": closed.reset,
+        "requests_completed": closed.requests_completed,
+        "bytes_read": closed.bytes_read,
+        "bytes_consumed": closed.bytes_consumed,
+        "bytes_written": closed.bytes_written,
+        "timestamp": _isoformat_utc(closed.timestamp),
+    }
+
+
 def exchange_to_json_obj(exchange: RecordedExchange) -> dict[str, object]:
     request = exchange.request
     request_wire = request.wire_raw_bytes
@@ -74,9 +100,10 @@ def exchange_to_json_obj(exchange: RecordedExchange) -> dict[str, object]:
     request_obj: dict[str, object] = {
         "method": request.method,
         "path": request.target,
-        "client": _request_client_json(request),
+        "client": _client_json(request.client),
         "headers": _headers_json(request.headers),
         "body": _request_body_json(request),
+        "body_complete": request.body_complete,
         "raw_wire_bytes": _to_base64(request_wire),
     }
     if request.is_proxy_request and request.target_uri is not None:
@@ -90,14 +117,7 @@ def exchange_to_json_obj(exchange: RecordedExchange) -> dict[str, object]:
         response_obj = None
         response_timestamp = None
     else:
-        response = exchange.response
-        response_obj = {
-            "status": response.status,
-            "reason": response.reason,
-            "headers": _headers_json(response.headers),
-            "body": _response_body_json(response),
-            "raw_wire_bytes": _to_base64(response.wire_raw_bytes),
-        }
+        response_obj = _response_json(exchange.response)
         response_timestamp = (
             _isoformat_utc(exchange.response_timestamp)
             if exchange.response_timestamp is not None
@@ -109,6 +129,10 @@ def exchange_to_json_obj(exchange: RecordedExchange) -> dict[str, object]:
         "request": request_obj,
         "response_timestamp": response_timestamp,
         "response": response_obj,
+        "interim_responses": [
+            _response_json(interim) for interim in exchange.interim_responses
+        ],
+        "closed": _closed_json(exchange.closed),
     }
 
 

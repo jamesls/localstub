@@ -155,7 +155,42 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Path to JSON config file for intercept mode responses",
     )
+    parser.add_argument(
+        "--keep-alive-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Seconds an idle stubbed connection waits for its next "
+            "request before closing (default: wait forever)"
+        ),
+    )
+    parser.add_argument(
+        "--max-requests-per-connection",
+        type=int,
+        default=None,
+        help=(
+            "Close a stubbed connection after this many responses "
+            "(default: unlimited)"
+        ),
+    )
     return parser.parse_args(args)
+
+
+def configure_server(
+    server: AsyncHTTPTestServer,
+    args: argparse.Namespace,
+) -> None:
+    """Apply the config file and keep-alive flags to a stub server."""
+    if args.config_file:
+        config = load_config(args.config_file)
+        if config.response_sequence:
+            server.set_response_sequence(config.response_sequence)
+        elif config.single_response:
+            server.set_default_response(config.single_response)
+    server.set_keep_alive(
+        timeout=args.keep_alive_timeout,
+        max_requests=args.max_requests_per_connection,
+    )
 
 
 async def run_proxy(args: argparse.Namespace) -> None:
@@ -185,14 +220,7 @@ async def run_http_proxy(args: argparse.Namespace) -> None:
         on_headers_received=handle_expect_header,
         forward_proxy=forward_proxy,
     )
-
-    # Configure responses if config file provided
-    if args.config_file:
-        config = load_config(args.config_file)
-        if config.response_sequence:
-            server.set_response_sequence(config.response_sequence)
-        elif config.single_response:
-            server.set_default_response(config.single_response)
+    configure_server(server, args)
 
     async with AsyncExitStack() as output_stack:
         output_file: TrafficOutput | None = None
@@ -230,12 +258,7 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
     server: AsyncHTTPTestServer | None = None
     if args.mode == "intercept":
         server = AsyncHTTPTestServer()
-        if args.config_file:
-            config = load_config(args.config_file)
-            if config.response_sequence:
-                server.set_response_sequence(config.response_sequence)
-            elif config.single_response:
-                server.set_default_response(config.single_response)
+        configure_server(server, args)
 
     ca: TLSProxyCA | None = None
     if args.ca_dir:

@@ -12,20 +12,34 @@ Any consumer that reads through :func:`read` sees the stream's bytes
 in their original order, whether they were held here or are still
 buffered in the reader.  A consumer that reads from the reader
 directly should first drain :func:`take_unread_data`.
+
+Readers are anything with an ``asyncio.StreamReader``-shaped ``read``
+method (:class:`ByteStream`), so a wrapper that counts or records
+bytes qualifies alongside the raw reader.  Bytes are keyed on the
+object handed to these functions, so a wrapper and the reader it
+wraps hold separate read-ahead; a consumer must read through one of
+them consistently.
 """
 
 from __future__ import annotations
 
-import asyncio
+from typing import Protocol
 from weakref import WeakKeyDictionary
 
-_UNREAD_BY_READER: WeakKeyDictionary[asyncio.StreamReader, bytearray] = (
+
+class ByteStream(Protocol):
+    """The one method these helpers and the request parser need."""
+
+    async def read(self, n: int = -1) -> bytes: ...
+
+
+_UNREAD_BY_READER: WeakKeyDictionary[ByteStream, bytearray] = (
     WeakKeyDictionary()
 )
 
 
 def unread_data(
-    reader: asyncio.StreamReader,
+    reader: ByteStream,
     data: bytes | bytearray,
 ) -> None:
     """Return ``data`` to ``reader``, ahead of any future reads.
@@ -41,7 +55,7 @@ def unread_data(
 
 
 def take_unread_data(
-    reader: asyncio.StreamReader,
+    reader: ByteStream,
     limit: int | None = None,
 ) -> bytes:
     """Consume bytes previously returned to ``reader`` via unread_data().
@@ -62,7 +76,7 @@ def take_unread_data(
     return data
 
 
-async def read(reader: asyncio.StreamReader, max_bytes: int) -> bytes:
+async def read(reader: ByteStream, max_bytes: int) -> bytes:
     """Read up to ``max_bytes`` from ``reader``, unread bytes first.
 
     Drop-in replacement for ``reader.read(max_bytes)`` that yields

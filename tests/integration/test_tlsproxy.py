@@ -1140,14 +1140,36 @@ async def test_forward_closes_tunnel_when_client_requests_connection_close():
 
 
 @pytest.mark.asyncio
-async def test_forward_returns_400_for_malformed_request_over_tunnel():
+@pytest.mark.parametrize(
+    "request_bytes",
+    [
+        b"INVALID HTTP DATA\r\n\r\n",
+        (
+            b"PUT /upload HTTP/1.1\r\n"
+            b"Host: example.com\r\n"
+            b"Transfer-Encoding: gzip\r\n"
+            b"Expect: 100-continue\r\n\r\n"
+        ),
+    ],
+    ids=["invalid-request-line", "rejected-transfer-encoding-with-expect"],
+)
+async def test_forward_returns_400_for_malformed_request_over_tunnel(
+    request_bytes: bytes,
+) -> None:
+    upstream_connected = asyncio.Event()
+
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        # A malformed client request is rejected before any upstream
-        # connection is opened, so this handler is never invoked.
+        upstream_connected.set()
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n"
+        )
+        await writer.drain()
         await reader.read()
         writer.close()
+        await writer.wait_closed()
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     upstream_host, upstream_port = server.sockets[0].getsockname()[:2]
@@ -1179,13 +1201,14 @@ async def test_forward_returns_400_for_malformed_request_over_tunnel():
                     verify_context, server_hostname=upstream_host
                 )
 
-                writer.write(b"INVALID HTTP DATA\r\n\r\n")
+                writer.write(request_bytes)
                 await writer.drain()
 
                 response = await asyncio.wait_for(
                     reader.readuntil(b"\r\n\r\n"), timeout=1.0
                 )
                 assert response.startswith(b"HTTP/1.1 400")
+                assert not upstream_connected.is_set()
             finally:
                 writer.close()
                 await writer.wait_closed()

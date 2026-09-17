@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from localstub.clock import Clock, MonotonicClock
 from localstub.forward import RawForwarder
+from localstub.http.exchange import ConnectionClosed
 from localstub.http.request import HTTPRequestHeaders, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
@@ -117,7 +118,66 @@ class ForwardProxyResponse:
     forwarder: RawForwarder
 
 
-type ResponseSpec = HTTPResponse | ForwardProxyResponse
+@dataclass(frozen=True)
+class CloseConnection:
+    """Close the client connection without sending a response.
+
+    Returned anywhere a responder can return an ``HTTPResponse``.  The
+    server reads the full request, writes nothing, and closes.  The
+    recorded exchange has no response and owns a ``ConnectionClosed``
+    event with reason ``close_response``.
+    """
+
+    reset: bool = False
+    """Request an abortive TCP close instead of ordinary closure."""
+
+    delay: float = 0.0
+    """Seconds to hold the connection open before closing.  The server
+    is not reading during the delay, so a client that gives up first is
+    not observed."""
+
+    def __post_init__(self) -> None:
+        if self.delay < 0:
+            raise ValueError("delay must be non-negative")
+
+
+@dataclass(frozen=True)
+class CloseDuringRequest:
+    """Stop reading the request and close the connection.
+
+    Returned by header middleware in place of ``True`` or ``False``.
+    The recorded request has ``body_complete=False`` unless the body
+    reached its message boundary at or before the threshold, and the
+    exchange owns a ``ConnectionClosed`` event with reason
+    ``request_read``.
+    """
+
+    after_body_bytes: int = 0
+    """Maximum payload bytes to consume before closing, excluding
+    HTTP transfer framing. 0 closes right after the headers."""
+
+    reset: bool = False
+    """Request an abortive TCP close instead of ordinary closure."""
+
+    def __post_init__(self) -> None:
+        if self.after_body_bytes < 0:
+            raise ValueError("after_body_bytes must be non-negative")
+
+    def __bool__(self) -> bool:
+        """Refuse boolean coercion.
+
+        Pyright does not flag ``if not decision`` on the union, so
+        this runtime guard is the only thing that stops an old-style
+        wrapper from silently discarding the fault. The cost is that
+        generic code, including test helpers, cannot truth-test the
+        object; compare with ``is`` or ``isinstance`` instead.
+        """
+        raise TypeError(
+            "Return HeaderDecision unchanged or handle it explicitly"
+        )
+
+
+type ResponseSpec = HTTPResponse | ForwardProxyResponse | CloseConnection
 
 
 def ensure_response_spec(value: object) -> ResponseSpec:
@@ -127,7 +187,9 @@ def ensure_response_spec(value: object) -> ResponseSpec:
     return anything at runtime, so the check is performed against
     ``object`` rather than trusting the annotation.
     """
-    if isinstance(value, HTTPResponse | ForwardProxyResponse):
+    if isinstance(
+        value, HTTPResponse | ForwardProxyResponse | CloseConnection
+    ):
         return value
     raise TypeError(f"Unhandled response spec: {type(value).__name__}")
 
@@ -196,8 +258,17 @@ def compose_responder(
 
 @dataclass(frozen=True)
 class SendResult:
-    recorded: RecordedHTTPResponse
+    """What the sender chain produced for one response spec.
+
+    ``recorded`` is ``None`` when nothing was sent, such as for a
+    ``CloseConnection``.  ``closed`` is the close event when sending
+    decided the connection's close, so sender middleware can observe a
+    close the same way it observes a response.
+    """
+
+    recorded: RecordedHTTPResponse | None
     should_close: bool
+    closed: ConnectionClosed | None = None
 
 
 class SenderNext(Protocol):
@@ -266,31 +337,44 @@ class HeaderContext:
     state: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
+type HeaderDecision = bool | CloseDuringRequest
+"""What header middleware returns.
+
+``True`` continues reading the body.  ``False`` closes without
+consuming body bytes, the same as ``CloseDuringRequest()``.  A
+delegated decision should be returned unchanged; inspect it with
+``is True``, ``is False``, or ``isinstance``, since boolean coercion
+of ``CloseDuringRequest`` raises ``TypeError``.
+"""
+
+
 class HeaderNext(Protocol):
     def __call__(
         self,
         *,
         ctx: HeaderContext | None = None,
-    ) -> Awaitable[bool]: ...
+    ) -> Awaitable[HeaderDecision]: ...
 
 
 type HeaderMiddleware = Callable[
     [HeaderContext, HeaderNext],
-    bool | Awaitable[bool],
+    HeaderDecision | Awaitable[HeaderDecision],
 ]
 
 
 def compose_headers(
     middlewares: list[HeaderMiddleware],
-    terminal: Callable[[HeaderContext], bool | Awaitable[bool]],
-) -> Callable[[HeaderContext], Awaitable[bool]]:
-    async def app(ctx: HeaderContext) -> bool:
+    terminal: Callable[
+        [HeaderContext], HeaderDecision | Awaitable[HeaderDecision]
+    ],
+) -> Callable[[HeaderContext], Awaitable[HeaderDecision]]:
+    async def app(ctx: HeaderContext) -> HeaderDecision:
         index = -1
 
         async def dispatch(
             i: int,
             current_ctx: HeaderContext,
-        ) -> bool:
+        ) -> HeaderDecision:
             nonlocal index
             if i <= index:
                 raise RuntimeError("call_next() called multiple times")
@@ -304,7 +388,7 @@ def compose_headers(
             async def call_next(
                 *,
                 ctx: HeaderContext | None = None,
-            ) -> bool:
+            ) -> HeaderDecision:
                 next_ctx = current_ctx if ctx is None else ctx
                 return await dispatch(i + 1, next_ctx)
 

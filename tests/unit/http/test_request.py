@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import sys
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import httptools
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from localstub.http.framing import ChunkScanError
 from localstub.http.headers import Headers
 from localstub.http.request import (
     AsyncRequestParser,
@@ -15,6 +19,8 @@ from localstub.http.request import (
     HTTPRequestHeaders,
     HTTPRequestReader,
     ParsedRequest,
+    ParseOutcome,
+    ParseStop,
     RecordedHTTPRequest,
     RequestProtocol,
 )
@@ -25,6 +31,11 @@ from .strategies import (
     fragments_of,
     header_items,
 )
+
+GZIP_HEAD = (
+    b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n"
+)
+GZIP_REQUEST = GZIP_HEAD + b"body"
 
 
 def test_parsed_request_default_values() -> None:
@@ -182,7 +193,7 @@ async def test_async_request_parser_parse_simple_get_request() -> None:
     reader = _create_mock_reader([request_data])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.method == "GET"
@@ -204,7 +215,7 @@ async def test_async_request_parser_parse_post_request_with_body() -> None:
     reader = _create_mock_reader([request_data])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.method == "POST"
@@ -227,7 +238,7 @@ async def test_async_request_parser_parse_chunked_request() -> None:
     reader = _create_mock_reader([request_data])
 
     parser = AsyncRequestParser()
-    parsed, _ = await parser.parse(reader)
+    parsed, _ = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.method == "POST"
@@ -249,7 +260,7 @@ async def test_async_request_parser_upgrade_content_length_body() -> None:
     reader = _create_mock_reader([request_data])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.body == b"hello"
@@ -273,7 +284,7 @@ async def test_async_request_parser_upgrade_chunked_body() -> None:
     reader = _create_mock_reader([request_data])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.body == b"Hello World"
@@ -297,8 +308,8 @@ async def test_async_request_parser_upgrade_body_preserves_pipeline() -> None:
     reader.feed_data(first_request + second_request)
     reader.feed_eof()
 
-    first, first_wire = await AsyncRequestParser().parse(reader)
-    second, second_wire = await AsyncRequestParser().parse(reader)
+    first, first_wire = _parsed(await AsyncRequestParser().parse(reader))
+    second, second_wire = _parsed(await AsyncRequestParser().parse(reader))
 
     assert first is not None
     assert first.body == smuggled
@@ -323,7 +334,7 @@ async def test_async_request_parser_upgrade_without_body_completes() -> None:
     reader.feed_eof()
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.is_complete
@@ -350,7 +361,7 @@ async def test_async_request_parser_upgrade_chunked_incremental() -> None:
     ])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.body == b"Hello"
@@ -375,7 +386,7 @@ async def test_async_request_parser_upgrade_chunked_trailers() -> None:
     reader = _create_mock_reader([request_data])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.body == b"hello"
@@ -396,7 +407,7 @@ async def test_async_request_parser_upgrade_zero_content_length() -> None:
     reader = _create_mock_reader([request_data])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.is_complete
@@ -418,7 +429,7 @@ async def test_async_request_parser_connect_ignores_content_length() -> None:
     reader.feed_eof()
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is not None
     assert parsed.method == "CONNECT"
@@ -456,15 +467,19 @@ async def test_async_request_parser_parse_with_connection_wire_pipeline() -> (
     connection_wire = bytearray()
 
     first_parser = AsyncRequestParser()
-    first_parsed, first_wire = await first_parser.parse(
-        reader,
-        connection_wire,
+    first_parsed, first_wire = _parsed(
+        await first_parser.parse(
+            reader,
+            connection_wire,
+        )
     )
 
     second_parser = AsyncRequestParser()
-    second_parsed, second_wire = await second_parser.parse(
-        reader,
-        connection_wire,
+    second_parsed, second_wire = _parsed(
+        await second_parser.parse(
+            reader,
+            connection_wire,
+        )
     )
 
     assert first_parsed is not None
@@ -483,7 +498,7 @@ async def test_async_request_parser_parse_eof_before_complete() -> None:
     reader = _create_mock_reader([b"GET / HTTP/1.1\r\nHost:"])
 
     parser = AsyncRequestParser()
-    parsed, _ = await parser.parse(reader)
+    parsed, _ = _parsed(await parser.parse(reader))
 
     assert parsed is None
 
@@ -493,7 +508,7 @@ async def test_async_request_parser_parse_malformed_request() -> None:
     reader = _create_mock_reader([b"NOT VALID HTTP AT ALL"])
 
     parser = AsyncRequestParser()
-    parsed, _ = await parser.parse(reader)
+    parsed, _ = _parsed(await parser.parse(reader))
 
     assert parsed is None
 
@@ -505,7 +520,7 @@ async def test_async_request_parser_parse_malformed_single_byte_request() -> (
     reader = _create_mock_reader([b"\x00"])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is None
     assert wire_bytes == b"\x00"
@@ -533,7 +548,7 @@ async def test_async_request_parser_preserves_first_pipelined_request() -> (
     reader.feed_data(first_request + second_request)
 
     parser1 = AsyncRequestParser()
-    parsed1, wire_bytes1 = await parser1.parse(reader)
+    parsed1, wire_bytes1 = _parsed(await parser1.parse(reader))
 
     assert parsed1 is not None
     assert parsed1.method == "GET"
@@ -546,7 +561,7 @@ async def test_async_request_parser_preserves_first_pipelined_request() -> (
     reader.feed_eof()
 
     parser2 = AsyncRequestParser()
-    parsed2, wire_bytes2 = await parser2.parse(reader)
+    parsed2, wire_bytes2 = _parsed(await parser2.parse(reader))
 
     assert parsed2 is not None
     assert parsed2.method == "GET"
@@ -567,8 +582,8 @@ async def test_async_request_parser_preserves_pipeline_across_handoff() -> (
     reader.feed_data(first_request + second_request)
     reader.feed_eof()
 
-    first, _ = await AsyncRequestParser().parse(reader)
-    second, _ = await AsyncRequestParser().parse(reader)
+    first, _ = _parsed(await AsyncRequestParser().parse(reader))
+    second, _ = _parsed(await AsyncRequestParser().parse(reader))
 
     assert first is not None
     assert first.url == b"/first"
@@ -584,7 +599,7 @@ async def test_async_request_parser_parse_with_read_exception() -> None:
     )
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is None
     assert wire_bytes == b""
@@ -597,7 +612,7 @@ async def test_async_request_parser_preserves_remaining_buffer() -> None:
     reader.feed_data(malformed_with_extra)
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes = await parser.parse(reader)
+    parsed, wire_bytes = _parsed(await parser.parse(reader))
 
     assert parsed is None
     assert len(wire_bytes) > 0
@@ -620,7 +635,7 @@ async def test_async_request_parser_parse_headers_stops_after_headers() -> (
     reader.feed_eof()
 
     parser = AsyncRequestParser()
-    parsed, header_wire, _ = await parser.parse_headers(reader)
+    parsed, header_wire, _ = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
     assert parsed.method == "POST"
@@ -640,7 +655,7 @@ async def test_async_request_parser_parse_headers_sets_complete_flag() -> None:
     reader.feed_eof()
 
     parser = AsyncRequestParser()
-    parsed, _, _ = await parser.parse_headers(reader)
+    parsed, _, _ = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
     assert parsed.headers_complete
@@ -661,7 +676,7 @@ async def test_async_request_parser_headers_return_remaining_buffer() -> None:
     reader.feed_eof()
 
     parser = AsyncRequestParser()
-    parsed, _, remaining = await parser.parse_headers(reader)
+    parsed, _, remaining = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
     assert len(remaining) > 0 or not reader.at_eof()
@@ -681,12 +696,14 @@ async def test_async_request_parser_continue_body_completes_request() -> None:
     reader.feed_eof()
 
     parser = AsyncRequestParser()
-    parsed, _, remaining = await parser.parse_headers(reader)
+    parsed, _, remaining = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
     assert not parsed.is_complete
 
-    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+    parsed, wire_bytes = _parsed(
+        await parser.continue_parse_body(reader, remaining)
+    )
 
     assert parsed is not None
     assert parsed.is_complete
@@ -711,7 +728,9 @@ async def test_async_request_parser_parse_headers_with_connection_wire() -> (
     connection_wire = bytearray()
 
     parser = AsyncRequestParser()
-    parsed, _, _ = await parser.parse_headers(reader, connection_wire)
+    parsed, _, _ = _headers(
+        await parser.parse_headers(reader, connection_wire)
+    )
 
     assert parsed is not None
     assert len(connection_wire) > 0
@@ -735,12 +754,16 @@ async def test_async_request_parser_continue_body_with_connection_wire() -> (
     connection_wire = bytearray()
 
     parser = AsyncRequestParser()
-    _, _, remaining = await parser.parse_headers(reader, connection_wire)
+    _, _, remaining = _headers(
+        await parser.parse_headers(reader, connection_wire)
+    )
 
-    parsed, _ = await parser.continue_parse_body(
-        reader,
-        remaining,
-        connection_wire,
+    parsed, _ = _parsed(
+        await parser.continue_parse_body(
+            reader,
+            remaining,
+            connection_wire,
+        )
     )
 
     assert parsed is not None
@@ -757,7 +780,7 @@ async def test_async_request_parser_parse_headers_eof_before_complete() -> (
     reader.feed_eof()
 
     parser = AsyncRequestParser()
-    parsed, _, _ = await parser.parse_headers(reader)
+    parsed, _, _ = _headers(await parser.parse_headers(reader))
 
     assert parsed is None
 
@@ -768,7 +791,7 @@ async def test_async_request_parser_parse_headers_malformed_request() -> None:
     reader.feed_data(b"INVALID HTTP DATA")
 
     parser = AsyncRequestParser()
-    parsed, _, _ = await parser.parse_headers(reader)
+    parsed, _, _ = _headers(await parser.parse_headers(reader))
 
     assert parsed is None
 
@@ -783,7 +806,9 @@ async def test_async_request_parser_parse_headers_with_read_exception() -> (
     )
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes, remaining = await parser.parse_headers(reader)
+    parsed, wire_bytes, remaining = _headers(
+        await parser.parse_headers(reader)
+    )
 
     assert parsed is None
     assert wire_bytes == b""
@@ -795,7 +820,9 @@ async def test_async_request_parser_parse_headers_malformed_byte() -> None:
     reader = _create_mock_reader([b"\x00"])
 
     parser = AsyncRequestParser()
-    parsed, wire_bytes, remaining = await parser.parse_headers(reader)
+    parsed, wire_bytes, remaining = _headers(
+        await parser.parse_headers(reader)
+    )
 
     assert parsed is None
     assert wire_bytes == b"\x00"
@@ -819,11 +846,11 @@ async def test_async_request_parser_continue_body_eof_before_complete() -> (
     reader.feed_eof()
 
     parser = AsyncRequestParser()
-    parsed, _, remaining = await parser.parse_headers(reader)
+    parsed, _, remaining = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
 
-    parsed, _ = await parser.continue_parse_body(reader, remaining)
+    parsed, _ = _parsed(await parser.continue_parse_body(reader, remaining))
 
     assert parsed is None
 
@@ -843,12 +870,14 @@ async def test_async_request_parser_continue_body_preserves_pipeline() -> None:
     )
 
     parser = AsyncRequestParser()
-    parsed, _, remaining = await parser.parse_headers(reader)
+    parsed, _, remaining = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
     assert remaining == bytearray()
 
-    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+    parsed, wire_bytes = _parsed(
+        await parser.continue_parse_body(reader, remaining)
+    )
 
     assert parsed is not None
     assert parsed.is_complete
@@ -873,11 +902,13 @@ async def test_async_request_parser_continue_body_with_read_exception() -> (
     )
 
     parser = AsyncRequestParser()
-    parsed, _, remaining = await parser.parse_headers(reader)
+    parsed, _, remaining = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
 
-    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+    parsed, wire_bytes = _parsed(
+        await parser.continue_parse_body(reader, remaining)
+    )
 
     assert parsed is None
     assert wire_bytes == header_bytes
@@ -898,11 +929,13 @@ async def test_async_request_parser_bad_chunk_preserves_remaining() -> None:
     )
 
     parser = AsyncRequestParser()
-    parsed, _, remaining = await parser.parse_headers(reader)
+    parsed, _, remaining = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
 
-    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+    parsed, wire_bytes = _parsed(
+        await parser.continue_parse_body(reader, remaining)
+    )
 
     assert parsed is None
     assert wire_bytes == header_bytes + b"Z"
@@ -924,15 +957,88 @@ async def test_async_request_parser_bad_chunk_without_remaining_bytes() -> (
     reader = _create_mock_reader([header_bytes, b"Z"])
 
     parser = AsyncRequestParser()
-    parsed, _, remaining = await parser.parse_headers(reader)
+    parsed, _, remaining = _headers(await parser.parse_headers(reader))
 
     assert parsed is not None
 
-    parsed, wire_bytes = await parser.continue_parse_body(reader, remaining)
+    parsed, wire_bytes = _parsed(
+        await parser.continue_parse_body(reader, remaining)
+    )
 
     assert parsed is None
     assert wire_bytes == header_bytes + b"Z"
     assert take_unread_data(reader) == b""
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_parse_rejected_transfer_encoding() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(GZIP_REQUEST)
+
+    parser = AsyncRequestParser()
+    outcome = await parser.parse(reader)
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert isinstance(outcome.error, httptools.HttpParserError)
+    assert outcome.parsed is not None
+    assert outcome.parsed.headers_complete
+    assert not outcome.parsed.is_complete
+    assert outcome.complete_request is None
+    assert outcome.wire_bytes == GZIP_HEAD
+    assert take_unread_data(reader) == b"body"
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_continue_body_after_rejected_headers() -> (
+    None
+):
+    reader = asyncio.StreamReader()
+    reader.feed_data(GZIP_REQUEST)
+    connection_wire = bytearray()
+
+    parser = AsyncRequestParser()
+    headers, remaining = await parser.parse_headers(reader, connection_wire)
+    outcome = await parser.continue_parse_body(
+        reader, remaining, connection_wire
+    )
+
+    assert headers.stop is ParseStop.PARSE_ERROR
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert outcome.error is headers.error
+    assert outcome.complete_request is None
+    assert outcome.wire_bytes == GZIP_HEAD
+    assert bytes(connection_wire) == GZIP_HEAD
+    assert take_unread_data(reader) == b"body"
+
+
+@pytest.mark.asyncio
+async def test_async_request_parser_content_length_with_leading_zeros() -> (
+    None
+):
+    zeros = b"0" * (sys.get_int_max_str_digits() + 1)
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"POST / HTTP/1.1\r\nHost: localhost\r\n"
+        b"Content-Length: " + zeros + b"5\r\n\r\nhello"
+    )
+
+    parser = AsyncRequestParser()
+    parsed, _ = _parsed(await parser.parse(reader))
+
+    assert parsed is not None
+    assert parsed.body == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_bad_transfer_encoding_returns_none() -> (
+    None
+):
+    reader = asyncio.StreamReader()
+    reader.feed_data(GZIP_REQUEST)
+
+    request = await HTTPRequestReader().read_request(reader)
+
+    assert request is None
 
 
 @pytest.mark.asyncio
@@ -1311,9 +1417,9 @@ def test_http_request_exposes_immutable_headers() -> None:
     assert request.headers["X-Test"] == "a"
 
     with pytest.raises(TypeError):
-        request.headers["X-Test"] = "b"
+        _untyped(request.headers)["X-Test"] = "b"
     with pytest.raises(TypeError):
-        del request.headers["X-Test"]
+        del _untyped(request.headers)["X-Test"]
 
 
 def test_http_request_headers_are_immutable() -> None:
@@ -1330,7 +1436,7 @@ def test_http_request_headers_are_immutable() -> None:
     assert partial.headers["Host"] == "example.com"
 
     with pytest.raises(TypeError):
-        partial.headers["Host"] = "other.example.com"
+        _untyped(partial.headers)["Host"] = "other.example.com"
 
 
 def test_http_request_is_proxy_request_true_for_http() -> None:
@@ -1451,10 +1557,28 @@ async def test_wire_body_bytes_preserves_chunked_wire_framing() -> None:
     assert request.wire_body_bytes == b"5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n"
 
 
+def _parsed(outcome: ParseOutcome) -> tuple[ParsedRequest | None, bytes]:
+    """The complete request and wire bytes, the way callers consume them."""
+    return outcome.complete_request, outcome.wire_bytes
+
+
+def _headers(
+    staged: tuple[ParseOutcome, bytearray],
+) -> tuple[ParsedRequest | None, bytes, bytearray]:
+    """The parsed headers, header wire bytes, and remaining buffer."""
+    outcome, remaining = staged
+    return outcome.parsed, outcome.wire_bytes, remaining
+
+
 def _create_mock_reader(data_chunks: list[bytes]) -> asyncio.StreamReader:
     reader = AsyncMock(spec=asyncio.StreamReader)
     reader.read = AsyncMock(side_effect=data_chunks + [b""])
     return reader
+
+
+def _untyped(value: object) -> Any:
+    """Drop static typing to attempt an operation the types forbid."""
+    return value
 
 
 def _make_recorded(
@@ -1521,7 +1645,7 @@ async def _parse_one_request(
     fragments: list[bytes],
 ) -> tuple[ParsedRequest | None, bytes, bytes]:
     reader = _fragment_reader(fragments)
-    parsed, wire = await AsyncRequestParser().parse(reader)
+    parsed, wire = _parsed(await AsyncRequestParser().parse(reader))
     return parsed, wire, take_unread_data(reader)
 
 
@@ -1530,7 +1654,9 @@ async def _parse_request_sequence(
     fragments: list[bytes],
 ) -> tuple[list[tuple[ParsedRequest | None, bytes]], bytes]:
     reader = _fragment_reader(fragments)
-    outcomes = [await AsyncRequestParser().parse(reader) for _ in range(count)]
+    outcomes = [
+        _parsed(await AsyncRequestParser().parse(reader)) for _ in range(count)
+    ]
     return outcomes, take_unread_data(reader)
 
 
@@ -1579,3 +1705,1069 @@ async def test_parser_pipelined_stream_preserves_per_request_wire_bytes(
         assert parsed.is_complete
         assert wire == encoded
     assert leftover == b""
+
+
+_NEXT_REQUEST = b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n"
+_CHUNKED_HEADERS = (
+    b"POST /upload HTTP/1.1\r\n"
+    b"Host: localhost\r\n"
+    b"Transfer-Encoding: chunked\r\n"
+    b"\r\n"
+)
+_UPGRADE_CHUNKED_HEADERS = (
+    b"POST /chat HTTP/1.1\r\n"
+    b"Host: localhost\r\n"
+    b"Connection: Upgrade\r\n"
+    b"Upgrade: custom\r\n"
+    b"Transfer-Encoding: chunked\r\n"
+    b"\r\n"
+)
+_TWO_CHUNKS = b"3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"
+_BAD_EXTENSION_CHUNK = b"5;a\x01\r\nhello\r\n"
+
+
+def _content_length_headers(length: int, *, upgrade: bool = False) -> bytes:
+    upgrade_lines = b""
+    if upgrade:
+        upgrade_lines = b"Connection: Upgrade\r\nUpgrade: custom\r\n"
+    return (
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        + upgrade_lines
+        + f"Content-Length: {length}\r\n\r\n".encode("ascii")
+    )
+
+
+class _ScriptedReader:
+    """A byte stream whose reads return scripted chunks or raise."""
+
+    def __init__(self, script: list[bytes | Exception]) -> None:
+        self._script = script
+
+    async def read(self, n: int = -1) -> bytes:
+        if not self._script:
+            return b""
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        if 0 <= n < len(item):
+            self._script.insert(0, item[n:])
+            return item[:n]
+        return item
+
+
+def _partial(outcome: ParseOutcome) -> ParsedRequest:
+    """The parsed request of an outcome whose headers completed."""
+    assert outcome.parsed is not None
+    return outcome.parsed
+
+
+async def _parse_body(
+    script: list[bytes | Exception],
+    *,
+    max_body_bytes: int | None = None,
+) -> tuple[ParseOutcome, bytes]:
+    """Parse headers then the body; return the outcome and unread bytes."""
+    reader = _ScriptedReader(script)
+    parser = AsyncRequestParser()
+    staged, remaining = await parser.parse_headers(reader)
+    assert staged.parsed is not None
+    outcome = await parser.continue_parse_body(
+        reader,
+        remaining,
+        max_body_bytes=max_body_bytes,
+    )
+    return outcome, take_unread_data(reader)
+
+
+def test_http_request_text_without_body_returns_empty_string() -> None:
+    request = HTTPRequest(method="GET", target="/")
+
+    assert request.text == ""
+
+
+def test_recorded_request_json_body_delegates_to_request() -> None:
+    request = HTTPRequest(method="POST", target="/", body=b'{"key": 1}')
+
+    assert _make_recorded(request).json_body == {"key": 1}
+
+
+def test_recorded_request_is_proxy_request_delegates_to_request() -> None:
+    request = HTTPRequest(method="GET", target="http://example.com/path")
+
+    assert _make_recorded(request).is_proxy_request
+
+
+def test_recorded_request_body_complete_defaults_to_true() -> None:
+    recorded = _make_recorded(HTTPRequest(method="GET", target="/"))
+
+    assert recorded.body_complete
+
+
+def test_from_parsed_complete_message_marks_body_complete() -> None:
+    parsed = ParsedRequest(
+        method="POST",
+        url=b"/upload",
+        http_version="1.1",
+        headers=[(b"Content-Length", b"5")],
+        body_parts=[b"hello"],
+        is_complete=True,
+        headers_complete=True,
+    )
+
+    recorded = RecordedHTTPRequest.from_parsed(
+        parsed, _content_length_headers(5) + b"hello"
+    )
+
+    assert recorded.body_complete
+    assert recorded.body == b"hello"
+
+
+def test_from_parsed_incomplete_message_marks_body_incomplete() -> None:
+    parsed = ParsedRequest(
+        method="POST",
+        url=b"/upload",
+        http_version="1.1",
+        headers=[(b"Content-Length", b"10")],
+        body_parts=[b"short"],
+        headers_complete=True,
+    )
+
+    recorded = RecordedHTTPRequest.from_parsed(
+        parsed, _content_length_headers(10) + b"short"
+    )
+
+    assert not recorded.body_complete
+    assert recorded.body == b"short"
+    assert recorded.wire_body_bytes == b"short"
+
+
+def test_from_parsed_partial_without_payload_has_empty_body() -> None:
+    parsed = ParsedRequest(
+        method="POST",
+        url=b"/upload",
+        http_version="1.1",
+        headers=[(b"Content-Length", b"10")],
+        headers_complete=True,
+    )
+
+    recorded = RecordedHTTPRequest.from_parsed(
+        parsed, _content_length_headers(10)
+    )
+
+    assert not recorded.body_complete
+    assert recorded.body == b""
+
+
+def test_from_parsed_chunked_without_payload_has_empty_body() -> None:
+    parsed = ParsedRequest(
+        method="POST",
+        url=b"/upload",
+        http_version="1.1",
+        headers=[(b"Transfer-Encoding", b"chunked")],
+        is_complete=True,
+        headers_complete=True,
+    )
+
+    recorded = RecordedHTTPRequest.from_parsed(
+        parsed, _CHUNKED_HEADERS + b"0\r\n\r\n"
+    )
+
+    assert recorded.body == b""
+
+
+def test_parse_outcome_complete_request_is_none_before_headers() -> None:
+    outcome = ParseOutcome(
+        parsed=None, wire_bytes=b"", stop=ParseStop.COMPLETE
+    )
+
+    assert outcome.complete_request is None
+    assert outcome.error is None
+
+
+def test_parse_outcome_complete_request_is_none_for_non_complete_stop() -> (
+    None
+):
+    parsed = ParsedRequest(headers_complete=True, is_complete=True)
+    outcome = ParseOutcome(parsed=parsed, wire_bytes=b"", stop=ParseStop.EOF)
+
+    assert outcome.complete_request is None
+
+
+def test_parse_outcome_complete_request_is_none_for_incomplete_message() -> (
+    None
+):
+    parsed = ParsedRequest(headers_complete=True)
+    outcome = ParseOutcome(
+        parsed=parsed, wire_bytes=b"", stop=ParseStop.COMPLETE
+    )
+
+    assert outcome.complete_request is None
+
+
+def test_parse_outcome_complete_request_returns_completed_message() -> None:
+    parsed = ParsedRequest(headers_complete=True, is_complete=True)
+    outcome = ParseOutcome(
+        parsed=parsed, wire_bytes=b"", stop=ParseStop.COMPLETE
+    )
+
+    assert outcome.complete_request is parsed
+
+
+@pytest.mark.asyncio
+async def test_parse_idle_eof_stops_with_eof_and_nothing_read() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_eof()
+
+    outcome = await AsyncRequestParser().parse(reader)
+
+    assert outcome.stop is ParseStop.EOF
+    assert outcome.parsed is None
+    assert outcome.wire_bytes == b""
+    assert outcome.error is None
+
+
+@pytest.mark.asyncio
+async def test_parse_eof_mid_headers_stops_with_eof_and_header_prefix() -> (
+    None
+):
+    partial_headers = b"GET / HTTP/1.1\r\nHost:"
+    reader = asyncio.StreamReader()
+    reader.feed_data(partial_headers)
+    reader.feed_eof()
+
+    outcome = await AsyncRequestParser().parse(reader)
+
+    assert outcome.stop is ParseStop.EOF
+    assert outcome.parsed is None
+    assert outcome.wire_bytes == partial_headers
+
+
+@pytest.mark.asyncio
+async def test_parse_eof_mid_body_stops_with_eof_and_partial_request() -> None:
+    headers = _content_length_headers(10)
+    reader = asyncio.StreamReader()
+    reader.feed_data(headers + b"short")
+    reader.feed_eof()
+
+    outcome = await AsyncRequestParser().parse(reader)
+
+    assert outcome.stop is ParseStop.EOF
+    assert _partial(outcome).body == b"short"
+    assert not _partial(outcome).is_complete
+    assert outcome.wire_bytes == headers + b"short"
+    assert outcome.complete_request is None
+
+
+@pytest.mark.asyncio
+async def test_parse_header_parse_error_stops_with_parser_exception() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"NOT VALID HTTP\r\n\r\n")
+    reader.feed_eof()
+
+    outcome = await AsyncRequestParser().parse(reader)
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert outcome.parsed is None
+    assert isinstance(outcome.error, httptools.HttpParserError)
+
+
+@pytest.mark.asyncio
+async def test_parse_chunk_framing_error_stops_with_partial_request() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(_CHUNKED_HEADERS + b"5\r\nhello\r\nZ\r\n")
+    reader.feed_eof()
+
+    outcome = await AsyncRequestParser().parse(reader)
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert _partial(outcome).body == b"hello"
+    assert not _partial(outcome).is_complete
+    assert isinstance(outcome.error, ChunkScanError)
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5\r\nhello\r\nZ"
+    assert take_unread_data(reader) == b"\r\n"
+
+
+@pytest.mark.asyncio
+async def test_parse_read_error_stops_with_read_error_and_exception() -> None:
+    error = ConnectionResetError("Connection reset")
+    reader = _ScriptedReader([error])
+
+    outcome = await AsyncRequestParser().parse(reader)
+
+    assert outcome.stop is ParseStop.READ_ERROR
+    assert outcome.parsed is None
+    assert outcome.error is error
+    assert outcome.wire_bytes == b""
+
+
+@pytest.mark.asyncio
+async def test_parse_read_error_mid_body_keeps_partial_request() -> None:
+    headers = _content_length_headers(10)
+    error = ConnectionResetError("Connection reset")
+    reader = _ScriptedReader([headers + b"short", error])
+
+    outcome = await AsyncRequestParser().parse(reader)
+
+    assert outcome.stop is ParseStop.READ_ERROR
+    assert _partial(outcome).body == b"short"
+    assert outcome.error is error
+    assert outcome.wire_bytes == headers + b"short"
+
+
+@pytest.mark.asyncio
+async def test_parse_headers_repeated_leading_crlf_is_parse_error() -> None:
+    request_data = b"\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    reader = asyncio.StreamReader()
+    reader.feed_data(request_data)
+    reader.feed_eof()
+
+    outcome, remaining = await AsyncRequestParser().parse_headers(reader)
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert outcome.parsed is None
+    assert outcome.wire_bytes == request_data
+    assert remaining == bytearray()
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_zero_threshold_consumes_no_body() -> None:
+    headers = _content_length_headers(5)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"hello"], max_body_bytes=0
+    )
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b""
+    assert outcome.complete_request is None
+    assert outcome.wire_bytes == headers
+    assert leftover == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_threshold_below_length_stops_in_body() -> (
+    None
+):
+    headers = _content_length_headers(5)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"hello"], max_body_bytes=2
+    )
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"he"
+    assert outcome.complete_request is None
+    assert outcome.wire_bytes == headers + b"he"
+    assert leftover == b"llo"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_threshold_equal_to_length_completes() -> (
+    None
+):
+    headers = _content_length_headers(5)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"hello"], max_body_bytes=5
+    )
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b"hello"
+    assert outcome.wire_bytes == headers + b"hello"
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_threshold_above_length_completes() -> None:
+    headers = _content_length_headers(5)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"hello"], max_body_bytes=10
+    )
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b"hello"
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_bodyless_request_ignores_threshold() -> (
+    None
+):
+    request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+
+    outcome, leftover = await _parse_body([request_data], max_body_bytes=0)
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body_parts == []
+    assert outcome.wire_bytes == request_data
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_eof_under_threshold_stops_with_eof() -> (
+    None
+):
+    headers = _content_length_headers(10)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"short"], max_body_bytes=8
+    )
+
+    assert outcome.stop is ParseStop.EOF
+    assert _partial(outcome).body == b"short"
+    assert not _partial(outcome).is_complete
+    assert outcome.wire_bytes == headers + b"short"
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_threshold_mid_read_keeps_surplus() -> None:
+    headers = _content_length_headers(8)
+
+    outcome, leftover = await _parse_body(
+        [headers, b"hel", b"lo w", b"or"], max_body_bytes=5
+    )
+
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"hello"
+    assert outcome.wire_bytes == headers + b"hello"
+    assert leftover == b" w"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_pipelined_request_stops_at_boundary() -> (
+    None
+):
+    headers = _content_length_headers(5)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"hello" + _NEXT_REQUEST], max_body_bytes=100
+    )
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b"hello"
+    assert outcome.wire_bytes == headers + b"hello"
+    assert leftover == _NEXT_REQUEST
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "prefix"),
+    [
+        (b"8\r\nabcdefghX\n", b"8\r\nab"),
+        (b"8\r\nabcdefgh\rX", b"8\r\nab"),
+        (b"8\r\nabcdefgh\r\nZ\r\n", b"8\r\nab"),
+        (b"1\r\na\r\n7\r\nbcdefghX\n", b"1\r\na\r\n7\r\nb"),
+    ],
+)
+@pytest.mark.parametrize(
+    "headers", [_CHUNKED_HEADERS, _UPGRADE_CHUNKED_HEADERS]
+)
+async def test_body_budget_precedes_later_chunk_errors_across_fragments(
+    body: bytes,
+    prefix: bytes,
+    headers: bytes,
+) -> None:
+    for split in range(len(body)):
+        script = [headers + body[:split], body[split:]]
+        outcome, leftover = await _parse_body(script, max_body_bytes=2)
+
+        assert outcome.stop is ParseStop.COMPLETE
+        assert outcome.error is None
+        assert not _partial(outcome).is_complete
+        assert _partial(outcome).body == b"ab"
+        assert outcome.wire_bytes == headers + prefix
+        if split == 0:
+            assert leftover == body[len(prefix) :]
+
+
+@pytest.mark.parametrize("budget", [2, 3])
+@pytest.mark.asyncio
+async def test_chunk_error_after_complete_chunk_respects_budget(
+    budget: int,
+) -> None:
+    outcome, leftover = await _parse_body(
+        [_CHUNKED_HEADERS + b"2\r\nab\r\nZ\r\n"], max_body_bytes=budget
+    )
+
+    assert _partial(outcome).body == b"ab"
+    if budget == 2:
+        assert outcome.stop is ParseStop.COMPLETE
+        assert outcome.error is None
+        assert outcome.wire_bytes == _CHUNKED_HEADERS + b"2\r\nab\r\n"
+        assert leftover == b"Z\r\n"
+    else:
+        assert outcome.stop is ParseStop.PARSE_ERROR
+        assert isinstance(outcome.error, ChunkScanError)
+        assert outcome.wire_bytes == _CHUNKED_HEADERS + b"2\r\nab\r\nZ"
+        assert leftover == b"\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_stop_within_chunk() -> None:
+    outcome, leftover = await _parse_body(
+        [_CHUNKED_HEADERS + b"5\r\nhello\r\n0\r\n\r\n"], max_body_bytes=3
+    )
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"hel"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5\r\nhel"
+    assert leftover == b"lo\r\n0\r\n\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_stop_within_partial_chunk() -> None:
+    outcome, leftover = await _parse_body(
+        [_CHUNKED_HEADERS + b"5\r\nhel", b"lo\r\n0\r\n\r\n"], max_body_bytes=2
+    )
+
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"he"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5\r\nhe"
+    assert leftover == b"l"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_stop_at_chunk_boundary() -> None:
+    outcome, leftover = await _parse_body(
+        [_CHUNKED_HEADERS + _TWO_CHUNKS], max_body_bytes=3
+    )
+
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"abc"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"3\r\nabc\r\n"
+    assert leftover == b"3\r\ndef\r\n0\r\n\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_stop_across_chunk_boundary() -> (
+    None
+):
+    outcome, leftover = await _parse_body(
+        [_CHUNKED_HEADERS + _TWO_CHUNKS], max_body_bytes=4
+    )
+
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"abcd"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"3\r\nabc\r\n3\r\nd"
+    assert leftover == b"ef\r\n0\r\n\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_count_excludes_framing() -> None:
+    body = b"3\r\nabc\r\n0\r\n\r\n"
+
+    outcome, leftover = await _parse_body(
+        [_CHUNKED_HEADERS + body], max_body_bytes=3
+    )
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b"abc"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + body
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_spent_budget_stops_next_read() -> (
+    None
+):
+    outcome, leftover = await _parse_body(
+        [_CHUNKED_HEADERS, b"3\r\nabc\r\n", b"3\r\ndef\r\n0\r\n\r\n"],
+        max_body_bytes=3,
+    )
+
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"abc"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"3\r\nabc\r\n"
+    assert leftover == b"3\r\ndef\r\n0\r\n\r\n"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        [b"3\r\nabc\r\n3\r\n"],
+        [b"3\r\nabc\r\n", b"3\r\n"],
+        [b"3\r\nabc\r\n3", b"\r\n"],
+    ],
+)
+@pytest.mark.parametrize(
+    "headers", [_CHUNKED_HEADERS, _UPGRADE_CHUNKED_HEADERS]
+)
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_spent_budget_stops_at_size_line(
+    script: list[bytes],
+    headers: bytes,
+) -> None:
+    outcome, leftover = await _parse_body([headers, *script], max_body_bytes=3)
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"abc"
+    assert outcome.wire_bytes == headers + b"3\r\nabc\r\n"
+    assert leftover == b"3\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_terminal_chunk_completes() -> None:
+    outcome, leftover = await _parse_body(
+        [_CHUNKED_HEADERS, b"3\r\nabc\r\n", b"0\r\n\r\n"], max_body_bytes=3
+    )
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b"abc"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"3\r\nabc\r\n0\r\n\r\n"
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_split_reads_stop_at_budget() -> (
+    None
+):
+    script: list[bytes | Exception] = [
+        _CHUNKED_HEADERS,
+        b"5;ext=1\r\nhel",
+        b"lo\r\n3\r\nabc\r\n0\r\nX-Trailer: v\r\n\r\n",
+    ]
+
+    outcome, leftover = await _parse_body(script, max_body_bytes=6)
+
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"helloa"
+    assert outcome.wire_bytes == (
+        _CHUNKED_HEADERS + b"5;ext=1\r\nhello\r\n3\r\na"
+    )
+    assert leftover == b"bc\r\n0\r\nX-Trailer: v\r\n\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_exact_budget_completes() -> None:
+    chunked_body = b"5;ext=1\r\nhello\r\n3\r\nabc\r\n0\r\nX-Trailer: v\r\n\r\n"
+    script: list[bytes | Exception] = [
+        _CHUNKED_HEADERS,
+        chunked_body[:12],
+        chunked_body[12:],
+    ]
+
+    outcome, leftover = await _parse_body(script, max_body_bytes=8)
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b"helloabc"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + chunked_body
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_eof_mid_chunk_stops_with_eof() -> (
+    None
+):
+    outcome, leftover = await _parse_body([_CHUNKED_HEADERS + b"5\r\nhel"])
+
+    assert outcome.stop is ParseStop.EOF
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"hel"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5\r\nhel"
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_read_error_keeps_chunks() -> None:
+    error = ConnectionResetError("Connection reset")
+
+    outcome, _ = await _parse_body([
+        _CHUNKED_HEADERS + b"5\r\nhello\r\n",
+        error,
+    ])
+
+    assert outcome.stop is ParseStop.READ_ERROR
+    assert outcome.error is error
+    assert _partial(outcome).body == b"hello"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5\r\nhello\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_upgrade_chunked_stop_within_chunk() -> None:
+    outcome, leftover = await _parse_body(
+        [_UPGRADE_CHUNKED_HEADERS + b"5\r\nhello\r\n0\r\n\r\n"],
+        max_body_bytes=3,
+    )
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"hel"
+    assert outcome.wire_bytes == _UPGRADE_CHUNKED_HEADERS + b"5\r\nhel"
+    assert leftover == b"lo\r\n0\r\n\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_upgrade_chunked_eof_keeps_partial() -> None:
+    outcome, _ = await _parse_body([_UPGRADE_CHUNKED_HEADERS + b"5\r\nhel"])
+
+    assert outcome.stop is ParseStop.EOF
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"hel"
+
+
+@pytest.mark.parametrize(
+    "headers", [_CHUNKED_HEADERS, _UPGRADE_CHUNKED_HEADERS]
+)
+@pytest.mark.asyncio
+async def test_continue_parse_body_chunked_eof_after_size_line_keeps_parts(
+    headers: bytes,
+) -> None:
+    outcome, leftover = await _parse_body([headers + b"3\r\nabc\r\n3\r\n"])
+
+    assert outcome.stop is ParseStop.EOF
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body_parts == [b"abc"]
+    assert outcome.wire_bytes == headers + b"3\r\nabc\r\n3\r\n"
+    assert leftover == b""
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_upgrade_bad_chunk_records_prefix() -> None:
+    outcome, leftover = await _parse_body([
+        _UPGRADE_CHUNKED_HEADERS + b"Z\r\n"
+    ])
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert isinstance(outcome.error, ChunkScanError)
+    assert _partial(outcome).body == b""
+    assert outcome.wire_bytes == _UPGRADE_CHUNKED_HEADERS + b"Z"
+    assert leftover == b"\r\n"
+
+
+@pytest.mark.parametrize(
+    ("script", "prefix"),
+    [
+        ([b"3\r\nabc\r\nZ\r\n"], b"3\r\nabc\r\nZ"),
+        ([b"3\r\nabc\r\n", b"Z\r\n"], b"3\r\nabc\r\nZ"),
+        ([b"3\r\nabcX\r\n"], b"3\r\nabcX"),
+    ],
+)
+@pytest.mark.parametrize(
+    "headers", [_CHUNKED_HEADERS, _UPGRADE_CHUNKED_HEADERS]
+)
+@pytest.mark.asyncio
+async def test_continue_parse_body_bad_chunk_keeps_payload_prefix(
+    script: list[bytes | Exception],
+    prefix: bytes,
+    headers: bytes,
+) -> None:
+    outcome, leftover = await _parse_body([headers, *script])
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert isinstance(outcome.error, ChunkScanError)
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body_parts == [b"abc"]
+    assert outcome.wire_bytes == headers + prefix
+    assert leftover == b"\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_upgrade_content_length_stops_early() -> (
+    None
+):
+    headers = _content_length_headers(5, upgrade=True)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"hello"], max_body_bytes=2
+    )
+
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b"he"
+    assert outcome.wire_bytes == headers + b"he"
+    assert leftover == b"llo"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_upgrade_content_length_completes() -> None:
+    headers = _content_length_headers(5, upgrade=True)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"hello"], max_body_bytes=5
+    )
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b"hello"
+    assert leftover == b""
+
+
+@pytest.mark.parametrize("max_body_bytes", [None, 0, 5])
+@pytest.mark.asyncio
+async def test_continue_parse_body_upgrade_zero_content_length_completes(
+    max_body_bytes: int | None,
+) -> None:
+    headers = _content_length_headers(0, upgrade=True)
+
+    outcome, leftover = await _parse_body(
+        [headers + b"tail"], max_body_bytes=max_body_bytes
+    )
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b""
+    assert outcome.wire_bytes == headers
+    assert leftover == b"tail"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_bad_extension_in_chunk_is_parse_error() -> (
+    None
+):
+    outcome, leftover = await _parse_body([
+        _CHUNKED_HEADERS,
+        _BAD_EXTENSION_CHUNK,
+        b"0\r\n\r\n",
+    ])
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert isinstance(outcome.error, httptools.HttpParserError)
+    assert _partial(outcome).body == b""
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5;a\x01"
+    assert leftover == b"\r\nhello\r\n"
+
+
+@pytest.mark.asyncio
+async def test_continue_parse_body_bad_extension_at_end_is_parse_error() -> (
+    None
+):
+    outcome, leftover = await _parse_body([
+        _CHUNKED_HEADERS + _BAD_EXTENSION_CHUNK + b"0\r\n\r\n",
+    ])
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert isinstance(outcome.error, httptools.HttpParserError)
+    assert _partial(outcome).body == b""
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5;a\x01"
+    assert leftover == b"\r\nhello\r\n0\r\n\r\n"
+
+
+def test_snapshot_before_parsing_reports_no_request() -> None:
+    outcome = AsyncRequestParser().snapshot()
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert outcome.parsed is None
+    assert outcome.wire_bytes == b""
+    assert outcome.error is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_after_headers_reports_incomplete_request() -> None:
+    headers = _content_length_headers(5)
+    reader = _ScriptedReader([headers + b"hello"])
+    parser = AsyncRequestParser()
+    await parser.parse_headers(reader)
+
+    outcome = parser.snapshot()
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert _partial(outcome).headers_complete
+    assert not _partial(outcome).is_complete
+    assert _partial(outcome).body == b""
+    assert outcome.wire_bytes == headers
+    assert outcome.complete_request is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_after_cancelled_body_read_keeps_delivered_chunks() -> (
+    None
+):
+    reader = asyncio.StreamReader()
+    reader.feed_data(_CHUNKED_HEADERS + b"5\r\nhello\r\n")
+    parser = AsyncRequestParser()
+    task = asyncio.create_task(parser.parse(reader))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    outcome = parser.snapshot()
+
+    assert outcome.stop is ParseStop.COMPLETE
+    assert _partial(outcome).body == b"hello"
+    assert not _partial(outcome).is_complete
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5\r\nhello\r\n"
+    assert outcome.complete_request is None
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_returns_none_for_truncated_body() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(_content_length_headers(10) + b"short")
+    reader.feed_eof()
+
+    assert await HTTPRequestReader().read_request(reader) is None
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_returns_none_on_read_error() -> None:
+    reader = _ScriptedReader([ConnectionResetError("Connection reset")])
+
+    assert await HTTPRequestReader().read_request(reader) is None
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_returns_none_for_bad_chunk_framing() -> (
+    None
+):
+    reader = asyncio.StreamReader()
+    reader.feed_data(_CHUNKED_HEADERS + b"5\r\nhello\r\nZ\r\n")
+    reader.feed_eof()
+
+    assert await HTTPRequestReader().read_request(reader) is None
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_content_length_zero_has_empty_body() -> (
+    None
+):
+    reader = asyncio.StreamReader()
+    reader.feed_data(_content_length_headers(0))
+    reader.feed_eof()
+
+    request = await HTTPRequestReader().read_request(reader)
+
+    assert request is not None
+    assert request.body == b""
+    assert request.body_complete
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_empty_chunked_body_is_empty_bytes() -> None:
+    reader = asyncio.StreamReader()
+    reader.feed_data(_CHUNKED_HEADERS + b"0\r\n\r\n")
+    reader.feed_eof()
+
+    request = await HTTPRequestReader().read_request(reader)
+
+    assert request is not None
+    assert request.body == b""
+    assert request.body_complete
+
+
+@pytest.mark.asyncio
+async def test_http_request_reader_without_content_headers_has_no_body() -> (
+    None
+):
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    reader.feed_eof()
+
+    request = await HTTPRequestReader().read_request(reader)
+
+    assert request is not None
+    assert request.body is None
+    assert request.body_complete
+
+
+@pytest.mark.asyncio
+async def test_from_parsed_threshold_outcome_marks_body_incomplete() -> None:
+    headers = _content_length_headers(5)
+    outcome, _ = await _parse_body([headers + b"hello"], max_body_bytes=2)
+
+    recorded = RecordedHTTPRequest.from_parsed(
+        _partial(outcome), outcome.wire_bytes
+    )
+
+    assert not recorded.body_complete
+    assert recorded.body == b"he"
+    assert recorded.wire_body_bytes == b"he"
+
+
+@pytest.mark.asyncio
+@given(data=st.data(), chunked=st.booleans())
+async def test_body_cutoffs_preserve_payload_prefix_and_remaining_stream(
+    data: st.DataObject,
+    chunked: bool,
+) -> None:
+    if chunked:
+        body = data.draw(chunked_bodies())
+        payload = b"".join(body.payloads)
+        encoded = _CHUNKED_HEADERS + body.encoded
+        boundaries = list(itertools.accumulate(map(len, body.payloads)))
+    else:
+        payload = data.draw(st.binary(max_size=128))
+        encoded = _content_length_headers(len(payload)) + payload
+        boundaries = [len(payload)]
+    cutoff = data.draw(
+        st.one_of(
+            st.sampled_from([0, *boundaries, len(payload), len(payload) + 1]),
+            st.integers(min_value=0, max_value=len(payload) + 1),
+        )
+    )
+    original = encoded + _NEXT_REQUEST
+    fragments = data.draw(fragments_of(original))
+    # Also force every CRLF (and every payload boundary) across reads.
+    for parts in (fragments, [bytes([byte]) for byte in original]):
+        reader = _ScriptedReader(list(parts))
+        parser = AsyncRequestParser()
+        staged, remaining = await parser.parse_headers(reader)
+        assert staged.parsed is not None
+        outcome = await parser.continue_parse_body(
+            reader,
+            remaining,
+            max_body_bytes=cutoff,
+        )
+        parsed = _partial(outcome)
+        recorded = RecordedHTTPRequest.from_parsed(parsed, outcome.wire_bytes)
+        rest = take_unread_data(reader)
+        while piece := await reader.read():
+            rest += piece
+
+        assert recorded.body == payload[:cutoff]
+        assert outcome.wire_bytes + rest == original
+        assert rest.endswith(_NEXT_REQUEST)
+        assert recorded.body_complete == (outcome.wire_bytes == encoded)
+        # At an exact chunk cutoff, available framing determines whether
+        # parsing reaches the message boundary before stopping.
+        if not chunked or cutoff != len(payload):
+            assert recorded.body_complete == (cutoff >= len(payload))
+        if recorded.body_complete:
+            assert rest == _NEXT_REQUEST
+
+
+@pytest.mark.asyncio
+@given(payload=st.binary(max_size=32), data=st.data())
+async def test_initial_data_preserves_body_and_pipelined_request(
+    payload: bytes, data: st.DataObject
+) -> None:
+    head = _content_length_headers(len(payload))
+    encoded = head + payload
+    original = encoded + _NEXT_REQUEST
+    split = data.draw(st.integers(min_value=0, max_value=len(original)))
+    reader = _ScriptedReader([original[split:]])
+    sink = bytearray()
+    parser = AsyncRequestParser()
+
+    staged, remaining = await parser.parse_headers(
+        reader, sink, initial_data=original[:split]
+    )
+    assert staged.wire_bytes == head
+    outcome = await parser.continue_parse_body(reader, remaining, sink)
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == payload
+    assert outcome.wire_bytes == encoded
+    assert sink == encoded
+    following = await AsyncRequestParser().parse(reader, sink)
+    assert following.complete_request is not None
+    assert following.wire_bytes == _NEXT_REQUEST
+    assert sink == original
+
+
+@pytest.mark.asyncio
+async def test_invalid_initial_data_is_rejected_without_another_read() -> None:
+    reader = AsyncMock(spec=asyncio.StreamReader)
+    outcome, remaining = await AsyncRequestParser().parse_headers(
+        reader, initial_data=b"\x00unconsumed"
+    )
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert outcome.wire_bytes == b"\x00"
+    assert remaining == b""
+    assert take_unread_data(reader) == b"unconsumed"
+    reader.read.assert_not_awaited()

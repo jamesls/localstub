@@ -79,11 +79,23 @@ async def test_cli_intercept_mode_writes_recorded_traffic(
             await cli_task
 
 
+def _assert_interrupted_upload_record(output_path: Path) -> None:
+    records = output_path.read_text().splitlines()
+    assert len(records) == 1
+    record = json.loads(records[0])
+    assert record["request"]["path"] == "/during-shutdown"
+    assert record["request"]["body"] == "a"
+    assert not record["request"]["body_complete"]
+    assert record["response"] is None
+    assert record["closed"]["reason"] == "shutdown"
+    assert record["closed"]["phase"] == "request_body"
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="asyncio signal handlers are unavailable on Windows",
 )
-@pytest.mark.asyncio
 async def test_cli_writes_exchange_completed_during_shutdown(
     tmp_path: Path,
 ) -> None:
@@ -155,17 +167,14 @@ async def test_cli_writes_exchange_completed_during_shutdown(
         await asyncio.sleep(0.05)
 
         os.kill(os.getpid(), signal.SIGTERM)
-        await asyncio.sleep(0.2)
 
-        writer.write(b"b")
-        await writer.drain()
+        # Shutdown cuts the in-flight upload rather than waiting for
+        # it, and the partial exchange still reaches the output.
         response = await asyncio.wait_for(reader.read(), timeout=1.0)
-        assert response.startswith(b"HTTP/1.1 200")
+        assert response == b""
         await asyncio.wait_for(cli_task, timeout=2.0)
 
-        records = output_path.read_text().splitlines()
-        assert len(records) == 1
-        assert json.loads(records[0])["request"]["path"] == "/during-shutdown"
+        _assert_interrupted_upload_record(output_path)
     finally:
         loop.remove_signal_handler(signal.SIGTERM)
         if writer is not None:

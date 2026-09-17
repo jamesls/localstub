@@ -1,10 +1,24 @@
 from __future__ import annotations
 
 from email.message import Message
+from typing import Protocol
 
 from localstub.http.headers import Headers
-from localstub.http.request import RecordedHTTPRequest
 from localstub.http.response import ParsedResponse
+
+
+class ConnectionRequest(Protocol):
+    """What the persistence rules read from a request.
+
+    Satisfied by ``RecordedHTTPRequest`` and, during the header phase,
+    by ``HTTPRequestHeaders``.
+    """
+
+    @property
+    def http_version(self) -> str | None: ...
+
+    @property
+    def headers(self) -> Headers: ...
 
 
 def parse_connection_tokens(value: str) -> set[str]:
@@ -36,11 +50,11 @@ def _connection_tokens_from_dict(headers: dict[str, str]) -> set[str]:
     return set()
 
 
-def _is_http10(request: RecordedHTTPRequest) -> bool:
+def _is_http10(request: ConnectionRequest) -> bool:
     return request.http_version == "1.0"
 
 
-def _is_http11(request: RecordedHTTPRequest) -> bool:
+def _is_http11(request: ConnectionRequest) -> bool:
     return request.http_version == "1.1"
 
 
@@ -66,18 +80,24 @@ def response_allows_reuse(parsed: ParsedResponse) -> bool:
 
 
 def should_close_connection(
-    request: RecordedHTTPRequest,
+    request: ConnectionRequest,
     *,
     response_headers: Headers | Message | dict[str, str] | None,
     response_version: str | None = None,
+    response_status: int | None = None,
 ) -> bool:
     """Return whether the connection must close after this exchange.
 
     ``response_version`` is the HTTP version of the response placed on
     the wire.  Persistence is opt-in for HTTP/1.0 responses (RFC 9112
     §9.3); when the version is unknown (``None``) the response is
-    assumed to be HTTP/1.1.
+    assumed to be HTTP/1.1.  A 101 ``response_status`` always closes:
+    the connection then speaks the upgraded protocol, which this server
+    does not, mirroring ``response_allows_reuse``.
     """
+    if response_status == 101:
+        return True
+
     request_tokens = connection_tokens_from_headers(request.headers)
 
     if response_headers is None:

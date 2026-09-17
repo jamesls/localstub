@@ -17,6 +17,26 @@ class ChunkScanResult:
     resume_from: int
 
 
+@dataclass(frozen=True)
+class ChunkPayloadScan:
+    """Chunk payload locations found by scanning chunk framing.
+
+    ``payloads`` holds the ``(start, end)`` data ranges of the complete
+    chunks after the scan start, in wire order.  ``partial`` is the
+    data range buffered so far for the first incomplete chunk, once
+    its size line is complete; the range is empty until any of its
+    data arrives.  ``end`` is the offset past the chunked body once
+    the terminal chunk and any trailers are complete.  ``resume_from``
+    is the chunk-size boundary of the first incomplete chunk, so a
+    caller can rescan from there after appending data.
+    """
+
+    payloads: tuple[tuple[int, int], ...]
+    partial: tuple[int, int] | None
+    end: int | None
+    resume_from: int
+
+
 def content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
     for name, value in reversed(headers):
         if name.lower() != b"content-length":
@@ -26,6 +46,9 @@ def content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
         digits = value.strip()
         if not digits.isdigit():
             return None
+        # Leading zeros are valid digits that leave the value unchanged
+        # but count toward the interpreter's conversion limit.
+        digits = digits.lstrip(b"0") or b"0"
         try:
             return int(digits)
         except ValueError:
@@ -137,37 +160,59 @@ def scan_chunked_body(
     `resume_from` identifies the first incomplete chunk so callers can
     continue scanning after appending data without revisiting complete chunks.
     """
+    scan = scan_chunk_payloads(buffer, start)
+    return ChunkScanResult(end=scan.end, resume_from=scan.resume_from)
+
+
+def _terminal_chunk_end(buffer: bytearray, data_start: int) -> int | None:
+    """Return the offset past the chunked body once its end is complete."""
+    if buffer.startswith(CRLF, data_start):
+        return data_start + 2
+    trailer_end = buffer.find(HEADER_TERMINATOR, data_start)
+    if trailer_end == -1:
+        return None
+    return trailer_end + len(HEADER_TERMINATOR)
+
+
+def _check_chunk_terminator(buffer: bytearray, data_end: int) -> None:
+    """Raise ChunkScanError at the first byte that is not the chunk CRLF."""
+    for offset, expected in enumerate(CRLF, start=data_end):
+        if buffer[offset] != expected:
+            raise ChunkScanError(offset + 1)
+
+
+def scan_chunk_payloads(
+    buffer: bytearray,
+    start: int = 0,
+) -> ChunkPayloadScan:
+    """Locate chunk payloads from a known chunk-size boundary.
+
+    Complete chunks are reported with their data ranges so a caller
+    can map a payload byte count to a wire offset; the first
+    incomplete chunk is reported as ``partial`` once its size line is
+    complete.  Raises ChunkScanError on a malformed chunk-size line or
+    a bad chunk-data terminator.
+    """
+    payloads: list[tuple[int, int]] = []
     index = start
 
     while True:
         chunk_size_line = _scan_chunk_size_line(buffer, index)
         if chunk_size_line is None:
-            return ChunkScanResult(end=None, resume_from=index)
+            return ChunkPayloadScan(tuple(payloads), None, None, index)
 
-        chunk_size, chunk_data_start = chunk_size_line
+        chunk_size, data_start = chunk_size_line
 
         if chunk_size == 0:
-            if buffer.startswith(CRLF, chunk_data_start):
-                end = chunk_data_start + 2
-                return ChunkScanResult(end=end, resume_from=end)
-            trailer_end = buffer.find(HEADER_TERMINATOR, chunk_data_start)
-            if trailer_end == -1:
-                return ChunkScanResult(end=None, resume_from=index)
-            end = trailer_end + len(HEADER_TERMINATOR)
-            return ChunkScanResult(end=end, resume_from=end)
+            end = _terminal_chunk_end(buffer, data_start)
+            resume_from = index if end is None else end
+            return ChunkPayloadScan(tuple(payloads), None, end, resume_from)
 
-        chunk_data_end = chunk_data_start + chunk_size
-        if chunk_data_end + 2 > len(buffer):
-            return ChunkScanResult(end=None, resume_from=index)
-        if not buffer.startswith(CRLF, chunk_data_end):
-            mismatch = chunk_data_end
-            while mismatch < len(buffer) and mismatch < chunk_data_end + 2:
-                expected = (
-                    ord("\r") if mismatch == chunk_data_end else ord("\n")
-                )
-                if buffer[mismatch] != expected:
-                    raise ChunkScanError(mismatch + 1)
-                mismatch += 1
-            return ChunkScanResult(end=None, resume_from=index)
+        data_end = data_start + chunk_size
+        if data_end + 2 > len(buffer):
+            partial = (data_start, min(data_end, len(buffer)))
+            return ChunkPayloadScan(tuple(payloads), partial, None, index)
+        _check_chunk_terminator(buffer, data_end)
 
-        index = chunk_data_end + 2
+        payloads.append((data_start, data_end))
+        index = data_end + 2
