@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import selectors
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 from pytest_codspeed import BenchmarkFixture
 
-from localstub import AsyncHTTPTestServer
+from localstub import (
+    AsyncHTTPTestServer,
+    HTTPResponse,
+    ResponderContext,
+    ResponderNext,
+    ResponseSpec,
+)
 from localstub.recording import DEFAULT_MAX_CONNECTION_BYTES, BoundedByteBuffer
 from localstub.server import RecordingStreamWriter
 
@@ -29,6 +38,63 @@ REQUEST = (
 type Connection = tuple[asyncio.StreamReader, asyncio.StreamWriter]
 
 
+class _ReadySelector(selectors.SelectSelector):
+    def select(
+        self, timeout: float | None = None
+    ) -> list[tuple[selectors.SelectorKey, int]]:
+        # In-memory exchanges only need ready callbacks. Fail if a sample
+        # would block, rather than polling the OS or spinning forever.
+        assert timeout == 0, "in-memory benchmark is waiting for I/O"
+        return []
+
+
+class _InMemoryLoop(asyncio.SelectorEventLoop):
+    def time(self) -> float:
+        return 0.0
+
+
+@dataclass(frozen=True)
+class _FixedClock[T]:
+    value: T
+
+    def now(self) -> T:
+        return self.value
+
+
+class _MemoryTransport(asyncio.Transport):
+    def __init__(
+        self,
+        peer_reader: asyncio.StreamReader,
+        protocol: asyncio.StreamReaderProtocol,
+    ) -> None:
+        super().__init__({"peername": ("127.0.0.1", 54321)})
+        self._peer_reader = peer_reader
+        self._protocol = protocol
+        self._closed = False
+
+    def write(self, data: bytes | bytearray | memoryview) -> None:
+        self._peer_reader.feed_data(data)
+
+    def close(self) -> None:
+        self._closed = True
+        self._peer_reader.feed_eof()
+        self._protocol.connection_lost(None)
+
+    def is_closing(self) -> bool:
+        return self._closed
+
+
+@pytest.fixture
+def routed_loop() -> Iterator[asyncio.AbstractEventLoop]:
+    # Loop setup stays outside measurement; samples perform no socket,
+    # selector, or clock I/O.
+    loop = _InMemoryLoop(selector=_ReadySelector())
+    try:
+        yield loop
+    finally:
+        loop.close()
+
+
 @pytest.fixture
 def connection(loop: asyncio.AbstractEventLoop) -> Iterator[Connection]:
     # One keep-alive connection is opened outside the measured region so
@@ -46,6 +112,68 @@ def connection(loop: asyncio.AbstractEventLoop) -> Iterator[Connection]:
         writer.close()
         loop.run_until_complete(writer.wait_closed())
         loop.run_until_complete(server.aclose())
+
+
+@pytest.fixture
+def routed_server() -> AsyncHTTPTestServer:
+    response = HTTPResponse.json(RESPONSE_OBJECT)
+
+    async def handler(_: ResponderContext) -> HTTPResponse:
+        return response
+
+    async def pass_through(
+        _: ResponderContext, call_next: ResponderNext
+    ) -> ResponseSpec:
+        return await call_next()
+
+    server = AsyncHTTPTestServer(
+        clock=_FixedClock(0.0),
+        timestamp_provider=_FixedClock(datetime(2026, 1, 1, tzinfo=UTC)),
+    )
+    # A route miss returns the same body length, so exchange() completes
+    # and the status assertion catches the miss.
+    server.set_json_response(RESPONSE_OBJECT, status=404)
+    server.add_route("GET", "/v1/items?page=2", handler)
+    for _ in range(3):
+        server.use(pass_through)
+    return server
+
+
+@pytest.fixture
+def routed_connection(
+    routed_loop: asyncio.AbstractEventLoop,
+    routed_server: AsyncHTTPTestServer,
+) -> Iterator[Connection]:
+    reader = asyncio.StreamReader(loop=routed_loop)
+    server_reader = asyncio.StreamReader(loop=routed_loop)
+    protocol = asyncio.StreamReaderProtocol(reader, loop=routed_loop)
+    server_protocol = asyncio.StreamReaderProtocol(
+        server_reader, loop=routed_loop
+    )
+    writer = asyncio.StreamWriter(
+        _MemoryTransport(server_reader, protocol),
+        protocol,
+        reader,
+        routed_loop,
+    )
+    server_writer = asyncio.StreamWriter(
+        _MemoryTransport(reader, server_protocol),
+        server_protocol,
+        server_reader,
+        routed_loop,
+    )
+    # Keep one conversation alive across samples, exercising the public
+    # server pipeline and bounded recording buffers without a listener.
+    task = routed_loop.create_task(
+        routed_server.handle_http_connection(server_reader, server_writer)
+    )
+    try:
+        yield reader, writer
+    finally:
+        writer.close()
+        routed_loop.run_until_complete(writer.wait_closed())
+        routed_loop.run_until_complete(task)
+        routed_loop.run_until_complete(routed_server.aclose())
 
 
 async def exchange(
@@ -75,6 +203,30 @@ def test_server_roundtrip_static_json(
 
     assert head.startswith(b"HTTP/1.1 200 OK\r\n")
     assert body == RESPONSE_BODY
+
+
+def test_server_roundtrip_routed_middleware(
+    benchmark: BenchmarkFixture,
+    routed_loop: asyncio.AbstractEventLoop,
+    routed_server: AsyncHTTPTestServer,
+    routed_connection: Connection,
+) -> None:
+    reader, writer = routed_connection
+
+    def exchange_once() -> tuple[bytes, bytes]:
+        return routed_loop.run_until_complete(exchange(reader, writer))
+
+    # Warm the persistent connection outside measurement, also ensuring
+    # that another sample can reuse it when benchmarks run as tests.
+    exchange_once()
+    head, body = benchmark(exchange_once)
+
+    assert head.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert body == RESPONSE_BODY
+    assert routed_server.last_request is not None
+    assert routed_server.last_request.wire_raw_bytes == REQUEST
+    assert routed_server.last_response is not None
+    assert routed_server.last_response.wire_raw_bytes == head + body
 
 
 class _NullTransport(asyncio.Transport):
