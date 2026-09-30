@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import create_autospec
 
 import pytest
@@ -103,3 +104,69 @@ async def test_forward_fault_adapter_uses_requested_closure(
     else:
         writer.close.assert_called_once()
         writer.reset.assert_not_called()
+
+
+def _writer_stuck_in_shutdown(closed: asyncio.Event):
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.wait_closed.side_effect = closed.wait
+    writer.transport = create_autospec(asyncio.Transport, instance=True)
+    writer.transport.abort.side_effect = closed.set
+    return writer
+
+
+@pytest.mark.asyncio
+async def test_release_upstream_closes_without_waiting_for_shutdown() -> None:
+    closed = asyncio.Event()
+    writer = _writer_stuck_in_shutdown(closed)
+    forwarder = RawForwarder()
+
+    forwarder.release_upstream(writer)
+    await asyncio.sleep(0)
+
+    writer.close.assert_called_once()
+    writer.wait_closed.assert_awaited_once()
+    writer.transport.abort.assert_not_called()
+    await forwarder.abort_pending_closes()
+
+
+@pytest.mark.asyncio
+async def test_abort_pending_closes_aborts_upstream_still_shutting_down() -> (
+    None
+):
+    closed = asyncio.Event()
+    writer = _writer_stuck_in_shutdown(closed)
+    forwarder = RawForwarder()
+    forwarder.release_upstream(writer)
+
+    await forwarder.abort_pending_closes()
+
+    writer.transport.abort.assert_called_once()
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_abort_pending_closes_skips_upstream_already_closed() -> None:
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    forwarder = RawForwarder()
+    forwarder.release_upstream(writer)
+    await asyncio.sleep(0)
+
+    await forwarder.abort_pending_closes()
+
+    writer.wait_closed.assert_awaited_once()
+    writer.transport.abort.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_release_upstream_logs_shutdown_failure_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="localstub.forward")
+    writer = create_autospec(asyncio.StreamWriter, instance=True)
+    writer.wait_closed.side_effect = OSError("shutdown failed")
+    forwarder = RawForwarder()
+    forwarder.release_upstream(writer)
+
+    await forwarder.abort_pending_closes()
+
+    assert "Failed to close upstream writer" in caplog.text

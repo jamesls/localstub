@@ -590,6 +590,21 @@ async def test_raw_forwarder_relays_absolute_form_requests() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("started", [True, False])
+async def test_aclose_aborts_raw_forwarder_pending_upstream_closes(
+    started: bool,
+) -> None:
+    forwarder = create_autospec(RawForwarder, instance=True)
+    server = AsyncHTTPTestServer(raw_forwarder=forwarder)
+    if started:
+        await server.start()
+
+    await server.aclose()
+
+    forwarder.abort_pending_closes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_forward_proxy_recreates_owned_client_after_aclose() -> None:
     async with AsyncHTTPTestServer() as upstream:
         upstream.set_text_response("from upstream")

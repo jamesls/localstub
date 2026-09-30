@@ -626,7 +626,7 @@ class AsyncHTTPTestServer:
         server = self._server
         if server is None:
             self._shutdown_connections()
-            await self._close_owned_upstream_client()
+            await self._close_upstreams()
             return
         self._closing = True
         cancelled: asyncio.CancelledError | None = None
@@ -664,7 +664,7 @@ class AsyncHTTPTestServer:
             if self._server is server:
                 self._server = None
             self._closing = False
-            await self._close_owned_upstream_client()
+            await self._close_upstreams()
 
         if cancelled is not None:
             raise cancelled
@@ -707,6 +707,13 @@ class AsyncHTTPTestServer:
         client = factory()
         self._upstream_client = client
         self._builtins.set("proxy", ForwardProxyMiddleware(client))
+
+    async def _close_upstreams(self) -> None:
+        try:
+            await self._close_owned_upstream_client()
+        finally:
+            if self._raw_forwarder is not None:
+                await self._raw_forwarder.abort_pending_closes()
 
     async def _close_owned_upstream_client(self) -> None:
         if self._owned_upstream_client_factory is None:

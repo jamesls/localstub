@@ -340,6 +340,7 @@ class AsyncTLSInterceptProxy:
                     exc_info=True,
                 )
 
+        await self._forwarder.abort_pending_closes()
         await listener.wait_closed()
         self._client_tasks.clear()
         self._client_writers.clear()
@@ -734,14 +735,7 @@ class AsyncTLSInterceptProxy:
             _close_log(f"lstub --> {client_id}", "response relayed")
             return response_allows_keep_alive(request, final_response)
         finally:
-            upstream_writer.close()
-            try:
-                await upstream_writer.wait_closed()
-            except OSError:
-                LOG.debug(
-                    "Failed to close upstream writer",
-                    exc_info=True,
-                )
+            self._forwarder.release_upstream(upstream_writer)
 
     async def _forward_100_continue_request(
         self,
