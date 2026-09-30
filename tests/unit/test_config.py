@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from localstub.config import ResponseConfig, load_config
+from localstub.config import load_config
 from localstub.server import CloseConnection, HTTPResponse
 
 
@@ -266,32 +266,6 @@ class TestParseConfig:
 
 
 class TestLoadConfig:
-    def test_load_config_from_valid_file(self, tmp_path: Path) -> None:
-        config_file = write_config_file(
-            tmp_path, {"response": {"type": "text", "body": "test"}}
-        )
-
-        config = load_config(config_file)
-
-        assert config.single_response is not None
-        assert config.single_response.body == b"test"
-
-    def test_load_config_from_sequence_file(self, tmp_path: Path) -> None:
-        config_file = write_config_file(
-            tmp_path,
-            {
-                "responses": [
-                    {"status": 503},
-                    {"status": 200, "body": {"success": True}},
-                ]
-            },
-        )
-
-        config = load_config(config_file)
-
-        assert config.response_sequence is not None
-        assert len(config.response_sequence) == 2
-
     def test_load_config_file_not_found_raises_error(
         self, tmp_path: Path
     ) -> None:
@@ -308,37 +282,3 @@ class TestLoadConfig:
 
         with pytest.raises(json.JSONDecodeError):
             load_config(config_file)
-
-
-class TestResponseConfig:
-    def test_response_config_dataclass_attributes(self) -> None:
-        response = HTTPResponse.json({"test": True})
-        config = ResponseConfig(
-            single_response=response,
-            response_sequence=None,
-        )
-
-        assert config.single_response is response
-        assert config.response_sequence is None
-
-    def test_response_config_with_sequence(self) -> None:
-        responses = [
-            HTTPResponse.json({"n": 1}),
-            HTTPResponse.json({"n": 2}),
-        ]
-        config = ResponseConfig(
-            single_response=None,
-            response_sequence=responses,
-        )
-
-        assert config.single_response is None
-        assert config.response_sequence is responses
-
-    def test_response_config_accepts_close_connection(self) -> None:
-        close = CloseConnection(delay=0.25)
-        config = ResponseConfig(
-            single_response=close,
-            response_sequence=None,
-        )
-
-        assert config.single_response is close

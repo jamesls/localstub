@@ -137,12 +137,6 @@ class ResponseProtocol:
             self.result.is_complete = True
             self.message_complete = True
 
-    def on_chunk_header(self) -> None:
-        pass
-
-    def on_chunk_complete(self) -> None:
-        pass
-
 
 class AsyncResponseParser:
     """Async wrapper for httptools.HttpResponseParser with wire
