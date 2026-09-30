@@ -476,23 +476,76 @@ async def test_max_requests_closes_after_second_response() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_abort_mid_upload_records_partial_request() -> None:
-    head = (
-        b"PUT /upload HTTP/1.1\r\n"
-        b"Host: localhost\r\n"
-        b"Content-Length: 100\r\n\r\n"
-    )
+@pytest.mark.parametrize(
+    ("head", "body_prefix", "expected_body"),
+    [
+        pytest.param(
+            b"PUT /upload HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Length: 100\r\n\r\n",
+            b"x" * 10,
+            b"x" * 10,
+            id="content-length",
+        ),
+        pytest.param(CHUNKED_HEAD, b"", b"", id="before-chunk-size"),
+        pytest.param(CHUNKED_HEAD, b"5\r\n", b"", id="before-chunk-data"),
+        pytest.param(
+            CHUNKED_HEAD,
+            b"5\r\nhello\r\n0\r\n",
+            b"hello",
+            id="before-trailer-terminator",
+        ),
+    ],
+)
+async def test_client_abort_mid_upload_records_partial_request(
+    head: bytes,
+    body_prefix: bytes,
+    expected_body: bytes,
+) -> None:
+    wire = head + body_prefix
     async with AsyncHTTPTestServer() as server:
         _, writer = await _connect(server)
-        await _send(writer, head + b"x" * 10)
-        await _close(writer)
+        try:
+            await _send(writer, wire)
+        finally:
+            await _close(writer)
         request = await server.next_request(timeout=TIMEOUT)
         closed = await server.next_closed_connection(timeout=TIMEOUT)
 
+    assert len(server.requests) == 1
+    assert len(server.exchanges) == 1
+    assert len(server.closed_connections) == 1
     assert not request.body_complete
-    assert request.body == b"x" * 10
-    assert request.wire_raw_bytes == head + b"x" * 10
+    assert request.body == expected_body
+    assert request.wire_raw_bytes == wire
     assert closed.reason == "client"
+    assert closed.phase == "request_body"
+    assert not closed.reset
+    assert closed.requests_completed == 0
+    exchange = server.exchanges[0]
+    assert exchange.request is request
+    assert exchange.response is None
+    assert exchange.closed is closed
+
+
+@pytest.mark.asyncio
+async def test_invalid_chunk_size_records_protocol_error() -> None:
+    async with AsyncHTTPTestServer() as server:
+        data, _ = await _exchange_raw(
+            server, CHUNKED_HEAD + b"INVALID\r\ntest\r\n"
+        )
+        request = await server.next_request(timeout=TIMEOUT)
+        closed = await server.next_closed_connection(timeout=TIMEOUT)
+
+    assert data == b""
+    assert len(server.requests) == 1
+    assert len(server.exchanges) == 1
+    assert len(server.closed_connections) == 1
+    assert not request.body_complete
+    assert request.body == b""
+    # Chunk parsing stops after the first invalid size byte.
+    assert request.wire_raw_bytes == CHUNKED_HEAD + b"I"
+    assert closed.reason == "protocol_error"
     assert closed.phase == "request_body"
     assert not closed.reset
     assert closed.requests_completed == 0

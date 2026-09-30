@@ -385,12 +385,6 @@ class RequestProtocol:
         if not self.result.is_complete:
             self.result.is_complete = True
 
-    def on_chunk_header(self) -> None:
-        """Called at the start of a chunk (for chunked encoding)."""
-
-    def on_chunk_complete(self) -> None:
-        """Called at the end of a chunk (for chunked encoding)."""
-
 
 def _build_request_parser() -> tuple[
     RequestProtocol, httptools.HttpRequestParser

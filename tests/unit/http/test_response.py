@@ -120,13 +120,6 @@ def test_response_protocol_on_message_complete_sets_complete_flag() -> None:
     assert protocol.result.is_complete
 
 
-def test_response_protocol_chunk_callbacks_are_noops() -> None:
-    protocol = ResponseProtocol()
-
-    protocol.on_chunk_header()
-    protocol.on_chunk_complete()
-
-
 def test_response_protocol_preserves_completed_message() -> None:
     protocol = ResponseProtocol()
 

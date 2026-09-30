@@ -1313,60 +1313,6 @@ async def test_server_handles_invalid_content_length(server):
 
 
 @pytest.mark.asyncio
-async def test_server_handles_invalid_chunk_size(server):
-    await send_raw_request(
-        server.host,
-        server.port,
-        b"POST / HTTP/1.1\r\n"
-        b"Host: localhost\r\n"
-        b"Transfer-Encoding: chunked\r\n"
-        b"\r\n"
-        b"INVALID\r\n"
-        b"test\r\n",
-    )
-
-    # Server should handle this gracefully
-    await asyncio.sleep(0.1)
-
-
-@pytest.mark.asyncio
-async def test_server_handles_eof_in_chunked_body(server):
-    _, writer = await asyncio.open_connection(server.host, server.port)
-    writer.write(
-        b"POST / HTTP/1.1\r\n"
-        b"Host: localhost\r\n"
-        b"Transfer-Encoding: chunked\r\n"
-        b"\r\n"
-        b"5\r\n"
-    )
-    await writer.drain()
-    # Close before sending the chunk data
-    writer.close()
-    await writer.wait_closed()
-
-    await asyncio.sleep(0.1)
-
-
-@pytest.mark.asyncio
-async def test_server_handles_eof_in_chunk_trailers(server):
-    _, writer = await asyncio.open_connection(server.host, server.port)
-    writer.write(
-        b"POST / HTTP/1.1\r\n"
-        b"Host: localhost\r\n"
-        b"Transfer-Encoding: chunked\r\n"
-        b"\r\n"
-        b"5\r\nhello\r\n"
-        b"0\r\n"
-    )
-    await writer.drain()
-    # Close before sending final CRLF
-    writer.close()
-    await writer.wait_closed()
-
-    await asyncio.sleep(0.1)
-
-
-@pytest.mark.asyncio
 async def test_server_handles_invalid_status_code():
     async with AsyncHTTPTestServer() as server:
         # Set response with invalid status code
@@ -1489,58 +1435,6 @@ async def test_server_handles_exception_during_request_processing():
 
         # Request should still be recorded before handler error
         assert len(server.requests) == 1
-
-
-@pytest.mark.asyncio
-async def test_server_handles_writer_close_exception():
-
-    async with AsyncHTTPTestServer() as server:
-        server.set_json_response({"test": "ok"})
-
-        # Make a normal request
-        reader, writer = await asyncio.open_connection(
-            server.host, server.port
-        )
-        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        await writer.drain()
-
-        # Read response
-        await reader.read(4096)
-
-        # Forcefully close from client side
-        writer.close()
-        await writer.wait_closed()
-
-        # Give server time to handle cleanup
-        await asyncio.sleep(0.1)
-
-
-@pytest.mark.asyncio
-async def test_server_handles_immediate_eof_in_request_line(server):
-    _, writer = await asyncio.open_connection(server.host, server.port)
-    # Close immediately without sending anything
-    writer.close()
-    await writer.wait_closed()
-
-    await asyncio.sleep(0.1)
-    assert len(server.requests) == 0
-
-
-@pytest.mark.asyncio
-async def test_server_handles_eof_after_chunk_size(server):
-    _, writer = await asyncio.open_connection(server.host, server.port)
-    writer.write(
-        b"POST / HTTP/1.1\r\n"
-        b"Host: localhost\r\n"
-        b"Transfer-Encoding: chunked\r\n"
-        b"\r\n"
-    )
-    await writer.drain()
-    # Close before sending any chunk size
-    writer.close()
-    await writer.wait_closed()
-
-    await asyncio.sleep(0.1)
 
 
 @pytest.mark.asyncio
