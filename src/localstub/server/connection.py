@@ -585,6 +585,17 @@ class HTTPConnection:
             return
         child.cancel()
 
+    async def wait_finished(self) -> None:
+        """Wait for the request loop to finish.
+
+        Returns at once when the loop never started or has already
+        finished.  Only the loop is awaited, not the transport close,
+        which over TLS can depend on the peer.
+        """
+        child = self._child
+        if child is not None:
+            await asyncio.wait({child})
+
     def owns_current_task(self) -> bool:
         """Whether the calling code runs inside this connection's loop."""
         try:

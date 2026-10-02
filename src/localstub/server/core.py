@@ -626,6 +626,7 @@ class AsyncHTTPTestServer:
         server = self._server
         if server is None:
             self._shutdown_connections()
+            await self._wait_connections_finished(self._calling_connection())
             await self._close_upstreams()
             return
         self._closing = True
@@ -655,9 +656,11 @@ class AsyncHTTPTestServer:
                 task.cancel()
             if client_tasks:
                 await asyncio.gather(*client_tasks, return_exceptions=True)
-            if caller is None:
-                # Server.wait_closed() waits for every accepted transport,
-                # and the caller's stays open until its handler returns.
+            await self._wait_connections_finished(caller)
+            if caller not in self._client_tasks:
+                # Server.wait_closed() waits for every accepted transport.
+                # An accepted caller's stays open until its handler
+                # returns, so only wait when the caller is not one.
                 await server.wait_closed()
         finally:
             server.close()
@@ -687,15 +690,37 @@ class AsyncHTTPTestServer:
         for connection in tuple(self._connections.values()):
             connection.shutdown()
 
+    async def _wait_connections_finished(
+        self, caller: HTTPConnection | None
+    ) -> None:
+        """Wait for every tracked connection loop except the caller's.
+
+        Connections handed to ``handle_http_connection`` have no task of
+        their own here, so after ``shutdown()`` interrupts their loops
+        the interrupted request still has to unwind.  A raw-forwarded
+        request releases its upstream on the way out, and that release
+        must land before ``_close_upstreams()`` drains the pending
+        closes, or the upstream transport outlives the server.
+        """
+        connections = tuple(
+            connection
+            for connection in self._connections.values()
+            if connection is not caller
+        )
+        if connections:
+            await asyncio.gather(
+                *(connection.wait_finished() for connection in connections)
+            )
+
     def _calling_connection(self) -> HTTPConnection | None:
-        """The accepted connection whose loop is running the caller.
+        """The tracked connection whose loop is running the caller.
 
         ``aclose()`` may run inside a handler.  That connection cannot
         finish until ``aclose()`` returns, so shutdown neither cancels
-        its task nor waits for its transport; the decision is recorded
-        and the loop exits after the current request.
+        its task nor waits for its loop or transport; the decision is
+        recorded and the loop exits after the current request.
         """
-        for connection in self._client_tasks:
+        for connection in self._connections.values():
             if connection.owns_current_task():
                 return connection
         return None

@@ -410,6 +410,29 @@ async def test_connection_handed_off_while_closing_records_shutdown_idle() -> (
 
 
 @pytest.mark.asyncio
+async def test_aclose_does_not_wait_for_handed_off_transport_to_close() -> (
+    None
+):
+    server = AsyncHTTPTestServer()
+    await server.start()
+    closing = asyncio.create_task(server.aclose())
+    await asyncio.sleep(0)
+    transport_closed = asyncio.Event()
+    writer = _fake_writer()
+    writer.wait_closed.side_effect = transport_closed.wait
+    handoff = asyncio.create_task(
+        server.handle_http_connection(_reader(eof=False), writer)
+    )
+
+    await asyncio.wait_for(closing, timeout=1.0)
+
+    assert not handoff.done()
+    transport_closed.set()
+    await asyncio.wait_for(handoff, timeout=1.0)
+    assert [c.reason for c in server.closed_connections] == ["shutdown"]
+
+
+@pytest.mark.asyncio
 async def test_handler_calling_aclose_on_own_connection_finishes_request() -> (
     None
 ):
@@ -602,6 +625,67 @@ async def test_aclose_aborts_raw_forwarder_pending_upstream_closes(
     await server.aclose()
 
     forwarder.abort_pending_closes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started", [True, False])
+async def test_aclose_unwinds_handed_off_forward_before_aborting_closes(
+    started: bool,
+) -> None:
+    events: list[str] = []
+
+    async def forward(**kwargs: Any) -> None:
+        _ = kwargs
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("released")
+
+    async def abort() -> None:
+        events.append("aborted")
+
+    forwarder = create_autospec(RawForwarder, instance=True)
+    forwarder.forward_and_relay.side_effect = forward
+    forwarder.abort_pending_closes.side_effect = abort
+    server = AsyncHTTPTestServer(raw_forwarder=forwarder)
+    if started:
+        await server.start()
+    task = asyncio.create_task(
+        server.handle_http_connection(
+            _reader(PROXY_GET, eof=False), _fake_writer()
+        )
+    )
+    await _settle()
+
+    await asyncio.wait_for(server.aclose(), timeout=1.0)
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert events == ["released", "aborted"]
+
+
+@pytest.mark.asyncio
+async def test_handler_calling_aclose_on_handed_off_connection_finishes() -> (
+    None
+):
+    server = AsyncHTTPTestServer()
+
+    async def handler(ctx: ResponderContext) -> HTTPResponse:
+        _ = ctx
+        await server.aclose()
+        return HTTPResponse.text("done")
+
+    server.handler = handler
+    await server.start()
+    writer = _fake_writer()
+
+    closed = await asyncio.wait_for(
+        _converse(server, GET + GET_TWO, writer=writer), timeout=1.0
+    )
+
+    assert _written(writer).endswith(b"done")
+    assert len(server.requests) == 1
+    assert closed.reason == "shutdown"
+    assert closed.phase == "response"
 
 
 @pytest.mark.asyncio
