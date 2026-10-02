@@ -6,6 +6,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from localstub import AsyncioClient
 from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest, RecordedHTTPRequest
 from localstub.middleware import (
@@ -274,6 +275,28 @@ async def test_server_returns_custom_headers(server, client):
     assert server.last_response.headers is not None
     assert server.last_response.headers["x-custom-header"] == "custom-value"
     assert server.last_response.headers["Content-Type"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_chunked_response_is_not_given_a_content_length(server):
+    # RFC 9112 §6.2: a sender must not send Content-Length alongside
+    # Transfer-Encoding.  A strict parser rejects a response that has
+    # both, so the server must not add one to a chunked response.
+    server.handler = lambda request: HTTPResponse(
+        headers={"Transfer-Encoding": "chunked"},
+        body=b"5\r\nhello\r\n0\r\n\r\n",
+    )
+
+    async with AsyncioClient() as asyncio_client:
+        response = await asyncio_client.send(
+            HTTPRequest(method="GET", target=server.url)
+        )
+
+    assert response.status == 200
+    assert response.body == b"hello"
+    assert "Content-Length" not in response.headers
+    assert server.last_response is not None
+    assert b"Content-Length" not in server.last_response.wire_raw_bytes
 
 
 @pytest.mark.asyncio

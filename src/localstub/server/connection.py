@@ -122,7 +122,9 @@ def _serialize_response_head(
             for name, value in items
             if name.lower() != "content-length"
         ]
-    elif "content-length" not in header_names:
+    elif not header_names & {"content-length", "transfer-encoding"}:
+        # A Transfer-Encoding header already frames the body, and RFC
+        # 9112 §6.2 forbids sending Content-Length alongside it.
         items.append(("Content-Length", str(body_length)))
     if should_close:
         items = _with_connection_token(items, "close")
