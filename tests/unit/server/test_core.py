@@ -16,6 +16,7 @@ from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequestHeaders, HTTPRequestReader
 from localstub.middleware import (
     CloseConnection,
+    ForwardProxyResponse,
     HeaderContext,
     HeaderDecision,
     HeaderNext,
@@ -625,6 +626,52 @@ async def test_aclose_aborts_raw_forwarder_pending_upstream_closes(
     await server.aclose()
 
     forwarder.abort_pending_closes.assert_awaited_once()
+
+
+def _forward_via(forwarder: Mock) -> ForwardProxyResponse:
+    return ForwardProxyResponse(
+        host="upstream.test",
+        port=80,
+        upstream_tls=False,
+        request_wire_bytes=GET,
+        request_method="GET",
+        forwarder=forwarder,
+    )
+
+
+@pytest.mark.asyncio
+async def test_aclose_drains_forwarder_supplied_by_handler() -> None:
+    forwarder = create_autospec(RawForwarder, instance=True)
+    forwarder.forward_and_relay.return_value = None
+    server = AsyncHTTPTestServer(handler=lambda ctx: _forward_via(forwarder))
+    await server.start()
+    await _converse(server, GET)
+    await _converse(server, GET_TWO)
+
+    await server.aclose()
+
+    assert forwarder.forward_and_relay.await_count == 2
+    forwarder.abort_pending_closes.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_aclose_drains_each_forwarder_once() -> None:
+    configured = create_autospec(RawForwarder, instance=True)
+    configured.forward_and_relay.return_value = None
+    named = create_autospec(RawForwarder, instance=True)
+    named.forward_and_relay.return_value = None
+    server = AsyncHTTPTestServer(
+        raw_forwarder=configured,
+        handler=lambda ctx: _forward_via(named),
+    )
+    await server.start()
+    await _converse(server, PROXY_GET)
+    await _converse(server, GET)
+
+    await server.aclose()
+
+    configured.abort_pending_closes.assert_awaited_once()
+    named.abort_pending_closes.assert_awaited_once()
 
 
 @pytest.mark.asyncio

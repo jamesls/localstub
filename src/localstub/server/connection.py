@@ -25,7 +25,7 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Any, NamedTuple
 
-from localstub.forward import response_allows_keep_alive
+from localstub.forward import RawForwarder, response_allows_keep_alive
 from localstub.http import stream
 from localstub.http.connection import (
     ConnectionRequest,
@@ -76,6 +76,7 @@ from localstub.server.transmission import (
 LOG = logging.getLogger(__name__)
 
 Sleep = Callable[[float], Awaitable[None]]
+TrackForwarder = Callable[[RawForwarder], None]
 HeaderApp = Callable[[HeaderContext], Awaitable[HeaderDecision]]
 ResponderApp = Callable[[ResponderContext], Awaitable[ResponseSpec]]
 SenderApp = Callable[[SenderContext, ResponseSpec], Awaitable[SendResult]]
@@ -521,6 +522,7 @@ class HTTPConnection:
         recorder: TrafficRecorder,
         services: ServerServices,
         sleep: Sleep,
+        track_forwarder: TrackForwarder,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -529,6 +531,7 @@ class HTTPConnection:
         self._recorder = recorder
         self._services = services
         self._sleep = sleep
+        self._track_forwarder = track_forwarder
         self._sink = ConsumedByteSink(state)
         self._policy = KeepAlivePolicy()
         self._child: asyncio.Task[None] | None = None
@@ -1235,7 +1238,12 @@ class HTTPConnection:
             wait_for_close=writer.wait_closed,
             reset_stream=reset,
         )
-        result = await response.forwarder.forward_and_relay(
+        forwarder = response.forwarder
+        # Report the forwarder before relaying: a shutdown that
+        # interrupts the relay still releases the upstream, and the
+        # server must know which forwarder to drain.
+        self._track_forwarder(forwarder)
+        result = await forwarder.forward_and_relay(
             host=response.host,
             port=response.port,
             request_wire_bytes=response.request_wire_bytes,

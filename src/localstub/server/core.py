@@ -194,7 +194,9 @@ class AsyncHTTPTestServer:
             self._owned_upstream_client_factory = AsyncioClient
             upstream_client = self._owned_upstream_client_factory()
         self._upstream_client = upstream_client
-        self._raw_forwarder = raw_forwarder
+        self._forwarders: list[RawForwarder] = []
+        if raw_forwarder is not None:
+            self._track_forwarder(raw_forwarder)
 
         self._builtins = BuiltinMiddlewares()
         if raw_forwarder is not None:
@@ -733,12 +735,25 @@ class AsyncHTTPTestServer:
         self._upstream_client = client
         self._builtins.set("proxy", ForwardProxyMiddleware(client))
 
+    def _track_forwarder(self, forwarder: RawForwarder) -> None:
+        """Remember a forwarder so ``aclose()`` drains its upstreams.
+
+        A connection relays through whichever forwarder its response
+        spec names, which need not be the one passed as
+        ``raw_forwarder``: a handler or middleware can build a
+        ``ForwardProxyResponse`` around its own.  Every forwarder that
+        relayed through this server is drained on close so no upstream
+        transport outlives it.
+        """
+        if forwarder not in self._forwarders:
+            self._forwarders.append(forwarder)
+
     async def _close_upstreams(self) -> None:
         try:
             await self._close_owned_upstream_client()
         finally:
-            if self._raw_forwarder is not None:
-                await self._raw_forwarder.abort_pending_closes()
+            for forwarder in tuple(self._forwarders):
+                await forwarder.abort_pending_closes()
 
     async def _close_owned_upstream_client(self) -> None:
         if self._owned_upstream_client_factory is None:
@@ -929,6 +944,7 @@ class AsyncHTTPTestServer:
             recorder=self._recorder,
             services=self._services,
             sleep=self._sleep,
+            track_forwarder=self._track_forwarder,
         )
         self._connections[writer] = connection
         return connection

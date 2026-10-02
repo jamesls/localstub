@@ -194,6 +194,7 @@ class Harness:
     recorder: TrafficRecorder
     connection: HTTPConnection
     responded: list[str] = field(default_factory=list[str])
+    forwarders: list[RawForwarder] = field(default_factory=list[RawForwarder])
 
     @property
     def written(self) -> bytes:
@@ -235,6 +236,7 @@ def _harness(
     timestamp_provider: TimestampProvider | None = None,
 ) -> Harness:
     responded: list[str] = []
+    forwarders: list[RawForwarder] = []
     stream_reader = asyncio.StreamReader() if reader is None else reader
     stream_writer = _fake_writer() if writer is None else writer
     state = ConnectionState(client=client, received=received, sent=sent)
@@ -284,6 +286,7 @@ def _harness(
             timestamp_provider=timestamp_provider or _FixedTimestampProvider()
         ),
         sleep=sleep or _ImmediateSleep(),
+        track_forwarder=forwarders.append,
     )
     return Harness(
         reader=stream_reader,
@@ -292,6 +295,7 @@ def _harness(
         recorder=recorder,
         connection=connection,
         responded=responded,
+        forwarders=forwarders,
     )
 
 
@@ -1862,6 +1866,20 @@ async def test_relay_client_transport_failure_records_client_response_body(
     assert closed.bytes_written == len(wire)
     assert len(harness.recorder.exchanges) == 1
     assert harness.recorder.exchanges[0].closed is closed
+
+
+@pytest.mark.asyncio
+async def test_relay_reports_forwarder_even_when_upstream_fails() -> None:
+    forwarder = Mock(spec=RawForwarder)
+    forwarder.forward_and_relay = AsyncMock(
+        side_effect=ConnectionResetError("upstream reset")
+    )
+    harness = _harness(response=_forward_response(forwarder))
+    harness.feed(GET, eof=True)
+
+    await harness.run()
+
+    assert harness.forwarders == [forwarder]
 
 
 @pytest.mark.parametrize("write_response", [False, True])
