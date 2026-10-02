@@ -25,7 +25,7 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Any, NamedTuple
 
-from localstub.forward import response_allows_keep_alive
+from localstub.forward import RawForwarder, response_allows_keep_alive
 from localstub.http import stream
 from localstub.http.connection import (
     ConnectionRequest,
@@ -76,6 +76,7 @@ from localstub.server.transmission import (
 LOG = logging.getLogger(__name__)
 
 Sleep = Callable[[float], Awaitable[None]]
+TrackForwarder = Callable[[RawForwarder], None]
 HeaderApp = Callable[[HeaderContext], Awaitable[HeaderDecision]]
 ResponderApp = Callable[[ResponderContext], Awaitable[ResponseSpec]]
 SenderApp = Callable[[SenderContext, ResponseSpec], Awaitable[SendResult]]
@@ -122,7 +123,9 @@ def _serialize_response_head(
             for name, value in items
             if name.lower() != "content-length"
         ]
-    elif "content-length" not in header_names:
+    elif not header_names & {"content-length", "transfer-encoding"}:
+        # A Transfer-Encoding header already frames the body, and RFC
+        # 9112 §6.2 forbids sending Content-Length alongside it.
         items.append(("Content-Length", str(body_length)))
     if should_close:
         items = _with_connection_token(items, "close")
@@ -519,6 +522,7 @@ class HTTPConnection:
         recorder: TrafficRecorder,
         services: ServerServices,
         sleep: Sleep,
+        track_forwarder: TrackForwarder,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -527,6 +531,7 @@ class HTTPConnection:
         self._recorder = recorder
         self._services = services
         self._sleep = sleep
+        self._track_forwarder = track_forwarder
         self._sink = ConsumedByteSink(state)
         self._policy = KeepAlivePolicy()
         self._child: asyncio.Task[None] | None = None
@@ -584,6 +589,17 @@ class HTTPConnection:
             self._writer.abort()
             return
         child.cancel()
+
+    async def wait_finished(self) -> None:
+        """Wait for the request loop to finish.
+
+        Returns at once when the loop never started or has already
+        finished.  Only the loop is awaited, not the transport close,
+        which over TLS can depend on the peer.
+        """
+        child = self._child
+        if child is not None:
+            await asyncio.wait({child})
 
     def owns_current_task(self) -> bool:
         """Whether the calling code runs inside this connection's loop."""
@@ -1222,7 +1238,12 @@ class HTTPConnection:
             wait_for_close=writer.wait_closed,
             reset_stream=reset,
         )
-        result = await response.forwarder.forward_and_relay(
+        forwarder = response.forwarder
+        # Report the forwarder before relaying: a shutdown that
+        # interrupts the relay still releases the upstream, and the
+        # server must know which forwarder to drain.
+        self._track_forwarder(forwarder)
+        result = await forwarder.forward_and_relay(
             host=response.host,
             port=response.port,
             request_wire_bytes=response.request_wire_bytes,

@@ -44,6 +44,13 @@ LOG = logging.getLogger(__name__)
 WireLog = Callable[[str, bytes], None]
 
 
+async def _wait_upstream_closed(writer: asyncio.StreamWriter) -> None:
+    try:
+        await writer.wait_closed()
+    except OSError:
+        LOG.debug("Failed to close upstream writer", exc_info=True)
+
+
 class ClientWriter(Protocol):
     """Minimal writer interface required for relaying responses."""
 
@@ -220,6 +227,9 @@ class RawForwarder:
         self._response_transformer = response_transformer
         self._decompress_body = decompress_body
         self._wire_log = wire_log
+        self._upstream_closes: dict[
+            asyncio.Task[None], asyncio.StreamWriter
+        ] = {}
 
     async def forward_and_relay(
         self,
@@ -270,14 +280,44 @@ class RawForwarder:
                 client_id=client_id,
             )
         finally:
-            upstream_writer.close()
-            try:
-                await upstream_writer.wait_closed()
-            except OSError:
-                LOG.debug(
-                    "Failed to close upstream writer",
-                    exc_info=True,
-                )
+            self.release_upstream(upstream_writer)
+
+    def release_upstream(self, writer: asyncio.StreamWriter) -> None:
+        """Close an upstream connection without waiting for shutdown.
+
+        Closing a TLS writer sends ``close_notify`` and only finishes
+        once the peer replies or asyncio's shutdown timeout (30 s by
+        default) expires.  An upstream that has answered but never
+        replies would stall the caller, and with it the next request on
+        a keep-alive client connection, so the wait runs in a background
+        task instead.  ``abort_pending_closes()`` aborts any wait still
+        outstanding.
+        """
+        writer.close()
+        task = asyncio.create_task(_wait_upstream_closed(writer))
+        self._upstream_closes[task] = writer
+        task.add_done_callback(self._forget_upstream_close)
+
+    def _forget_upstream_close(self, task: asyncio.Task[None]) -> None:
+        self._upstream_closes.pop(task, None)
+
+    async def abort_pending_closes(self) -> None:
+        """Abort upstream connections still waiting for TLS shutdown.
+
+        Called by the owning server or proxy when it shuts down so no
+        transport outlives it.  The forwarder stays usable afterwards.
+        """
+        pending = tuple(
+            (task, writer)
+            for task, writer in self._upstream_closes.items()
+            if not task.done()
+        )
+        for _, writer in pending:
+            writer.transport.abort()
+        if pending:
+            await asyncio.gather(
+                *(task for task, _ in pending), return_exceptions=True
+            )
 
     async def connect_upstream(
         self,

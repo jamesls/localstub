@@ -194,7 +194,9 @@ class AsyncHTTPTestServer:
             self._owned_upstream_client_factory = AsyncioClient
             upstream_client = self._owned_upstream_client_factory()
         self._upstream_client = upstream_client
-        self._raw_forwarder = raw_forwarder
+        self._forwarders: list[RawForwarder] = []
+        if raw_forwarder is not None:
+            self._track_forwarder(raw_forwarder)
 
         self._builtins = BuiltinMiddlewares()
         if raw_forwarder is not None:
@@ -626,7 +628,8 @@ class AsyncHTTPTestServer:
         server = self._server
         if server is None:
             self._shutdown_connections()
-            await self._close_owned_upstream_client()
+            await self._wait_connections_finished(self._calling_connection())
+            await self._close_upstreams()
             return
         self._closing = True
         cancelled: asyncio.CancelledError | None = None
@@ -655,16 +658,18 @@ class AsyncHTTPTestServer:
                 task.cancel()
             if client_tasks:
                 await asyncio.gather(*client_tasks, return_exceptions=True)
-            if caller is None:
-                # Server.wait_closed() waits for every accepted transport,
-                # and the caller's stays open until its handler returns.
+            await self._wait_connections_finished(caller)
+            if caller not in self._client_tasks:
+                # Server.wait_closed() waits for every accepted transport.
+                # An accepted caller's stays open until its handler
+                # returns, so only wait when the caller is not one.
                 await server.wait_closed()
         finally:
             server.close()
             if self._server is server:
                 self._server = None
             self._closing = False
-            await self._close_owned_upstream_client()
+            await self._close_upstreams()
 
         if cancelled is not None:
             raise cancelled
@@ -687,15 +692,37 @@ class AsyncHTTPTestServer:
         for connection in tuple(self._connections.values()):
             connection.shutdown()
 
+    async def _wait_connections_finished(
+        self, caller: HTTPConnection | None
+    ) -> None:
+        """Wait for every tracked connection loop except the caller's.
+
+        Connections handed to ``handle_http_connection`` have no task of
+        their own here, so after ``shutdown()`` interrupts their loops
+        the interrupted request still has to unwind.  A raw-forwarded
+        request releases its upstream on the way out, and that release
+        must land before ``_close_upstreams()`` drains the pending
+        closes, or the upstream transport outlives the server.
+        """
+        connections = tuple(
+            connection
+            for connection in self._connections.values()
+            if connection is not caller
+        )
+        if connections:
+            await asyncio.gather(
+                *(connection.wait_finished() for connection in connections)
+            )
+
     def _calling_connection(self) -> HTTPConnection | None:
-        """The accepted connection whose loop is running the caller.
+        """The tracked connection whose loop is running the caller.
 
         ``aclose()`` may run inside a handler.  That connection cannot
         finish until ``aclose()`` returns, so shutdown neither cancels
-        its task nor waits for its transport; the decision is recorded
-        and the loop exits after the current request.
+        its task nor waits for its loop or transport; the decision is
+        recorded and the loop exits after the current request.
         """
-        for connection in self._client_tasks:
+        for connection in self._connections.values():
             if connection.owns_current_task():
                 return connection
         return None
@@ -707,6 +734,26 @@ class AsyncHTTPTestServer:
         client = factory()
         self._upstream_client = client
         self._builtins.set("proxy", ForwardProxyMiddleware(client))
+
+    def _track_forwarder(self, forwarder: RawForwarder) -> None:
+        """Remember a forwarder so ``aclose()`` drains its upstreams.
+
+        A connection relays through whichever forwarder its response
+        spec names, which need not be the one passed as
+        ``raw_forwarder``: a handler or middleware can build a
+        ``ForwardProxyResponse`` around its own.  Every forwarder that
+        relayed through this server is drained on close so no upstream
+        transport outlives it.
+        """
+        if forwarder not in self._forwarders:
+            self._forwarders.append(forwarder)
+
+    async def _close_upstreams(self) -> None:
+        try:
+            await self._close_owned_upstream_client()
+        finally:
+            for forwarder in tuple(self._forwarders):
+                await forwarder.abort_pending_closes()
 
     async def _close_owned_upstream_client(self) -> None:
         if self._owned_upstream_client_factory is None:
@@ -897,6 +944,7 @@ class AsyncHTTPTestServer:
             recorder=self._recorder,
             services=self._services,
             sleep=self._sleep,
+            track_forwarder=self._track_forwarder,
         )
         self._connections[writer] = connection
         return connection

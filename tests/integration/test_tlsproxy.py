@@ -6,11 +6,13 @@ import socket
 import ssl
 import threading
 import time
+from unittest.mock import create_autospec
 
 import httpx
 import pytest
 import trustme
 
+from localstub.forward import RawForwarder
 from localstub.http.headers import Headers
 from localstub.middleware import ResponderContext
 from localstub.server import (
@@ -866,6 +868,75 @@ async def test_forward_to_plain_http_when_tls_disabled():
         assert recorded.target == "/forward"
         assert response.status_code == 200
         assert response.json() == {"upstream": True}
+
+
+@pytest.mark.asyncio
+async def test_forward_keep_alive_not_delayed_by_upstream_tls_shutdown() -> (
+    None
+):
+    ca = trustme.CA()
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ca.issue_cert("127.0.0.1").configure_cert(server_ctx)
+    release = asyncio.Event()
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        # Stop reading before answering so the proxy's close_notify is
+        # never acknowledged and its TLS shutdown cannot complete.
+        writer.transport.pause_reading()
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        await writer.drain()
+        await release.wait()
+        writer.transport.abort()
+
+    upstream = await asyncio.start_server(
+        handle, "127.0.0.1", 0, ssl=server_ctx
+    )
+    upstream_host, upstream_port = upstream.sockets[0].getsockname()[:2]
+    url = f"https://{upstream_host}:{upstream_port}/keep-alive"
+
+    try:
+        async with AsyncTLSInterceptProxy(
+            server=None,
+            default_mode="forward",
+            verify_upstream=False,
+            upstream_tls=True,
+        ) as proxy:
+            proxy_host, proxy_port = proxy.address
+            verify_ctx = ssl.create_default_context(
+                cafile=str(proxy.ca.ca_pem_path())
+            )
+            async with httpx.AsyncClient(
+                proxy=f"http://{proxy_host}:{proxy_port}",
+                verify=verify_ctx,
+                http2=False,
+            ) as client:
+                first = await client.get(url)
+                # Reuses the tunnel; waiting for the upstream TLS shutdown
+                # would hold this request for asyncio's 30 s timeout.
+                second = await asyncio.wait_for(client.get(url), timeout=5.0)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        for _ in range(2):
+            recorded = await proxy.next_response(timeout=1.0)
+            assert recorded.status == 200
+    finally:
+        release.set()
+        upstream.close()
+        await upstream.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_aclose_aborts_forwarder_pending_upstream_closes() -> None:
+    forwarder = create_autospec(RawForwarder, instance=True)
+
+    async with AsyncTLSInterceptProxy(server=None, forwarder=forwarder):
+        pass
+
+    forwarder.abort_pending_closes.assert_awaited_once()
 
 
 @pytest.mark.asyncio
