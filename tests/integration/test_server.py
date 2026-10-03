@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import asyncio
+import socket
 import time
 from datetime import UTC, datetime
 
@@ -6,9 +9,9 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from localstub import AsyncioClient
+from localstub import AsyncHTTPTestServer, AsyncioClient, HTTPRequest
 from localstub.http.headers import Headers
-from localstub.http.request import HTTPRequest, RecordedHTTPRequest
+from localstub.http.request import RecordedHTTPRequest
 from localstub.middleware import (
     ResponderContext,
     ResponderNext,
@@ -19,7 +22,6 @@ from localstub.middleware import (
 )
 from localstub.router import Router
 from localstub.server import (
-    AsyncHTTPTestServer,
     HTTPRequestHeaders,
     HTTPResponse,
     SendResponse,
@@ -88,6 +90,24 @@ async def test_server_receives_request_and_returns_json_response(
     assert server.exchanges[0].request_timestamp.tzinfo is not None
     assert server.exchanges[0].response_timestamp is not None
     assert server.exchanges[0].response_timestamp.tzinfo is not None
+
+
+@pytest.mark.skipif(not socket.has_ipv6, reason="IPv6 is unavailable")
+@pytest.mark.asyncio
+async def test_server_ipv6_url_is_usable_by_client() -> None:
+    async with (
+        AsyncHTTPTestServer(host="::1") as server,
+        AsyncioClient() as client,
+    ):
+        server.set_text_response("hello IPv6")
+
+        assert server.url == f"http://[::1]:{server.port}/"
+        response = await client.send(
+            HTTPRequest(method="GET", target=server.url)
+        )
+
+    assert response.status == 200
+    assert response.body == b"hello IPv6"
 
 
 @pytest.mark.asyncio

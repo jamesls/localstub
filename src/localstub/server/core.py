@@ -264,7 +264,8 @@ class AsyncHTTPTestServer:
     def url(self) -> str:
         if self.host is None or self.port is None:
             raise RuntimeError("Server not started yet")
-        return f"http://{self.host}:{self.port}/"
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"http://{host}:{self.port}/"
 
     @property
     def handler(self) -> ResponderHandler | None:
