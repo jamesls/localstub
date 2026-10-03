@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -67,9 +67,9 @@ def parse_absolute_uri(uri: str) -> ParsedURI | None:
         return None
 
     # Malformed authorities (unbalanced IPv6 bracket, non-numeric or
-    # out-of-range port) raise ValueError from urlparse/.port.
+    # out-of-range port) raise ValueError from urlsplit/.port.
     try:
-        parsed = urlparse(uri)
+        parsed = urlsplit(uri)
         parsed_port = parsed.port
     except ValueError:
         return None

@@ -11,11 +11,11 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from localstub import HTTPRequest
 from localstub.http.framing import ChunkScanError
 from localstub.http.headers import Headers
 from localstub.http.request import (
     AsyncRequestParser,
-    HTTPRequest,
     HTTPRequestHeaders,
     HTTPRequestReader,
     ParsedRequest,
@@ -1432,18 +1432,15 @@ def test_http_request_headers_are_immutable() -> None:
         _untyped(partial.headers)["Host"] = "other.example.com"
 
 
-def test_http_request_is_proxy_request_true_for_http() -> None:
+@pytest.mark.parametrize(
+    "scheme", ["http", "HTTP", "hTtP", "https", "HTTPS", "hTtPs"]
+)
+def test_http_request_is_proxy_request_accepts_case_insensitive_schemes(
+    scheme: str,
+) -> None:
     request = HTTPRequest(
         method="GET",
-        target="http://example.com/path",
-    )
-    assert request.is_proxy_request
-
-
-def test_http_request_is_proxy_request_true_for_https() -> None:
-    request = HTTPRequest(
-        method="GET",
-        target="https://example.com/path",
+        target=f"{scheme}://example.com/path",
     )
     assert request.is_proxy_request
 
@@ -1482,12 +1479,39 @@ def test_http_request_target_uri_returns_none_for_empty_target() -> None:
     assert request.target_uri is None
 
 
-def test_http_request_effective_path_extracts_absolute_path() -> None:
+@pytest.mark.parametrize(
+    ("target", "expected_path"),
+    [
+        pytest.param(
+            "http://example.com/api/users?limit=10",
+            "/api/users?limit=10",
+            id="query",
+        ),
+        pytest.param(
+            "http://example.com/api/users;version=2?limit=10",
+            "/api/users;version=2?limit=10",
+            id="path-parameters",
+        ),
+        pytest.param(
+            "http://example.com/api/users;",
+            "/api/users;",
+            id="empty-path-parameters",
+        ),
+        pytest.param(
+            "https://example.com/api;version=2/users;active=true?limit=10",
+            "/api;version=2/users;active=true?limit=10",
+            id="multiple-path-parameters",
+        ),
+    ],
+)
+def test_http_request_effective_path_extracts_absolute_path(
+    target: str, expected_path: str
+) -> None:
     request = HTTPRequest(
         method="GET",
-        target="http://example.com/api/users?limit=10",
+        target=target,
     )
-    assert request.effective_path == "/api/users?limit=10"
+    assert request.effective_path == expected_path
 
 
 def test_http_request_effective_path_returns_origin_form_path() -> None:
