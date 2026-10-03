@@ -1432,18 +1432,15 @@ def test_http_request_headers_are_immutable() -> None:
         _untyped(partial.headers)["Host"] = "other.example.com"
 
 
-def test_http_request_is_proxy_request_true_for_http() -> None:
+@pytest.mark.parametrize(
+    "scheme", ["http", "HTTP", "hTtP", "https", "HTTPS", "hTtPs"]
+)
+def test_http_request_is_proxy_request_accepts_case_insensitive_schemes(
+    scheme: str,
+) -> None:
     request = HTTPRequest(
         method="GET",
-        target="http://example.com/path",
-    )
-    assert request.is_proxy_request
-
-
-def test_http_request_is_proxy_request_true_for_https() -> None:
-    request = HTTPRequest(
-        method="GET",
-        target="https://example.com/path",
+        target=f"{scheme}://example.com/path",
     )
     assert request.is_proxy_request
 

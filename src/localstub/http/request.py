@@ -121,11 +121,10 @@ class HTTPRequest:
         """Return True if this is a forward proxy request (absolute-form URI).
 
         Forward proxy requests have the full URL in the request line,
-        e.g., GET http://example.com/path HTTP/1.1
+        e.g., GET http://example.com/path HTTP/1.1. URI schemes are
+        case-insensitive.
         """
-        return self.target.startswith("http://") or self.target.startswith(
-            "https://"
-        )
+        return self.target[:8].lower().startswith(("http://", "https://"))
 
     @property
     def target_uri(self) -> ParsedURI | None:
