@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from unittest.mock import create_autospec
 
 import pytest
 
-from localstub.forward import ClientWriter, ForwardError, RawForwarder
+from localstub.forward import (
+    ClientWriter,
+    ForwardError,
+    RawForwarder,
+    StreamClientWriter,
+)
 from localstub.http.request import AsyncRequestParser, RecordedHTTPRequest
+from localstub.http.tcp import pack_linger_option
 from localstub.server import DropConnection
 from localstub.tlsproxy import fault_step_transformer
 
@@ -104,6 +111,36 @@ async def test_forward_fault_adapter_uses_requested_closure(
     else:
         writer.close.assert_called_once()
         writer.reset.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stream_client_writer_delegates_to_stream() -> None:
+    stream = create_autospec(asyncio.StreamWriter, instance=True)
+    writer = StreamClientWriter(stream)
+
+    writer.write(b"abc")
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+    stream.write.assert_called_once_with(b"abc")
+    stream.drain.assert_awaited_once()
+    stream.close.assert_called_once_with()
+    stream.wait_closed.assert_awaited_once()
+
+
+def test_stream_client_writer_reset_arms_linger_and_aborts() -> None:
+    sock = create_autospec(socket.socket, instance=True)
+    stream = create_autospec(asyncio.StreamWriter, instance=True)
+    stream.get_extra_info.return_value = sock
+    stream.transport = create_autospec(asyncio.Transport, instance=True)
+
+    StreamClientWriter(stream).reset()
+
+    sock.setsockopt.assert_called_once_with(
+        socket.SOL_SOCKET, socket.SO_LINGER, pack_linger_option()
+    )
+    stream.transport.abort.assert_called_once_with()
 
 
 def _writer_stuck_in_shutdown(closed: asyncio.Event):

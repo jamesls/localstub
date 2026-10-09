@@ -20,7 +20,6 @@ from localstub.http.framing import (
 from localstub.http.headers import HeaderItem, Headers
 from localstub.http.stream import ByteStream
 from localstub.http.uri import ParsedURI, parse_absolute_uri
-from localstub.http.utils import headers_to_headers
 
 LOG = logging.getLogger(__name__)
 
@@ -221,7 +220,7 @@ class RecordedHTTPRequest:
         request = HTTPRequest(
             method=parsed.method or "",
             target=target,
-            headers=headers_to_headers(parsed.headers),
+            headers=Headers.from_raw_items(parsed.headers),
             body=_parsed_body(parsed),
         )
         return cls(
@@ -443,11 +442,7 @@ class _ReadStatus(Enum):
     ERROR = auto()
 
 
-def _chunk_limit_offset(
-    scan: ChunkPayloadScan,
-    scan_from: int,
-    budget: int,
-) -> int | None:
+def _chunk_limit_offset(scan: ChunkPayloadScan, budget: int) -> int | None:
     """Map a remaining payload budget to the wire offset to stop at.
 
     Returns the offset just past the last allowed payload byte and its
@@ -457,21 +452,18 @@ def _chunk_limit_offset(
     that chunk's data arrives. Otherwise, ``None`` means the caller
     needs the message boundary or more data to decide.
     """
-    spans = [*scan.payloads]
-    if scan.partial is not None:
-        spans.append(scan.partial)
+    has_partial = scan.partial is not None
     if budget == 0:
-        return scan_from if spans else None
+        return 0 if scan.payloads or has_partial else None
 
-    boundary = scan_from
     for index, (start, end) in enumerate(scan.payloads):
         size = end - start
         if size > budget:
             return start + budget
         budget -= size
-        boundary = end + 2
         if budget == 0:
-            return boundary if len(spans) > index + 1 else None
+            more = index + 1 < len(scan.payloads) or has_partial
+            return end + 2 if more else None
 
     if scan.partial is not None:
         start, end = scan.partial
@@ -921,9 +913,7 @@ class AsyncRequestParser:
                 )
 
             if max_body_bytes is not None:
-                stop_at = _chunk_limit_offset(
-                    scan, 0, max_body_bytes - counted
-                )
+                stop_at = _chunk_limit_offset(scan, max_body_bytes - counted)
                 if stop_at is not None:
                     return self._finish_chunked_prefix(
                         reader,
@@ -988,7 +978,7 @@ class AsyncRequestParser:
             # The scanner may have reached an error beyond the payload
             # limit. Rescan only the valid prefix before attributing it.
             scan = scan_chunk_payloads(buffer[: error.offset - 1])
-            stop_at = _chunk_limit_offset(scan, 0, budget)
+            stop_at = _chunk_limit_offset(scan, budget)
             if (
                 stop_at is None
                 and sum(end - start for start, end in scan.payloads) == budget

@@ -63,6 +63,7 @@ from localstub.server.connection import (
     SenderApp,
 )
 from localstub.server.transmission import Delay, FaultStep
+from tests.unit.server.fakes import RecordingSleep, fake_writer, settle
 
 CLIENT = ("127.0.0.1", 4321)
 TIMESTAMP = datetime(2026, 9, 7, tzinfo=UTC)
@@ -106,14 +107,6 @@ class _FixedTimestampProvider:
 class _RaisingTimestampProvider:
     def now(self) -> datetime:
         raise RuntimeError("no timestamps left")
-
-
-class _ImmediateSleep:
-    def __init__(self) -> None:
-        self.calls: list[float] = []
-
-    async def __call__(self, seconds: float) -> None:
-        self.calls.append(seconds)
 
 
 class _HeldSleep:
@@ -160,20 +153,6 @@ class _RaisingTransmission(TransmissionStrategy):
         raise self._error
 
 
-def _fake_writer(sock: socket.socket | None = None) -> Mock:
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    writer.is_closing.return_value = False
-    writer.get_extra_info.return_value = sock
-
-    def close() -> None:
-        writer.is_closing.return_value = True
-
-    writer.close.side_effect = close
-    writer.transport = create_autospec(asyncio.Transport, instance=True)
-    writer.transport.abort.side_effect = close
-    return writer
-
-
 def _held_close_writer() -> tuple[Mock, asyncio.Event]:
     """A writer whose close finishes only once the returned event is set."""
     release = asyncio.Event()
@@ -181,7 +160,7 @@ def _held_close_writer() -> tuple[Mock, asyncio.Event]:
     async def wait_closed() -> None:
         await release.wait()
 
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.wait_closed.side_effect = wait_closed
     return writer, release
 
@@ -238,7 +217,7 @@ def _harness(
     responded: list[str] = []
     forwarders: list[RawForwarder] = []
     stream_reader = asyncio.StreamReader() if reader is None else reader
-    stream_writer = _fake_writer() if writer is None else writer
+    stream_writer = fake_writer() if writer is None else writer
     state = ConnectionState(client=client, received=received, sent=sent)
     recorder = TrafficRecorder(None)
     policy = keep_alive or KeepAlivePolicy()
@@ -285,7 +264,7 @@ def _harness(
         services=ServerServices(
             timestamp_provider=timestamp_provider or _FixedTimestampProvider()
         ),
-        sleep=sleep or _ImmediateSleep(),
+        sleep=sleep or RecordingSleep(),
         track_forwarder=forwarders.append,
     )
     return Harness(
@@ -318,11 +297,6 @@ async def _continue(
 ) -> HeaderDecision:
     _ = ctx
     return await call_next()
-
-
-async def _settle() -> None:
-    for _ in range(5):
-        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
@@ -384,7 +358,7 @@ async def test_close_connection_records_close_response_writes_nothing() -> (
 
 @pytest.mark.asyncio
 async def test_close_connection_delay_waits_on_injected_sleep() -> None:
-    sleep = _ImmediateSleep()
+    sleep = RecordingSleep()
     harness = _harness(response=CloseConnection(delay=0.25), sleep=sleep)
     harness.feed(GET, eof=True)
 
@@ -396,7 +370,7 @@ async def test_close_connection_delay_waits_on_injected_sleep() -> None:
 
 @pytest.mark.asyncio
 async def test_close_connection_without_delay_never_sleeps() -> None:
-    sleep = _ImmediateSleep()
+    sleep = RecordingSleep()
     harness = _harness(response=CloseConnection(), sleep=sleep)
     harness.feed(GET, eof=True)
 
@@ -409,7 +383,7 @@ async def test_close_connection_without_delay_never_sleeps() -> None:
 async def test_close_connection_reset_arms_linger_and_aborts() -> None:
     sock = create_autospec(socket.socket, instance=True)
     harness = _harness(
-        response=CloseConnection(reset=True), writer=_fake_writer(sock)
+        response=CloseConnection(reset=True), writer=fake_writer(sock=sock)
     )
     harness.feed(GET, eof=True)
 
@@ -440,11 +414,11 @@ async def test_reset_setsockopt_failure_logs_warning_and_still_aborts(
     sock = create_autospec(socket.socket, instance=True)
     sock.setsockopt.side_effect = OSError("no linger here")
     harness = _harness(
-        response=CloseConnection(reset=True), writer=_fake_writer(sock)
+        response=CloseConnection(reset=True), writer=fake_writer(sock=sock)
     )
     harness.feed(GET, eof=True)
 
-    with caplog.at_level(logging.WARNING, logger="localstub.server"):
+    with caplog.at_level(logging.WARNING, logger="localstub.http.tcp"):
         closed = await harness.run()
 
     assert closed.reset
@@ -475,7 +449,7 @@ async def test_shutdown_interrupts_idle_wait_and_run_returns_normally() -> (
 ):
     harness = _harness()
     task = asyncio.create_task(harness.connection.run())
-    await _settle()
+    await settle()
 
     harness.connection.shutdown()
     await asyncio.wait_for(task, timeout=1.0)
@@ -501,7 +475,7 @@ async def test_shutdown_is_a_no_op_after_run_finished() -> None:
 async def test_cancelling_run_finalizes_once_and_reraises() -> None:
     harness = _harness()
     task = asyncio.create_task(harness.connection.run())
-    await _settle()
+    await settle()
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -519,13 +493,13 @@ async def test_cancelling_run_during_wait_closed_aborts_transport() -> None:
     async def wait_closed() -> None:
         await release.wait()
 
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.wait_closed.side_effect = wait_closed
     writer.transport.abort.side_effect = release.set
     harness = _harness(writer=writer)
     harness.feed(GET, eof=True)
     task = asyncio.create_task(harness.connection.run())
-    await _settle()
+    await settle()
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -774,7 +748,7 @@ async def test_close_during_request_chunked_split_reads_with_trailers() -> (
     harness = _harness(header_middlewares=[_close_after(6)])
     harness.feed(CHUNKED_HEAD + b"5;ext=1\r\nhel")
     task = asyncio.create_task(harness.connection.run())
-    await _settle()
+    await settle()
 
     assert harness.recorder.requests == []
     harness.feed(b"lo\r\n3\r\nabc\r\n0\r\nX-Trailer: v\r\n\r\n", eof=True)
@@ -850,7 +824,7 @@ async def test_header_middleware_unknown_decision_records_error() -> None:
 
 @pytest.mark.asyncio
 async def test_idle_timeout_fires_when_timer_wins() -> None:
-    sleep = _ImmediateSleep()
+    sleep = RecordingSleep()
     harness = _harness(keep_alive=KeepAlivePolicy(timeout=0.2), sleep=sleep)
     harness.feed(GET)
 
@@ -956,10 +930,10 @@ async def test_shutdown_after_loop_finished_aborts_pending_close() -> None:
 
 @pytest.mark.asyncio
 async def test_no_idle_timer_runs_before_the_first_request() -> None:
-    sleep = _ImmediateSleep()
+    sleep = RecordingSleep()
     harness = _harness(keep_alive=KeepAlivePolicy(timeout=0.2), sleep=sleep)
     task = asyncio.create_task(harness.connection.run())
-    await _settle()
+    await settle()
 
     assert sleep.calls == []
     harness.feed(GET)
@@ -979,7 +953,7 @@ async def test_idle_timer_disarmed_once_first_byte_arrives() -> None:
     await asyncio.wait_for(sleep.entered.wait(), timeout=1.0)
     sleep.entered.clear()
     harness.feed(GET_TWO[:1])
-    await _settle()
+    await settle()
     assert not sleep.entered.is_set()
     harness.feed(GET_TWO[1:])
     await asyncio.wait_for(sleep.entered.wait(), timeout=1.0)
@@ -1013,7 +987,7 @@ async def test_idle_wait_reads_buffered_next_request_without_duplication() -> (
 async def test_zero_timeout_closes_after_response_with_pipelined_request() -> (
     None
 ):
-    sleep = _ImmediateSleep()
+    sleep = RecordingSleep()
     harness = _harness(keep_alive=KeepAlivePolicy(timeout=0.0), sleep=sleep)
     harness.feed(GET + GET_TWO, eof=True)
 
@@ -1194,7 +1168,7 @@ async def test_shutdown_during_drop_close_retains_truncated_response(
         closing.set()
         await release.wait()
 
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.wait_closed.side_effect = wait_closed
     harness = _harness(
         response=HTTPResponse.text("abcdef"),
@@ -1238,7 +1212,7 @@ async def test_drop_connection_reset_arms_linger() -> None:
         transmission=FaultyTransmission([
             DropConnection(after_bytes=0, reset=True)
         ]),
-        writer=_fake_writer(sock),
+        writer=fake_writer(sock=sock),
     )
     harness.feed(GET, eof=True)
 
@@ -1266,7 +1240,7 @@ async def test_drop_connection_wins_over_planned_max_requests() -> None:
 
 @pytest.mark.asyncio
 async def test_drain_reset_records_client_reset_not_error() -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.drain.side_effect = ConnectionResetError("peer reset")
     harness = _harness(
         writer=writer, keep_alive=KeepAlivePolicy(max_requests=1)
@@ -1285,7 +1259,7 @@ async def test_drain_reset_records_client_reset_not_error() -> None:
 
 @pytest.mark.asyncio
 async def test_drain_broken_pipe_records_client_without_reset() -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.drain.side_effect = BrokenPipeError("gone")
     harness = _harness(writer=writer)
     harness.feed(GET, eof=True)
@@ -1310,7 +1284,7 @@ async def test_response_head_write_failure_records_client(
     transmission: TransmissionStrategy,
     error: OSError,
 ) -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.write.side_effect = error
     harness = _harness(
         writer=writer,
@@ -1341,7 +1315,7 @@ async def test_strategy_transport_failure_records_client(
     failure_site: str,
     error: OSError,
 ) -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     if failure_site == "write":
         writer.write.side_effect = [None, error]
     else:
@@ -1442,7 +1416,7 @@ async def test_shutdown_mid_upload_records_partial_request() -> None:
     harness = _harness()
     harness.feed(POST_HEAD + b"0123")
     task = asyncio.create_task(harness.connection.run())
-    await _settle()
+    await settle()
 
     harness.connection.shutdown()
     await asyncio.wait_for(task, timeout=1.0)
@@ -1460,7 +1434,7 @@ async def test_shutdown_mid_headers_records_nothing() -> None:
     harness = _harness()
     harness.feed(b"GET /partial HTTP/1.1\r\nHost:")
     task = asyncio.create_task(harness.connection.run())
-    await _settle()
+    await settle()
 
     harness.connection.shutdown()
     await asyncio.wait_for(task, timeout=1.0)
@@ -1584,7 +1558,7 @@ async def test_header_phase_write_failure_records_client(
         await ctx.send(response)
         return True
 
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.write.side_effect = error
     harness = _harness(header_middlewares=[answer], writer=writer)
     harness.feed(POST_HEAD, eof=True)
@@ -1651,7 +1625,7 @@ async def test_header_phase_send_drain_failure_preserves_response(
         await ctx.send(response)
         return True
 
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.drain.side_effect = drain_error
     harness = _harness(header_middlewares=[answer], writer=writer)
     harness.feed(POST_HEAD + b"0123456789", eof=True)
@@ -1850,7 +1824,7 @@ async def test_relay_client_transport_failure_records_client_response_body(
 
     forwarder = Mock(spec=RawForwarder)
     forwarder.forward_and_relay = AsyncMock(side_effect=relay)
-    writer = _fake_writer()
+    writer = fake_writer()
     if failure_site == "write":
         writer.write.side_effect = error
     else:
@@ -2149,7 +2123,7 @@ async def test_counting_stream_reader_cancelled_read_counts_nothing() -> None:
     reader = asyncio.StreamReader()
     counting = CountingStreamReader(reader, state)
     pending = asyncio.create_task(counting.read(4))
-    await _settle()
+    await settle()
 
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -2162,7 +2136,7 @@ async def test_counting_stream_reader_cancelled_read_counts_nothing() -> None:
 
 
 def test_recording_writer_abort_delegates_to_transport() -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     recording = RecordingStreamWriter(writer)
 
     recording.abort()
@@ -2171,9 +2145,16 @@ def test_recording_writer_abort_delegates_to_transport() -> None:
     writer.close.assert_not_called()
 
 
+def test_recording_writer_get_extra_info_delegates_to_stream() -> None:
+    recording = RecordingStreamWriter(fake_writer(peer=CLIENT))
+
+    assert recording.get_extra_info("peername") == CLIENT
+    assert recording.get_extra_info("missing", "fallback") == "fallback"
+
+
 def test_recording_writer_feeds_state_bytes_written() -> None:
     state = ConnectionState(client=None)
-    recording = RecordingStreamWriter(_fake_writer(), state=state)
+    recording = RecordingStreamWriter(fake_writer(), state=state)
 
     recording.write(b"abc")
     recording.write(b"")
@@ -2335,15 +2316,6 @@ async def test_recording_writer_cancelled_wait_keeps_shared_waiter() -> None:
     await asyncio.sleep(0)
 
 
-def test_pack_linger_option_uses_shorts_on_windows() -> None:
-    assert len(pack_linger_option(platform="win32")) == 4
-
-
-def test_pack_linger_option_uses_ints_elsewhere() -> None:
-    assert len(pack_linger_option(platform="linux")) == 8
-    assert len(pack_linger_option(platform="darwin")) == 8
-
-
 @pytest.mark.asyncio
 async def test_str_body_is_utf8_encoded_with_matching_content_length() -> None:
     harness = _harness(response=HTTPResponse(status=200, body="héllo"))
@@ -2380,7 +2352,7 @@ async def test_cancelling_run_while_finalizing_aborts_and_reraises() -> None:
     async def wait_closed() -> None:
         await release.wait()
 
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.wait_closed.side_effect = wait_closed
     writer.transport.abort.side_effect = release.set
     harness = _harness(writer=writer)
@@ -2388,7 +2360,7 @@ async def test_cancelling_run_while_finalizing_aborts_and_reraises() -> None:
         "client", "idle", reset=False, timestamp=TIMESTAMP
     )
     task = asyncio.create_task(harness.connection.run())
-    await _settle()
+    await settle()
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -2407,7 +2379,7 @@ async def test_finalize_on_shutdown_closes_then_aborts_without_waiting() -> (
     async def wait_closed() -> None:
         await release.wait()
 
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.wait_closed.side_effect = wait_closed
     writer.transport.abort.side_effect = release.set
     harness = _harness(writer=writer)
@@ -2421,7 +2393,7 @@ async def test_finalize_on_shutdown_closes_then_aborts_without_waiting() -> (
 
 
 def test_finalize_closes_writer_when_timestamp_provider_raises() -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     harness = _harness(
         writer=writer,
         reader=_ScriptedReader([]),
@@ -2439,7 +2411,7 @@ def test_finalize_closes_writer_when_timestamp_provider_raises() -> None:
 async def test_finalize_logs_wait_closed_failure_at_debug(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.wait_closed.side_effect = OSError("already gone")
     harness = _harness(writer=writer)
     harness.connection.shutdown()
@@ -2455,7 +2427,7 @@ async def test_finalize_logs_wait_closed_failure_at_debug(
 async def test_close_writer_logs_wait_closed_failure_at_debug(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.wait_closed.side_effect = OSError("already gone")
     harness = _harness(response=CloseConnection(), writer=writer)
     harness.feed(GET, eof=True)
@@ -2520,7 +2492,7 @@ async def test_shutdown_during_header_middleware_records_whole_request() -> (
 
 @pytest.mark.asyncio
 async def test_drain_failure_wins_over_planned_zero_timeout_close() -> None:
-    writer = _fake_writer()
+    writer = fake_writer()
     writer.drain.side_effect = BrokenPipeError("gone")
     harness = _harness(writer=writer, keep_alive=KeepAlivePolicy(timeout=0.0))
     harness.feed(GET, eof=True)
@@ -2558,7 +2530,7 @@ async def test_first_byte_probe_counts_bytes_once_after_unread() -> None:
     await asyncio.wait_for(sleep.entered.wait(), timeout=1.0)
 
     harness.feed(GET_TWO[:1])
-    await _settle()
+    await settle()
     harness.feed(GET_TWO[1:], eof=True)
     await asyncio.wait_for(task, timeout=1.0)
 
@@ -2570,7 +2542,7 @@ async def test_first_byte_probe_counts_bytes_once_after_unread() -> None:
 
 @pytest.mark.asyncio
 async def test_no_timeout_never_calls_sleep_between_requests() -> None:
-    sleep = _ImmediateSleep()
+    sleep = RecordingSleep()
     harness = _harness(sleep=sleep)
     harness.feed(GET + GET_TWO, eof=True)
 

@@ -3,25 +3,11 @@ from __future__ import annotations
 import pytest
 
 from localstub.http.utils import (
-    headers_to_headers,
     headers_to_message,
     message_from_items,
     serialize_header_line,
     status_phrase,
 )
-
-
-def test_headers_to_headers_decodes_ascii_values() -> None:
-    headers = headers_to_headers([(b"Content-Type", b"application/json")])
-
-    assert headers["Content-Type"] == "application/json"
-
-
-def test_headers_to_headers_exposes_obs_text_through_raw_view() -> None:
-    headers = headers_to_headers([(b"X-Obs", b"value-\x80\xff")])
-
-    assert isinstance(headers["X-Obs"], str)
-    assert headers.raw == ((b"X-Obs", b"value-\x80\xff"),)
 
 
 def test_headers_to_message_preserves_string_facade() -> None:

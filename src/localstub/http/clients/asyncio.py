@@ -14,12 +14,13 @@ from localstub.http.clients.pool import (
     PooledConnection,
 )
 from localstub.http.connection import response_allows_reuse
+from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequest
 from localstub.http.response import AsyncMultiResponseParser, ParsedResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.upstream import open_upstream_connection
 from localstub.http.uri import ParsedURI
-from localstub.http.utils import headers_to_headers, serialize_header_line
+from localstub.http.utils import serialize_header_line
 
 LOG = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ def _serialize_request(request: HTTPRequest, uri: ParsedURI) -> bytes:
 def _to_http_response(parsed: ParsedResponse) -> HTTPResponse:
     return HTTPResponse(
         status=parsed.status_code or 0,
-        headers=headers_to_headers(parsed.headers),
+        headers=Headers.from_raw_items(parsed.headers),
         body=parsed.body,
     )
 

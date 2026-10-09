@@ -8,7 +8,6 @@ from hypothesis import strategies as st
 
 from localstub.http.framing import (
     ChunkScanError,
-    chunk_payloads,
     content_length,
     is_chunked_transfer,
     scan_chunk_payloads,
@@ -94,27 +93,33 @@ def test_is_chunked_transfer_without_transfer_encoding_returns_false() -> None:
     assert not is_chunked_transfer([(b"Content-Length", b"5")])
 
 
-def test_scan_chunk_payloads_empty_chunk_size_raises_error_at_first_byte() -> (
-    None
-):
+@pytest.mark.parametrize(
+    ("buffer", "offset"),
+    [
+        (b"\r\nhello\r\n", 1),
+        (b"XYZ\r\nhello\r\n", 1),
+        (b";ext=1\r\nhello\r\n", 1),
+        (b"5\rXhello\r\n", 2),
+        (b"5\r\nhelloXY0\r\n\r\n", 9),
+        (b"5\r\nhello\rX0\r\n\r\n", 10),
+    ],
+    ids=[
+        "empty-size",
+        "non-hex-size",
+        "extension-without-size",
+        "bare-cr-after-size",
+        "bad-data-terminator",
+        "bad-data-terminator-lf",
+    ],
+)
+def test_scan_chunk_payloads_malformed_framing_raises_error_at_offset(
+    buffer: bytes,
+    offset: int,
+) -> None:
     with pytest.raises(ChunkScanError) as excinfo:
-        scan_chunk_payloads(bytearray(b"\r\nhello\r\n"))
+        scan_chunk_payloads(bytearray(buffer))
 
-    assert excinfo.value.offset == 1
-
-
-def test_scan_chunk_payloads_bare_cr_after_size_raises_error() -> None:
-    with pytest.raises(ChunkScanError) as excinfo:
-        scan_chunk_payloads(bytearray(b"5\rXhello\r\n"))
-
-    assert excinfo.value.offset == 2
-
-
-def test_scan_chunk_payloads_extension_without_size_raises_error() -> None:
-    with pytest.raises(ChunkScanError) as excinfo:
-        scan_chunk_payloads(bytearray(b";ext=1\r\nhello\r\n"))
-
-    assert excinfo.value.offset == 1
+    assert excinfo.value.offset == offset
 
 
 def test_scan_chunk_payloads_reports_complete_chunk_data_ranges() -> None:
@@ -188,60 +193,6 @@ def test_scan_chunk_payloads_incomplete_trailers_resume_at_terminal() -> None:
     assert scan.resume_from == 10
 
 
-def test_chunk_payloads_returns_single_chunk_data() -> None:
-    buffer = bytearray(b"5\r\nhello\r\n0\r\n\r\n")
-
-    assert chunk_payloads(buffer) == [b"hello"]
-
-
-def test_chunk_payloads_returns_multiple_chunk_data() -> None:
-    buffer = bytearray(b"5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n")
-
-    assert chunk_payloads(buffer) == [b"Hello", b" World"]
-
-
-def test_chunk_payloads_skips_chunk_extensions() -> None:
-    buffer = bytearray(b"5;name=value\r\nhello\r\n0\r\n\r\n")
-
-    assert chunk_payloads(buffer) == [b"hello"]
-
-
-def test_chunk_payloads_stops_at_terminal_chunk() -> None:
-    buffer = bytearray(b"5\r\nhello\r\n0\r\n\r\nGET /next HTTP/1.1\r\n\r\n")
-
-    assert chunk_payloads(buffer) == [b"hello"]
-
-
-def test_chunk_payloads_ignores_trailers() -> None:
-    buffer = bytearray(b"5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n")
-
-    assert chunk_payloads(buffer) == [b"hello"]
-
-
-def test_chunk_payloads_truncated_returns_complete_chunks() -> None:
-    buffer = bytearray(b"5\r\nhello\r\n3\r\nab")
-
-    assert chunk_payloads(buffer) == [b"hello"]
-
-
-def test_chunk_payloads_empty_buffer_returns_no_payloads() -> None:
-    assert chunk_payloads(bytearray()) == []
-
-
-def test_chunk_payloads_malformed_size_raises_error() -> None:
-    buffer = bytearray(b"XYZ\r\nhello\r\n")
-
-    with pytest.raises(ChunkScanError):
-        chunk_payloads(buffer)
-
-
-def test_chunk_payloads_bad_chunk_terminator_raises_error() -> None:
-    buffer = bytearray(b"5\r\nhelloXY0\r\n\r\n")
-
-    with pytest.raises(ChunkScanError):
-        chunk_payloads(buffer)
-
-
 @st.composite
 def _incremental_scan_cases(
     draw: st.DrawFn,
@@ -264,11 +215,17 @@ SCANNER_INPUTS = st.one_of(
 )
 
 
-@given(body=chunked_bodies())
-def test_chunk_payloads_roundtrip_recovers_encoded_payloads(
+@given(body=chunked_bodies(), garbage=st.binary(max_size=32))
+def test_scan_chunk_payloads_roundtrip_locates_encoded_payloads(
     body: ChunkedBody,
+    garbage: bytes,
 ) -> None:
-    assert chunk_payloads(bytearray(body.encoded)) == body.payloads
+    buffer = bytearray(body.encoded + garbage)
+
+    scan = scan_chunk_payloads(buffer)
+
+    payloads = [bytes(buffer[start:end]) for start, end in scan.payloads]
+    assert payloads == body.payloads
 
 
 @given(body=chunked_bodies())
@@ -311,14 +268,6 @@ def test_scan_chunked_body_ignores_bytes_after_terminal_chunk(
     assert scan.end == len(body.encoded)
 
 
-@given(body=chunked_bodies(), garbage=st.binary(min_size=1, max_size=32))
-def test_chunk_payloads_ignores_bytes_after_terminal_chunk(
-    body: ChunkedBody,
-    garbage: bytes,
-) -> None:
-    assert chunk_payloads(bytearray(body.encoded + garbage)) == body.payloads
-
-
 @given(data=SCANNER_INPUTS)
 def test_scan_chunked_body_arbitrary_input_scans_or_raises_scan_error(
     data: bytes,
@@ -332,16 +281,3 @@ def test_scan_chunked_body_arbitrary_input_scans_or_raises_scan_error(
         assert 0 <= scan.resume_from <= len(buffer)
         if scan.end is not None:
             assert scan.end == scan.resume_from
-
-
-@given(data=SCANNER_INPUTS)
-def test_chunk_payloads_arbitrary_input_returns_list_or_raises_scan_error(
-    data: bytes,
-) -> None:
-    buffer = bytearray(data)
-    try:
-        payloads = chunk_payloads(buffer)
-    except ChunkScanError as exc:
-        assert 1 <= exc.offset <= len(buffer)
-    else:
-        assert all(isinstance(payload, bytes) for payload in payloads)

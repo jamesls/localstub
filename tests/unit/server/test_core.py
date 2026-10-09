@@ -34,6 +34,7 @@ from localstub.server import (
     SendResponse,
 )
 from localstub.throttle import ThrottleDecision
+from tests.unit.server.fakes import RecordingSleep, fake_writer, settle
 
 CLIENT = ("127.0.0.1", 4321)
 GET = b"GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n"
@@ -44,31 +45,6 @@ POST_HEAD = (
 PROXY_GET = (
     b"GET http://upstream.test/x HTTP/1.1\r\nHost: upstream.test\r\n\r\n"
 )
-
-
-class _RecordingSleep:
-    def __init__(self) -> None:
-        self.calls: list[float] = []
-
-    async def __call__(self, seconds: float) -> None:
-        self.calls.append(seconds)
-
-
-def _fake_writer(peer: tuple[str, int] | None = CLIENT) -> Mock:
-    writer = create_autospec(asyncio.StreamWriter, instance=True)
-    writer.is_closing.return_value = False
-
-    def get_extra_info(name: str, default: Any = None) -> Any:
-        return peer if name == "peername" else default
-
-    def close() -> None:
-        writer.is_closing.return_value = True
-
-    writer.get_extra_info.side_effect = get_extra_info
-    writer.close.side_effect = close
-    writer.transport = create_autospec(asyncio.Transport, instance=True)
-    writer.transport.abort.side_effect = close
-    return writer
 
 
 def _reader(data: bytes = b"", *, eof: bool = True) -> asyncio.StreamReader:
@@ -96,16 +72,11 @@ async def _converse(
     eof: bool = True,
     writer: Mock | None = None,
 ) -> ConnectionClosed:
-    writer = _fake_writer() if writer is None else writer
+    writer = fake_writer(peer=CLIENT) if writer is None else writer
     await server.handle_http_connection(_reader(data, eof=eof), writer)
     closed = server.last_closed_connection
     assert closed is not None
     return closed
-
-
-async def _settle() -> None:
-    for _ in range(5):
-        await asyncio.sleep(0)
 
 
 async def _expect_eof(sock: socket.socket) -> None:
@@ -203,7 +174,7 @@ async def test_close_connection_default_response_closes_each_request() -> None:
 @pytest.mark.asyncio
 async def test_constructor_max_requests_per_connection_seeds_policy() -> None:
     server = AsyncHTTPTestServer(max_requests_per_connection=1)
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
 
     closed = await _converse(server, GET + GET_TWO, writer=writer)
 
@@ -214,7 +185,7 @@ async def test_constructor_max_requests_per_connection_seeds_policy() -> None:
 
 @pytest.mark.asyncio
 async def test_constructor_keep_alive_timeout_seeds_policy_via_sleep() -> None:
-    sleep = _RecordingSleep()
+    sleep = RecordingSleep()
     server = AsyncHTTPTestServer(keep_alive_timeout=0.2, sleep=sleep)
 
     closed = await _converse(server, GET, eof=False)
@@ -241,7 +212,7 @@ def test_set_keep_alive_rejects_max_requests_below_one() -> None:
 async def test_set_keep_alive_replaces_every_earlier_setting() -> None:
     server = AsyncHTTPTestServer()
     server.set_keep_alive(max_requests=1, advertise=True)
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
 
     server.set_keep_alive(timeout=5)
     closed = await _converse(server, GET + GET_TWO, writer=writer)
@@ -335,9 +306,11 @@ async def test_aclose_without_listener_shuts_down_handed_off_connection() -> (
 ):
     server = AsyncHTTPTestServer()
     task = asyncio.create_task(
-        server.handle_http_connection(_reader(eof=False), _fake_writer())
+        server.handle_http_connection(
+            _reader(eof=False), fake_writer(peer=CLIENT)
+        )
     )
-    await _settle()
+    await settle()
 
     await server.aclose()
     await asyncio.wait_for(task, timeout=1.0)
@@ -353,11 +326,11 @@ async def test_close_http_connection_shuts_down_the_tracked_connection() -> (
     None
 ):
     server = AsyncHTTPTestServer()
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
     task = asyncio.create_task(
         server.handle_http_connection(_reader(eof=False), writer)
     )
-    await _settle()
+    await settle()
 
     server.close_http_connection(writer)
     await asyncio.wait_for(task, timeout=1.0)
@@ -371,7 +344,7 @@ async def test_close_http_connection_after_finish_records_nothing_more() -> (
     None
 ):
     server = AsyncHTTPTestServer()
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
     closed = await _converse(server, GET, writer=writer)
 
     server.close_http_connection(writer)
@@ -383,7 +356,7 @@ async def test_close_http_connection_after_finish_records_nothing_more() -> (
 def test_close_http_connection_ignores_untracked_writer() -> None:
     server = AsyncHTTPTestServer()
 
-    server.close_http_connection(_fake_writer())
+    server.close_http_connection(fake_writer(peer=CLIENT))
 
     assert server.closed_connections == []
 
@@ -396,7 +369,7 @@ async def test_connection_handed_off_while_closing_records_shutdown_idle() -> (
     await server.start()
     closing = asyncio.create_task(server.aclose())
     await asyncio.sleep(0)
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
 
     await server.handle_http_connection(_reader(GET, eof=False), writer)
     await asyncio.wait_for(closing, timeout=1.0)
@@ -419,7 +392,7 @@ async def test_aclose_does_not_wait_for_handed_off_transport_to_close() -> (
     closing = asyncio.create_task(server.aclose())
     await asyncio.sleep(0)
     transport_closed = asyncio.Event()
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
     writer.wait_closed.side_effect = transport_closed.wait
     handoff = asyncio.create_task(
         server.handle_http_connection(_reader(eof=False), writer)
@@ -445,7 +418,7 @@ async def test_handler_calling_aclose_on_own_connection_finishes_request() -> (
         return HTTPResponse.text("done")
 
     server.handler = handler
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
 
     closed = await asyncio.wait_for(
         _converse(server, GET + GET_TWO, writer=writer), timeout=1.0
@@ -502,7 +475,7 @@ async def test_handler_calling_aclose_on_started_server_closes_others() -> (
     idle.setblocking(False)
     reader, writer = await asyncio.open_connection(*_listening(server))
     try:
-        await _settle()
+        await settle()
         writer.write(GET)
         response = await asyncio.wait_for(reader.read(), timeout=1.0)
         await _expect_eof(idle)
@@ -699,10 +672,10 @@ async def test_aclose_unwinds_handed_off_forward_before_aborting_closes(
         await server.start()
     task = asyncio.create_task(
         server.handle_http_connection(
-            _reader(PROXY_GET, eof=False), _fake_writer()
+            _reader(PROXY_GET, eof=False), fake_writer(peer=CLIENT)
         )
     )
-    await _settle()
+    await settle()
 
     await asyncio.wait_for(server.aclose(), timeout=1.0)
     await asyncio.wait_for(task, timeout=1.0)
@@ -723,7 +696,7 @@ async def test_handler_calling_aclose_on_handed_off_connection_finishes() -> (
 
     server.handler = handler
     await server.start()
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
 
     closed = await asyncio.wait_for(
         _converse(server, GET + GET_TWO, writer=writer), timeout=1.0
@@ -781,7 +754,7 @@ async def test_retained_bytes_accumulate_across_a_clients_connections() -> (
 @pytest.mark.asyncio
 async def test_max_connection_bytes_zero_still_counts_bytes() -> None:
     server = AsyncHTTPTestServer(max_connection_bytes=0)
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
 
     closed = await _converse(server, GET, writer=writer)
 
@@ -795,7 +768,7 @@ async def test_max_connection_bytes_zero_still_counts_bytes() -> None:
 @pytest.mark.asyncio
 async def test_same_writer_handed_off_twice_keeps_second_tracked() -> None:
     server = AsyncHTTPTestServer()
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
     reader_one = _reader(eof=False)
     first = asyncio.create_task(
         server.handle_http_connection(reader_one, writer)
@@ -803,7 +776,7 @@ async def test_same_writer_handed_off_twice_keeps_second_tracked() -> None:
     second = asyncio.create_task(
         server.handle_http_connection(_reader(eof=False), writer)
     )
-    await _settle()
+    await settle()
 
     reader_one.feed_eof()
     await asyncio.wait_for(first, timeout=1.0)
@@ -819,7 +792,7 @@ async def test_same_writer_handed_off_twice_keeps_second_tracked() -> None:
 @pytest.mark.asyncio
 async def test_handed_off_reader_read_ahead_is_served_and_recorded() -> None:
     server = AsyncHTTPTestServer()
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
     reader = _reader(GET + GET_TWO)
     first = await HTTPRequestReader().read_request(reader)
     assert first is not None
@@ -909,7 +882,7 @@ async def test_cached_head_tracks_response_mutations_and_live_policy() -> None:
     response = HTTPResponse(body=b"x")
     server = AsyncHTTPTestServer(default_response=response)
     reader = _reader(eof=False)
-    writer = _fake_writer()
+    writer = fake_writer(peer=CLIENT)
     task = asyncio.create_task(server.handle_http_connection(reader, writer))
     cases = [
         (200, "a", b"x", b"X-Test: a\r\nContent-Length: 1\r\n\r\nx"),

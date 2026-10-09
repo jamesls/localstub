@@ -19,6 +19,7 @@ from localstub.forward import (
     ForwardError,
     RawForwarder,
     ResponseTransformer,
+    StreamClientWriter,
     TransformContext,
     TransformResult,
     response_allows_keep_alive,
@@ -33,11 +34,13 @@ from localstub.http.request import (
 from localstub.http.response import (
     RecordedHTTPResponse,
 )
+from localstub.http.uri import format_host
 from localstub.recording import (
     DEFAULT_RECORDING_BUFFER_SIZE,
     TrafficRecorder,
 )
-from localstub.server import AsyncHTTPTestServer, RecordingStreamWriter
+from localstub.server import AsyncHTTPTestServer
+from localstub.server.transmission import apply_fault_steps
 
 LOG = logging.getLogger(__name__)
 _SHUTDOWN_DRAIN_TURNS = 8
@@ -197,7 +200,7 @@ class AsyncTLSInterceptProxy:
     def endpoint_url(self) -> str:
         if self._host is None or self._port is None:
             raise RuntimeError("Proxy not started yet")
-        return f'http://{self._host}:{self._port}'
+        return f'http://{format_host(self._host)}:{self._port}'
 
     @property
     def ca(self) -> TLSProxyCA:
@@ -706,7 +709,7 @@ class AsyncTLSInterceptProxy:
 
             final_response = await self._forwarder.read_and_relay_responses(
                 upstream_reader=upstream_reader,
-                client_writer=RecordingStreamWriter(client_writer),
+                client_writer=StreamClientWriter(client_writer),
                 request_method=final_parsed.method,
                 upstream_id=upstream_id,
                 client_id=client_id,
@@ -757,7 +760,7 @@ class AsyncTLSInterceptProxy:
             header_wire_bytes=header_wire,
             remaining_buffer=remaining,
             client_reader=client_reader,
-            client_writer=RecordingStreamWriter(client_writer),
+            client_writer=StreamClientWriter(client_writer),
             upstream_reader=upstream_reader,
             upstream_writer=upstream_writer,
             request_method=parsed.method,
@@ -893,24 +896,12 @@ def fault_step_transformer(
     """
 
     def transform(context: TransformContext) -> TransformResult:
-        body = context.body
-        total_delay = 0.0
-        drop_after: int | None = None
-        drop_reset = False
-
-        for step in steps:
-            result = step.apply(body)
-            body = result.body
-            total_delay += result.delay_before
-            if drop_after is None and result.drop_after is not None:
-                drop_after = result.drop_after
-                drop_reset = result.drop_reset
-
+        result = apply_fault_steps(steps, context.body)
         return TransformResult(
-            body=body,
-            delay_before=total_delay,
-            drop_after=drop_after,
-            drop_reset=drop_reset,
+            body=result.body,
+            delay_before=result.delay_before,
+            drop_after=result.drop_after,
+            drop_reset=result.drop_reset,
         )
 
     return transform

@@ -427,13 +427,7 @@ class ConnectionPool:
             state.idle.remove(connection)
         state.open_count -= 1
         state.condition.notify_all()
-        try:
-            connection.close()
-        except Exception:
-            LOG.debug("Failed to close pooled connection", exc_info=True)
-        task = asyncio.create_task(self._drain(connection))
-        self._drains.add(task)
-        task.add_done_callback(self._drains.discard)
+        self._close_writer(connection.writer)
 
     def _close_writer(self, writer: asyncio.StreamWriter) -> None:
         """Initiate and track shutdown for an opened stream writer."""
@@ -444,12 +438,6 @@ class ConnectionPool:
         task = asyncio.create_task(self._drain_writer(writer))
         self._drains.add(task)
         task.add_done_callback(self._drains.discard)
-
-    async def _drain(self, connection: PooledConnection) -> None:
-        try:
-            await connection.wait_closed()
-        except OSError:
-            LOG.debug("Error while draining pooled connection", exc_info=True)
 
     async def _drain_writer(self, writer: asyncio.StreamWriter) -> None:
         try:

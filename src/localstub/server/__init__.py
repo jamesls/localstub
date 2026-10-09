@@ -21,6 +21,7 @@ from localstub.http.request import (
 )
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
+from localstub.http.tcp import pack_linger_option
 from localstub.middleware import (
     CloseConnection,
     CloseDuringRequest,
@@ -36,7 +37,6 @@ from localstub.server.connection import (
     KeepAlivePolicy,
     RecordingStreamWriter,
     RequestPipeline,
-    pack_linger_option,
 )
 from localstub.server.core import (
     AsyncHTTPTestServer,

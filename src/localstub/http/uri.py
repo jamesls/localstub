@@ -8,6 +8,11 @@ from urllib.parse import urlsplit
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
+def format_host(host: str) -> str:
+    """Bracket an IPv6 literal (``[::1]``) so it reads apart from a port."""
+    return f"[{host}]" if ":" in host else host
+
+
 @dataclass(frozen=True)
 class ParsedURI:
     """Parsed components of an absolute-form URI.
@@ -30,7 +35,7 @@ class ParsedURI:
         default for the scheme, so ``http://example.com:443/`` keeps
         its explicit port.
         """
-        host = f"[{self.host}]" if ":" in self.host else self.host
+        host = format_host(self.host)
         if self.port == _DEFAULT_PORTS.get(self.scheme):
             return host
         return f"{host}:{self.port}"
@@ -81,10 +86,8 @@ def parse_absolute_uri(uri: str) -> ParsedURI | None:
     # Determine default port based on scheme
     if parsed_port is not None:
         port = parsed_port
-    elif parsed.scheme == "https":
-        port = 443
     else:
-        port = 80
+        port = _DEFAULT_PORTS.get(parsed.scheme, 80)
 
     # Build path with query string
     path = parsed.path or "/"

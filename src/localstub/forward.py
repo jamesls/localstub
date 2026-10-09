@@ -30,6 +30,7 @@ from localstub.http.response import (
 )
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.stream import ByteStream
+from localstub.http.tcp import reset_stream
 from localstub.http.upstream import open_upstream_connection
 from localstub.http.utils import (
     decode_status_text,
@@ -63,6 +64,30 @@ class ClientWriter(Protocol):
     def reset(self) -> None: ...
 
     async def wait_closed(self) -> None: ...
+
+
+class StreamClientWriter:
+    """Adapt an ``asyncio.StreamWriter`` to ``ClientWriter``."""
+
+    def __init__(self, writer: asyncio.StreamWriter) -> None:
+        self._writer = writer
+
+    def write(self, data: bytes) -> None:
+        self._writer.write(data)
+
+    async def drain(self) -> None:
+        await self._writer.drain()
+
+    def close(self) -> None:
+        self._writer.close()
+
+    def reset(self) -> None:
+        reset_stream(self._writer)
+
+    async def wait_closed(self) -> None:
+        # Shielded so cancelling the relay does not cancel the close
+        # future the stream shares with its owner.
+        await asyncio.shield(self._writer.wait_closed())
 
 
 @dataclass
@@ -160,16 +185,13 @@ def response_allows_keep_alive(
     HTTP/1.0 response that did not opt in to keep-alive.
     """
     relayed = result.relayed
-    if relayed.status == 101:
-        # The connection now speaks the upgraded protocol; without a
-        # bidirectional relay it cannot carry further HTTP.
-        return False
     if relayed.is_eof_delimited:
         return False
     return not should_close_connection(
         request,
         response_headers=relayed.headers,
         response_version=relayed.http_version,
+        response_status=relayed.status,
     )
 
 
