@@ -24,6 +24,7 @@ from localstub import (
 )
 from localstub.forward import RawForwarder
 from localstub.tlsproxy import fault_step_transformer
+from tests.integration.wire import read_http_response
 
 TIMEOUT = 2.0
 GET_REQUEST = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
@@ -85,24 +86,6 @@ async def _exchange_raw(
         return await _read_to_end(reader)
     finally:
         await _close(writer)
-
-
-def _content_length(head: bytes) -> int:
-    for line in head.split(b"\r\n"):
-        name, sep, value = line.partition(b":")
-        if sep and name.strip().lower() == b"content-length":
-            return int(value.strip())
-    return 0
-
-
-async def _read_response(reader: asyncio.StreamReader) -> bytes:
-    head = await asyncio.wait_for(
-        reader.readuntil(b"\r\n\r\n"), timeout=TIMEOUT
-    )
-    body = await asyncio.wait_for(
-        reader.readexactly(_content_length(head)), timeout=TIMEOUT
-    )
-    return head + body
 
 
 @reset_observable
@@ -618,11 +601,11 @@ async def test_header_phase_final_send_then_true_skips_responder() -> None:
                 b"Host: localhost\r\n"
                 b"Content-Length: 5\r\n\r\nhello",
             )
-            first = await _read_response(reader)
+            first = await read_http_response(reader, timeout=TIMEOUT)
             await _send(
                 writer, b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n"
             )
-            second = await _read_response(reader)
+            second = await read_http_response(reader, timeout=TIMEOUT)
         finally:
             await _close(writer)
 
@@ -660,7 +643,7 @@ async def test_header_phase_second_final_send_raises_runtime_error() -> None:
         reader, writer = await _connect(server)
         try:
             await _send(writer, GET_REQUEST)
-            response = await _read_response(reader)
+            response = await read_http_response(reader, timeout=TIMEOUT)
         finally:
             await _close(writer)
 
@@ -778,7 +761,7 @@ async def test_aclose_records_shutdown_for_idle_raw_client() -> None:
     reader, writer = await _connect(server)
     try:
         await _send(writer, GET_REQUEST)
-        await _read_response(reader)
+        await read_http_response(reader, timeout=TIMEOUT)
         await asyncio.wait_for(server.aclose(), timeout=TIMEOUT)
         data, _ = await _read_to_end(reader)
     finally:

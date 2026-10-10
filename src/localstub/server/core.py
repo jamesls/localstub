@@ -17,6 +17,7 @@ from localstub.http.request import (
 )
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HeadersLike, HTTPResponse
+from localstub.http.uri import format_host
 from localstub.http.utils import maybe_await
 from localstub.middleware import (
     CloseConnection,
@@ -264,8 +265,7 @@ class AsyncHTTPTestServer:
     def url(self) -> str:
         if self.host is None or self.port is None:
             raise RuntimeError("Server not started yet")
-        host = f"[{self.host}]" if ":" in self.host else self.host
-        return f"http://{host}:{self.port}/"
+        return f"http://{format_host(self.host)}:{self.port}/"
 
     @property
     def handler(self) -> ResponderHandler | None:

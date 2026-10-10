@@ -24,10 +24,6 @@ def maybe_await[T](value: T | Awaitable[T]) -> Awaitable[T]:
     return done()
 
 
-def headers_to_headers(headers: list[tuple[bytes, bytes]]) -> Headers:
-    return Headers.from_raw_items(headers)
-
-
 def serialize_header_line(name: str, value: str) -> bytes:
     """Serialize a header from the reversible string facade."""
     return name.encode("ascii") + b": " + value.encode("latin-1") + b"\r\n"
@@ -65,4 +61,4 @@ def message_from_items(items: Iterable[tuple[str, str]]) -> Message:
 
 def headers_to_message(headers: list[tuple[bytes, bytes]]) -> Message:
     """Convert parsed headers through the reversible string facade."""
-    return message_from_items(headers_to_headers(headers).items())
+    return message_from_items(Headers.from_raw_items(headers).items())

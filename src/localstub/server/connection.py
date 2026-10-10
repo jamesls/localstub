@@ -16,9 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
-import struct
-import sys
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,10 +26,11 @@ from localstub.forward import RawForwarder, response_allows_keep_alive
 from localstub.http import stream
 from localstub.http.connection import (
     ConnectionRequest,
+    parse_connection_tokens,
     should_close_connection,
 )
 from localstub.http.exchange import ClosePhase, CloseReason, ConnectionClosed
-from localstub.http.headers import HeaderItem
+from localstub.http.headers import HeaderItem, Headers
 from localstub.http.request import (
     AsyncRequestParser,
     HTTPRequestHeaders,
@@ -43,11 +41,8 @@ from localstub.http.request import (
 )
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
-from localstub.http.utils import (
-    headers_to_headers,
-    serialize_header_line,
-    status_phrase,
-)
+from localstub.http.tcp import reset_stream
+from localstub.http.utils import serialize_header_line, status_phrase
 from localstub.middleware import (
     CloseConnection,
     CloseDuringRequest,
@@ -90,17 +85,6 @@ class ConnectionLost(Exception):
     is raised, so the loop only needs to stop; it is not an error in
     user code and is logged at debug level.
     """
-
-
-def pack_linger_option(*, platform: str = sys.platform) -> bytes:
-    """Pack the ``SO_LINGER`` value that turns close into a TCP reset.
-
-    The option is a C struct with no Python constant: Linux and macOS
-    define it as two ints, Windows as two unsigned shorts, and the
-    kernel rejects the wrong size.
-    """
-    layout = "HH" if platform == "win32" else "ii"
-    return struct.pack(layout, 1, 0)
 
 
 @lru_cache(maxsize=128)
@@ -180,8 +164,7 @@ def _with_connection_token(
     for index, (name, value) in enumerate(items):
         if name.lower() != "connection":
             continue
-        tokens = {part.strip().lower() for part in value.split(",")}
-        if token not in tokens:
+        if token not in parse_connection_tokens(value):
             items[index] = (name, f"{value}, {token}")
         return items
     items.append(("Connection", token))
@@ -443,19 +426,7 @@ class RecordingStreamWriter:
 
     def reset(self) -> None:
         """Request an abortive TCP close, even after writes have drained."""
-        sock = self.get_extra_info("socket")
-        if sock is not None:
-            try:
-                sock.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_LINGER, pack_linger_option()
-                )
-            except OSError:
-                LOG.warning(
-                    "Could not request a TCP reset; the client may observe "
-                    "EOF instead",
-                    exc_info=True,
-                )
-        self.abort()
+        reset_stream(self._writer)
 
     async def wait_closed(self) -> None:
         """Wait for the transport to close.
@@ -506,7 +477,6 @@ class _Reading(NamedTuple):
     state: dict[str, Any]
     request_timestamp: datetime
     received_monotonic: float
-    responded: bool
 
 
 class HTTPConnection:
@@ -533,6 +503,7 @@ class HTTPConnection:
         self._sleep = sleep
         self._track_forwarder = track_forwarder
         self._sink = ConsumedByteSink(state)
+        self._meta = ConnectionMeta(client=state.client)
         self._policy = KeepAlivePolicy()
         self._child: asyncio.Task[None] | None = None
         self._finalized = False
@@ -800,7 +771,11 @@ class HTTPConnection:
                 max_body_bytes=fault.after_body_bytes,
             ),
         )
-        self._close_during_request(outcome, fault.reset)
+        self._start_close(
+            self._record_interrupted(
+                outcome, "request_read", reset=fault.reset
+            )
+        )
         return None
 
     async def _interruptible[T](
@@ -828,7 +803,10 @@ class HTTPConnection:
         self,
         outcome: ParseOutcome,
         reason: CloseReason,
-    ) -> None:
+        *,
+        reset: bool = False,
+    ) -> ConnectionClosed:
+        """Record a request whose read was stopped, and decide the close."""
         state = self._state
         parsed = outcome.parsed
         assert parsed is not None
@@ -837,10 +815,11 @@ class HTTPConnection:
         )
         request_timestamp, _ = self._recorder.record_request(request)
         self._track_boundary(parsed)
-        self._decide(reason, state.phase)
+        event = self._decide(reason, state.phase, reset=reset)
         self._record_exchange(
             request, request_timestamp, response=state.final_response
         )
+        return event
 
     async def _header_stage(
         self,
@@ -874,7 +853,7 @@ class HTTPConnection:
                 else None
             ),
             http_version=parsed.http_version,
-            headers=headers_to_headers(parsed.headers),
+            headers=Headers.from_raw_items(parsed.headers),
             wire_raw_bytes=header_wire,
         )
 
@@ -883,7 +862,7 @@ class HTTPConnection:
 
         return HeaderContext(
             headers=partial,
-            connection=ConnectionMeta(client=self._state.client),
+            connection=self._meta,
             services=self._services,
             send=send,
             state=request_state,
@@ -930,6 +909,20 @@ class HTTPConnection:
     ) -> RecordedHTTPResponse:
         writer = self._writer
         writer.start_response()
+        head, wire_body = self._encode_response(
+            partial.method, response, close=close
+        )
+        self._write(head + wire_body)
+        return self._build_recorded_response(response, writer.bytes_sent)
+
+    def _encode_response(
+        self,
+        method: str | None,
+        response: HTTPResponse,
+        *,
+        close: bool,
+    ) -> tuple[bytes, bytes]:
+        """Return the response head and the body as sent on the wire."""
         body = _normalize_body(response.body)
         head = _serialize_response_head(
             response.status,
@@ -938,11 +931,8 @@ class HTTPConnection:
             close,
             self._policy.keep_alive_hint(),
         )
-        wire_body = (
-            body if _body_allowed(partial.method, response.status) else b""
-        )
-        self._write(head + wire_body)
-        return self._build_recorded_response(response, writer.bytes_sent)
+        wire_body = body if _body_allowed(method, response.status) else b""
+        return head, wire_body
 
     def _complete_reading(
         self,
@@ -959,15 +949,10 @@ class HTTPConnection:
         request_timestamp, received_monotonic = self._recorder.record_request(
             request
         )
-        if parsed.is_complete and outcome.stop is ParseStop.COMPLETE:
-            if state.phase != "response":
-                self._track_boundary(parsed)
+        if outcome.complete_request is not None:
+            self._track_boundary(parsed)
             return _Reading(
-                request,
-                request_state,
-                request_timestamp,
-                received_monotonic,
-                state.final_response is not None,
+                request, request_state, request_timestamp, received_monotonic
             )
         state.phase = "request_body"
         self._decide_read_stop(outcome)
@@ -976,7 +961,7 @@ class HTTPConnection:
         )
         return None
 
-    def _decide_read_stop(self, outcome: ParseOutcome) -> ConnectionClosed:
+    def _decide_read_stop(self, outcome: ParseOutcome) -> None:
         """Decide the close for a request read that stopped short.
 
         ``_await_first_byte`` has already seen a byte of this request,
@@ -987,31 +972,12 @@ class HTTPConnection:
             "request_body" if outcome.parsed is not None else "request_headers"
         )
         if outcome.stop is ParseStop.PARSE_ERROR:
-            return self._decide("protocol_error", phase)
-        if outcome.stop is ParseStop.READ_ERROR:
+            self._decide("protocol_error", phase)
+        elif outcome.stop is ParseStop.READ_ERROR:
             reset = isinstance(outcome.error, ConnectionResetError)
-            return self._decide("client", phase, reset=reset)
-        return self._decide("client", phase)
-
-    def _close_during_request(
-        self,
-        outcome: ParseOutcome,
-        reset: bool,
-    ) -> None:
-        """Record and start the close header middleware decided on."""
-        state = self._state
-        parsed = outcome.parsed
-        assert parsed is not None
-        request = RecordedHTTPRequest.from_parsed(
-            parsed, outcome.wire_bytes, client=state.client
-        )
-        request_timestamp, _ = self._recorder.record_request(request)
-        self._track_boundary(parsed)
-        event = self._decide("request_read", state.phase, reset=reset)
-        self._record_exchange(
-            request, request_timestamp, response=state.final_response
-        )
-        self._start_close(event)
+            self._decide("client", phase, reset=reset)
+        else:
+            self._decide("client", phase)
 
     def _track_boundary(self, parsed: ParsedRequest) -> None:
         """Advance the phase once the request's headers have been read.
@@ -1062,7 +1028,8 @@ class HTTPConnection:
         state.phase = "response"
         self._sending = None
         try:
-            if reading.responded:
+            if state.final_response is not None:
+                # Header middleware already sent the final response.
                 result = SendResult(
                     recorded=state.final_response,
                     should_close=self._final_send_close,
@@ -1141,13 +1108,11 @@ class HTTPConnection:
 
         sender = self._pipeline.sender(self._send_response)
         responder = self._pipeline.responder(capture)
-        connection: ConnectionMeta | None = None
         if callable(responder):
-            connection = ConnectionMeta(client=self._state.client)
             response_spec = await responder(
                 ResponderContext(
                     request=request,
-                    connection=connection,
+                    connection=self._meta,
                     services=self._services,
                     state=reading.state,
                     received_monotonic=reading.received_monotonic,
@@ -1159,11 +1124,9 @@ class HTTPConnection:
             return await self._send_request_response(
                 sender_request, response_spec
             )
-        if connection is None:
-            connection = ConnectionMeta(client=self._state.client)
         sender_ctx = SenderContext(
             request=sender_request,
-            connection=connection,
+            connection=self._meta,
             services=self._services,
             state=reading.state,
         )
@@ -1275,19 +1238,11 @@ class HTTPConnection:
         request: RecordedHTTPRequest,
     ) -> tuple[bool, AbortTransmission | None]:
         writer = self._writer
-        body = _normalize_body(response.body)
-        wire_body = (
-            body if _body_allowed(request.method, response.status) else b""
-        )
         should_close = self._should_close_after(
             request, response, self._state.requests_completed
         )
-        head = _serialize_response_head(
-            response.status,
-            tuple(response.headers.items()),
-            len(body),
-            should_close,
-            self._policy.keep_alive_hint(),
+        head, wire_body = self._encode_response(
+            request.method, response, close=should_close
         )
 
         strategy = self._pipeline.transmission()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -129,6 +129,27 @@ class FaultStep(Protocol):
     def apply(self, body: bytes) -> ApplyResult: ...
 
 
+def apply_fault_steps(
+    steps: Iterable[FaultStep],
+    body: bytes,
+) -> ApplyResult:
+    """Apply ``steps`` in order and combine their results.
+
+    Each step sees the body the previous step produced.  Delays add
+    up, and the first step that drops the connection decides where
+    the drop happens and whether it resets.
+    """
+    combined = ApplyResult(body=body)
+    for step in steps:
+        result = step.apply(combined.body)
+        combined.body = result.body
+        combined.delay_before += result.delay_before
+        if combined.drop_after is None and result.drop_after is not None:
+            combined.drop_after = result.drop_after
+            combined.drop_reset = result.drop_reset
+    return combined
+
+
 class Delay(FaultStep):
     """Delay sending the body."""
 
@@ -211,27 +232,16 @@ class FaultyTransmission(TransmissionStrategy):
         writer: Writer,
         body: bytes,
     ) -> AbortTransmission | None:
-        body_to_send = body
-        total_delay = 0.0
-        drop_after: int | None = None
-        drop_reset = False
+        result = apply_fault_steps(self._faults, body)
 
-        for fault in self._faults:
-            result = fault.apply(body_to_send)
-            body_to_send = result.body
-            total_delay += result.delay_before
-            if drop_after is None and result.drop_after is not None:
-                drop_after = result.drop_after
-                drop_reset = result.drop_reset
+        if result.delay_before > 0:
+            await self._sleep(result.delay_before)
 
-        if total_delay > 0:
-            await self._sleep(total_delay)
+        if result.drop_after is None:
+            return await self._base.write_body(writer, result.body)
 
-        if drop_after is None:
-            return await self._base.write_body(writer, body_to_send)
-
-        to_send = body_to_send[:drop_after]
+        to_send = result.body[: result.drop_after]
         if to_send:
             writer.write(to_send)
             await writer.drain()
-        return AbortTransmission(reset=drop_reset)
+        return AbortTransmission(reset=result.drop_reset)

@@ -21,28 +21,7 @@ from localstub.server import (
     HTTPResponse,
     ThrottledTransmission,
 )
-
-
-async def _read_http_response(reader: asyncio.StreamReader) -> bytes:
-    header_bytes = await asyncio.wait_for(
-        reader.readuntil(b"\r\n\r\n"),
-        timeout=1.0,
-    )
-    content_length = 0
-    for line in header_bytes.split(b"\r\n"):
-        if line.lower().startswith(b"content-length:"):
-            length_value = line.split(b":", 1)[1].strip()
-            content_length = int(length_value) if length_value else 0
-            break
-
-    if content_length == 0:
-        return header_bytes
-
-    body_bytes = await asyncio.wait_for(
-        reader.readexactly(content_length),
-        timeout=1.0,
-    )
-    return header_bytes + body_bytes
+from tests.integration.wire import read_http_response
 
 
 async def _assert_connection_closes(reader: asyncio.StreamReader) -> None:
@@ -155,7 +134,7 @@ async def test_cancelled_aclose_finishes_shutdown_and_allows_restart() -> None:
     try:
         writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
         await writer.drain()
-        response = await _read_http_response(reader)
+        response = await read_http_response(reader)
         assert response.startswith(b"HTTP/1.1 200 OK\r\n")
     finally:
         writer.close()
@@ -217,7 +196,7 @@ async def test_server_closes_when_response_has_connection_close():
             writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             await writer.drain()
 
-            response = await _read_http_response(reader)
+            response = await read_http_response(reader)
             assert b"Connection: close" in response
             await _assert_connection_closes(reader)
         finally:
@@ -240,7 +219,7 @@ async def test_server_closes_http10_connection_by_default():
             writer.write(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
             await writer.drain()
 
-            await _read_http_response(reader)
+            await read_http_response(reader)
             await _assert_connection_closes(reader)
         finally:
             writer.close()
@@ -298,7 +277,7 @@ async def test_bodyless_response_preserves_keep_alive_connection(
             writer.write(b"GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n")
             await writer.drain()
 
-            next_response = await _read_http_response(reader)
+            next_response = await read_http_response(reader)
             assert next_response.startswith(b"HTTP/1.1 200 OK\r\n")
             assert next_response.endswith(b"next-response")
         finally:
@@ -351,7 +330,7 @@ async def test_header_phase_bodyless_response_keeps_pipelined_response_intact(
             else:
                 assert b"Content-Length: 15\r\n" in first_response
 
-            next_response = await _read_http_response(reader)
+            next_response = await read_http_response(reader)
             assert next_response.startswith(b"HTTP/1.1 200 OK\r\n")
             assert next_response.endswith(b"next-response")
         finally:
@@ -461,7 +440,7 @@ async def test_rewritten_connection_close_reaches_sender_stage():
             writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             await writer.drain()
 
-            response = await _read_http_response(reader)
+            response = await read_http_response(reader)
             assert b"Connection: close" in response
             await _assert_connection_closes(reader)
         finally:
@@ -542,12 +521,12 @@ async def test_connection_close_is_parsed_as_token_not_substring():
                 b"\r\n"
             )
             await writer.drain()
-            response = await _read_http_response(reader)
+            response = await read_http_response(reader)
             assert b"connection: close" not in response.lower()
 
             writer.write(b"GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n")
             await writer.drain()
-            await _read_http_response(reader)
+            await read_http_response(reader)
         finally:
             writer.close()
             try:
