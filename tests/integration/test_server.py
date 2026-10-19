@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import socket
 import time
 from datetime import UTC, datetime
@@ -11,8 +12,10 @@ import pytest_asyncio
 
 from localstub import AsyncHTTPTestServer, AsyncioClient, HTTPRequest
 from localstub.http.headers import Headers
-from localstub.http.request import RecordedHTTPRequest
+from localstub.http.request import ParsedRequest, RecordedHTTPRequest
 from localstub.middleware import (
+    HeaderContext,
+    HeaderNext,
     ResponderContext,
     ResponderNext,
     ResponseSpec,
@@ -27,6 +30,7 @@ from localstub.server import (
     SendResponse,
     ThrottledTransmission,
 )
+from tests.integration.wire import read_http_response
 
 
 @pytest_asyncio.fixture
@@ -2172,3 +2176,55 @@ async def test_trimmed_request_loses_its_timestamp():
         assert server.get_request_timestamp(server.requests[0]) > 0
         with pytest.raises(ValueError, match="not found"):
             server.get_request_timestamp(first)
+
+
+@pytest.mark.asyncio
+async def test_requests_are_freed_without_the_cyclic_gc() -> None:
+    # Large-body traffic allocates few objects, so the cyclic GC rarely
+    # runs; a request body held in a reference cycle then stays alive
+    # long after the recorder evicted it.
+    async def headers(ctx: HeaderContext, call_next: HeaderNext):
+        return await call_next()
+
+    async def responder(ctx: ResponderContext, call_next: ResponderNext):
+        return await call_next()
+
+    async def sender(
+        ctx: SenderContext, response: ResponseSpec, call_next: SenderNext
+    ) -> SendResult:
+        return await call_next(response)
+
+    gc.collect()
+    gc.disable()
+    try:
+        async with AsyncHTTPTestServer(
+            handler=lambda ctx: HTTPResponse.text("ok"),
+            recording_buffer_size=1,
+        ) as server:
+            server.use_headers(headers)
+            server.use(responder)
+            server.use_sender(sender)
+            reader, writer = await asyncio.open_connection(
+                server.host, server.port
+            )
+            for _ in range(3):
+                writer.write(
+                    b"PUT / HTTP/1.1\r\nHost: x\r\n"
+                    b"Content-Length: 5\r\n\r\nhello"
+                )
+                await read_http_response(reader)
+            writer.close()
+            await writer.wait_closed()
+        gc.set_debug(gc.DEBUG_SAVEALL)
+        gc.collect()
+        leaked = [
+            obj
+            for obj in gc.garbage
+            if isinstance(obj, (ParsedRequest, RecordedHTTPRequest))
+        ]
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+        gc.enable()
+
+    assert leaked == []

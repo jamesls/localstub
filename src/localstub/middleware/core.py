@@ -208,6 +208,62 @@ type ResponderMiddleware = Callable[
 ]
 
 
+class _ResponderRun:
+    """One request's pass through a responder chain.
+
+    The chain lives on an object rather than in a nested ``dispatch``
+    function: ``call_next`` closures refer back to whatever dispatches,
+    and a nested function referring to itself is a reference cycle that
+    keeps the request alive until the cyclic GC runs.
+    """
+
+    def __init__(
+        self,
+        middlewares: list[ResponderMiddleware],
+        terminal: Callable[
+            [ResponderContext], ResponseSpec | Awaitable[ResponseSpec]
+        ],
+        capture_ctx: Callable[[ResponderContext], None] | None,
+    ) -> None:
+        self._middlewares = middlewares
+        self._terminal = terminal
+        self._capture_ctx = capture_ctx
+        self._index = -1
+
+    async def dispatch(
+        self,
+        i: int,
+        current_ctx: ResponderContext,
+    ) -> ResponseSpec:
+        if i <= self._index:
+            raise RuntimeError("call_next() called multiple times")
+        self._index = i
+
+        capture_ctx = self._capture_ctx
+        if i >= len(self._middlewares):
+            result = await maybe_await(self._terminal(current_ctx))
+            if capture_ctx is not None:
+                capture_ctx(current_ctx)
+            return result
+
+        mw = self._middlewares[i]
+        delegated = False
+
+        async def call_next(
+            *,
+            ctx: ResponderContext | None = None,
+        ) -> ResponseSpec:
+            nonlocal delegated
+            delegated = True
+            next_ctx = current_ctx if ctx is None else ctx
+            return await self.dispatch(i + 1, next_ctx)
+
+        result = await maybe_await(mw(current_ctx, call_next))
+        if not delegated and capture_ctx is not None:
+            capture_ctx(current_ctx)
+        return result
+
+
 def compose_responder(
     middlewares: list[ResponderMiddleware],
     terminal: Callable[
@@ -217,41 +273,8 @@ def compose_responder(
     capture_ctx: Callable[[ResponderContext], None] | None = None,
 ) -> Callable[[ResponderContext], Awaitable[ResponseSpec]]:
     async def app(ctx: ResponderContext) -> ResponseSpec:
-        index = -1
-
-        async def dispatch(
-            i: int,
-            current_ctx: ResponderContext,
-        ) -> ResponseSpec:
-            nonlocal index
-            if i <= index:
-                raise RuntimeError("call_next() called multiple times")
-            index = i
-
-            if i >= len(middlewares):
-                result = await maybe_await(terminal(current_ctx))
-                if capture_ctx is not None:
-                    capture_ctx(current_ctx)
-                return result
-
-            mw = middlewares[i]
-            delegated = False
-
-            async def call_next(
-                *,
-                ctx: ResponderContext | None = None,
-            ) -> ResponseSpec:
-                nonlocal delegated
-                delegated = True
-                next_ctx = current_ctx if ctx is None else ctx
-                return await dispatch(i + 1, next_ctx)
-
-            result = await maybe_await(mw(current_ctx, call_next))
-            if not delegated and capture_ctx is not None:
-                capture_ctx(current_ctx)
-            return result
-
-        return await dispatch(0, ctx)
+        run = _ResponderRun(middlewares, terminal, capture_ctx)
+        return await run.dispatch(0, ctx)
 
     return app
 
@@ -286,6 +309,46 @@ type SenderMiddleware = Callable[
 ]
 
 
+class _SenderRun:
+    """One response's pass through a sender chain (see ``_ResponderRun``)."""
+
+    def __init__(
+        self,
+        middlewares: list[SenderMiddleware],
+        terminal: Callable[
+            [SenderContext, ResponseSpec], SendResult | Awaitable[SendResult]
+        ],
+    ) -> None:
+        self._middlewares = middlewares
+        self._terminal = terminal
+        self._index = -1
+
+    async def dispatch(
+        self,
+        i: int,
+        resp: ResponseSpec,
+        current_ctx: SenderContext,
+    ) -> SendResult:
+        if i <= self._index:
+            raise RuntimeError("call_next() called multiple times")
+        self._index = i
+
+        if i >= len(self._middlewares):
+            return await maybe_await(self._terminal(current_ctx, resp))
+
+        mw = self._middlewares[i]
+
+        async def call_next(
+            response: ResponseSpec,
+            *,
+            ctx: SenderContext | None = None,
+        ) -> SendResult:
+            next_ctx = current_ctx if ctx is None else ctx
+            return await self.dispatch(i + 1, response, next_ctx)
+
+        return await maybe_await(mw(current_ctx, resp, call_next))
+
+
 def compose_sender(
     middlewares: list[SenderMiddleware],
     terminal: Callable[
@@ -293,34 +356,9 @@ def compose_sender(
     ],
 ) -> Callable[[SenderContext, ResponseSpec], Awaitable[SendResult]]:
     async def app(ctx: SenderContext, response: ResponseSpec) -> SendResult:
-        index = -1
-
-        async def dispatch(
-            i: int,
-            resp: ResponseSpec,
-            current_ctx: SenderContext,
-        ) -> SendResult:
-            nonlocal index
-            if i <= index:
-                raise RuntimeError("call_next() called multiple times")
-            index = i
-
-            if i >= len(middlewares):
-                return await maybe_await(terminal(current_ctx, resp))
-
-            mw = middlewares[i]
-
-            async def call_next(
-                response: ResponseSpec,
-                *,
-                ctx: SenderContext | None = None,
-            ) -> SendResult:
-                next_ctx = current_ctx if ctx is None else ctx
-                return await dispatch(i + 1, response, next_ctx)
-
-            return await maybe_await(mw(current_ctx, resp, call_next))
-
-        return await dispatch(0, response, ctx)
+        return await _SenderRun(middlewares, terminal).dispatch(
+            0, response, ctx
+        )
 
     return app
 
@@ -362,6 +400,44 @@ type HeaderMiddleware = Callable[
 ]
 
 
+class _HeaderRun:
+    """One request's pass through a header chain (see ``_ResponderRun``)."""
+
+    def __init__(
+        self,
+        middlewares: list[HeaderMiddleware],
+        terminal: Callable[
+            [HeaderContext], HeaderDecision | Awaitable[HeaderDecision]
+        ],
+    ) -> None:
+        self._middlewares = middlewares
+        self._terminal = terminal
+        self._index = -1
+
+    async def dispatch(
+        self,
+        i: int,
+        current_ctx: HeaderContext,
+    ) -> HeaderDecision:
+        if i <= self._index:
+            raise RuntimeError("call_next() called multiple times")
+        self._index = i
+
+        if i >= len(self._middlewares):
+            return await maybe_await(self._terminal(current_ctx))
+
+        mw = self._middlewares[i]
+
+        async def call_next(
+            *,
+            ctx: HeaderContext | None = None,
+        ) -> HeaderDecision:
+            next_ctx = current_ctx if ctx is None else ctx
+            return await self.dispatch(i + 1, next_ctx)
+
+        return await maybe_await(mw(current_ctx, call_next))
+
+
 def compose_headers(
     middlewares: list[HeaderMiddleware],
     terminal: Callable[
@@ -369,31 +445,6 @@ def compose_headers(
     ],
 ) -> Callable[[HeaderContext], Awaitable[HeaderDecision]]:
     async def app(ctx: HeaderContext) -> HeaderDecision:
-        index = -1
-
-        async def dispatch(
-            i: int,
-            current_ctx: HeaderContext,
-        ) -> HeaderDecision:
-            nonlocal index
-            if i <= index:
-                raise RuntimeError("call_next() called multiple times")
-            index = i
-
-            if i >= len(middlewares):
-                return await maybe_await(terminal(current_ctx))
-
-            mw = middlewares[i]
-
-            async def call_next(
-                *,
-                ctx: HeaderContext | None = None,
-            ) -> HeaderDecision:
-                next_ctx = current_ctx if ctx is None else ctx
-                return await dispatch(i + 1, next_ctx)
-
-            return await maybe_await(mw(current_ctx, call_next))
-
-        return await dispatch(0, ctx)
+        return await _HeaderRun(middlewares, terminal).dispatch(0, ctx)
 
     return app

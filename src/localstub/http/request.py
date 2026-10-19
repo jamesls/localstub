@@ -372,6 +372,11 @@ class RequestProtocol:
             )
             self.result.http_version = self._parser.get_http_version()
             self.result.headers_complete = True
+            # The parser holds this protocol's bound callbacks, so the
+            # reference back to it is a cycle that would keep the body
+            # parts alive until the cyclic GC runs.  Nothing needs the
+            # parser after the headers.
+            self._parser = None
 
     def on_body(self, body: bytes) -> None:
         """Called for each chunk of body data."""
