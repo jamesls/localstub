@@ -23,6 +23,10 @@ from localstub.http.uri import ParsedURI, parse_absolute_uri
 
 LOG = logging.getLogger(__name__)
 
+# Largest read while consuming a Content-Length body.  Reads stop at the
+# message boundary, so a larger size never reads ahead of the request.
+BODY_READ_SIZE = 256 * 1024
+
 
 class Writer(Protocol):
     """Minimal StreamWriter interface for extracting client info."""
@@ -477,6 +481,30 @@ def _chunk_limit_offset(scan: ChunkPayloadScan, budget: int) -> int | None:
     return None
 
 
+class _ByteParts:
+    """Append-only bytes kept as the pieces they arrived in.
+
+    A ``bytes`` piece is retained by reference, so attributing a large
+    body read to a request costs a list entry instead of a copy.  The
+    pieces are joined only when the whole is asked for.
+    """
+
+    def __init__(self) -> None:
+        self.parts: list[bytes] = []
+        self._size = 0
+
+    def extend(self, data: bytes | bytearray) -> None:
+        if data:
+            self.parts.append(bytes(data))
+            self._size += len(data)
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __bytes__(self) -> bytes:
+        return b"".join(self.parts)
+
+
 class AsyncRequestParser:
     """Async wrapper for httptools.HttpRequestParser with wire tracking.
 
@@ -489,8 +517,9 @@ class AsyncRequestParser:
 
     def __init__(self, max_read: int = 8192) -> None:
         self._protocol, self._parser = _build_request_parser()
-        self._wire = bytearray()
-        self._connection_wire_offset = 0
+        self._wire = _ByteParts()
+        # Pieces of ``_wire`` already passed to the connection sink.
+        self._connection_wire_synced = 0
         self._max_read = max_read
         self._upgraded = False
         self._read_error: Exception | None = None
@@ -752,11 +781,10 @@ class AsyncRequestParser:
         if connection_wire is None:
             return
 
-        if self._connection_wire_offset >= len(self._wire):
-            return
-
-        connection_wire.extend(self._wire[self._connection_wire_offset :])
-        self._connection_wire_offset = len(self._wire)
+        parts = self._wire.parts
+        for part in parts[self._connection_wire_synced :]:
+            connection_wire.extend(part)
+        self._connection_wire_synced = len(parts)
 
     def _precise_error_offset(self, data: bytes) -> int:
         protocol, parser = _build_request_parser()
@@ -840,48 +868,65 @@ class AsyncRequestParser:
             if max_body_bytes is None
             else min(max_body_bytes, content_length)
         )
-        consumed = 0
+        # The length alone delimits the body, so its bytes bypass
+        # httptools and go straight to the protocol callbacks, the same
+        # way an Upgrade request's body does.  Each piece is delivered
+        # and attributed as the same object, without copies.
+        consumed = min(len(buffer), target)
+        if consumed:
+            self._deliver_length_body(bytes(buffer[:consumed]))
+            del buffer[:consumed]
+            self._sync_connection_wire(connection_wire)
         status = _ReadStatus.DATA
-        while True:
-            take = min(len(buffer), target - consumed)
-            if take:
-                # Body bytes under a Content-Length cannot fail to parse.
-                self._feed_body(buffer, take)
-                consumed += take
-                self._sync_connection_wire(connection_wire)
-            if consumed >= target:
+        while consumed < target:
+            # Never read past the message boundary: the next bytes
+            # belong to whoever reads the stream after this request.
+            read_size = min(BODY_READ_SIZE, target - consumed)
+            try:
+                data = await stream.read(reader, read_size)
+            except Exception as exc:
+                LOG.debug("Failed to read request data", exc_info=True)
+                self._read_error = exc
+                status = _ReadStatus.ERROR
                 break
-            status = await self._read_more(reader, buffer)
-            if status is not _ReadStatus.DATA:
+            if not data:
+                status = _ReadStatus.EOF
                 break
+            if len(data) > read_size:
+                # A ByteStream may hand back more than was asked for.
+                stream.unread_data(reader, data[read_size:])
+                data = data[:read_size]
+            self._deliver_length_body(data)
+            consumed += len(data)
+            self._sync_connection_wire(connection_wire)
 
-        if self._upgraded and consumed == content_length:
+        if consumed == content_length:
             self._protocol.on_message_complete()
         stream.unread_data(reader, buffer)
         self._sync_connection_wire(connection_wire)
         return self._body_outcome(status)
 
-    def _feed_body(
+    def _deliver_length_body(self, data: bytes) -> None:
+        self._protocol.on_body(data)
+        self._wire.extend(data)
+
+    def _feed_chunks(
         self,
         buffer: bytearray,
         length: int,
-        *,
-        chunked: bool = False,
     ) -> None:
-        """Deliver ``buffer[:length]`` as body bytes and attribute them.
+        """Deliver the complete chunks in ``buffer[:length]``.
 
         The bytes are removed from the buffer once the parser accepted
         them; when the parser raises they stay so the error offset can
-        be located.  ``chunked`` bytes are complete chunks whose
-        framing is stripped when the parser cannot be fed after an
-        upgrade.
+        be located.  After an upgrade the parser cannot be fed, so the
+        chunk framing is stripped and the payloads delivered directly.
         """
         segment = bytes(buffer[:length])
         if self._upgraded:
-            parts = (
-                _chunk_payload_parts(buffer[:length]) if chunked else [segment]
+            self._deliver_upgrade_body(
+                _chunk_payload_parts(buffer[:length]), complete=False
             )
-            self._deliver_upgrade_body(parts, complete=False)
         else:
             self._parser.feed_data(segment)
         self._wire.extend(segment)
@@ -942,7 +987,7 @@ class AsyncRequestParser:
             counted += sum(end - start for start, end in scan.payloads)
             if scan.resume_from:
                 try:
-                    self._feed_body(buffer, scan.resume_from, chunked=True)
+                    self._feed_chunks(buffer, scan.resume_from)
                 except httptools.HttpParserError as exc:
                     return self._body_parse_error(
                         reader,

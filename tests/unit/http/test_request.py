@@ -12,6 +12,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from localstub import HTTPRequest
+from localstub.http import stream
 from localstub.http.framing import ChunkScanError
 from localstub.http.headers import Headers
 from localstub.http.request import (
@@ -2145,15 +2146,19 @@ async def test_continue_parse_body_eof_under_threshold_stops_with_eof() -> (
 @pytest.mark.asyncio
 async def test_continue_parse_body_threshold_mid_read_keeps_surplus() -> None:
     headers = _content_length_headers(8)
+    reader = _ScriptedReader([headers, b"hel", b"lo w", b"or"])
+    parser = AsyncRequestParser()
+    _, remaining = await parser.parse_headers(reader)
 
-    outcome, leftover = await _parse_body(
-        [headers, b"hel", b"lo w", b"or"], max_body_bytes=5
+    outcome = await parser.continue_parse_body(
+        reader, remaining, max_body_bytes=5
     )
 
     assert not _partial(outcome).is_complete
     assert _partial(outcome).body == b"hello"
     assert outcome.wire_bytes == headers + b"hello"
-    assert leftover == b" w"
+    assert await stream.read(reader, 100) == b" w"
+    assert await stream.read(reader, 100) == b"or"
 
 
 @pytest.mark.asyncio
