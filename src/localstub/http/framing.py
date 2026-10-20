@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 HEADER_TERMINATOR = b"\r\n\r\n"
@@ -28,13 +29,17 @@ class ChunkPayloadScan:
     data arrives.  ``end`` is the offset past the chunked body once
     the terminal chunk and any trailers are complete.  ``resume_from``
     is the chunk-size boundary of the first incomplete chunk, so a
-    caller can rescan from there after appending data.
+    caller can rescan from there after appending data.  ``missing`` is
+    how many bytes that chunk still lacks, its CRLF included, once its
+    size line is complete, and ``0`` otherwise; reading no more than
+    that never reads past the chunked body.
     """
 
     payloads: tuple[tuple[int, int], ...]
     partial: tuple[int, int] | None
     end: int | None
     resume_from: int
+    missing: int = 0
 
 
 def content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
@@ -69,12 +74,7 @@ def is_chunked_transfer(headers: list[tuple[bytes, bytes]]) -> bool:
     return False
 
 
-def _is_hex_digit(value: int) -> bool:
-    return (
-        ord("0") <= value <= ord("9")
-        or ord("A") <= value <= ord("F")
-        or ord("a") <= value <= ord("f")
-    )
+_HEX_DIGITS = re.compile(rb"[0-9A-Fa-f]*")
 
 
 def _parse_chunk_size(
@@ -91,31 +91,28 @@ def _scan_chunk_size_line(
     buffer: bytearray,
     start: int,
 ) -> tuple[int, int] | None:
-    size_end = start
+    # One match finds the digits rather than a Python loop per byte.
+    digits = _HEX_DIGITS.match(buffer, start)
+    assert digits is not None  # "*" also matches no digits
+    size_end = digits.end()
+    if size_end >= len(buffer):
+        return None
 
-    while True:
-        if size_end >= len(buffer):
+    current = buffer[size_end]
+    if current == ord(";"):
+        line_end = buffer.find(CRLF, size_end)
+        if line_end == -1:
             return None
+        return _parse_chunk_size(buffer, start, size_end), line_end + 2
 
-        current = buffer[size_end]
-        if _is_hex_digit(current):
-            size_end += 1
-            continue
+    if current == ord("\r"):
+        if size_end + 1 >= len(buffer):
+            return None
+        if buffer[size_end + 1] != ord("\n"):
+            raise ChunkScanError(size_end + 1)
+        return _parse_chunk_size(buffer, start, size_end), size_end + 2
 
-        if current == ord(";"):
-            line_end = buffer.find(CRLF, size_end)
-            if line_end == -1:
-                return None
-            return _parse_chunk_size(buffer, start, size_end), line_end + 2
-
-        if current == ord("\r"):
-            if size_end + 1 >= len(buffer):
-                return None
-            if buffer[size_end + 1] != ord("\n"):
-                raise ChunkScanError(size_end + 1)
-            return _parse_chunk_size(buffer, start, size_end), size_end + 2
-
-        raise ChunkScanError(size_end + 1)
+    raise ChunkScanError(size_end + 1)
 
 
 def scan_chunked_body(
@@ -178,7 +175,13 @@ def scan_chunk_payloads(
         data_end = data_start + chunk_size
         if data_end + 2 > len(buffer):
             partial = (data_start, min(data_end, len(buffer)))
-            return ChunkPayloadScan(tuple(payloads), partial, None, index)
+            return ChunkPayloadScan(
+                tuple(payloads),
+                partial,
+                None,
+                index,
+                missing=data_end + 2 - len(buffer),
+            )
         _check_chunk_terminator(buffer, data_end)
 
         payloads.append((data_start, data_end))

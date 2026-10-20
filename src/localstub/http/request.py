@@ -47,7 +47,7 @@ class WireSink(Protocol):
     retention policy.  The parser only ever appends to it.
     """
 
-    def extend(self, data: bytes | bytearray, /) -> None: ...
+    def extend(self, data: bytes | bytearray | memoryview, /) -> None: ...
 
 
 def client_address(writer: Writer) -> tuple[str, int] | None:
@@ -575,7 +575,7 @@ class _ByteParts:
         self.parts: list[bytes] = []
         self._size = 0
 
-    def extend(self, data: bytes | bytearray) -> None:
+    def extend(self, data: bytes | bytearray | memoryview) -> None:
         if data:
             self.parts.append(bytes(data))
             self._size += len(data)
@@ -861,9 +861,10 @@ class AsyncRequestParser:
         self,
         reader: ByteStream,
         buffer: bytearray,
+        size: int | None = None,
     ) -> _ReadStatus:
         try:
-            data = await stream.read(reader, self._max_read)
+            data = await stream.read(reader, size or self._max_read)
         except Exception as exc:
             LOG.debug("Failed to read request data", exc_info=True)
             self._read_error = exc
@@ -1029,7 +1030,7 @@ class AsyncRequestParser:
 
     def _extend_wire(
         self,
-        data: bytes | bytearray,
+        data: bytes | bytearray | memoryview,
         keep: int | None,
         connection_wire: WireSink | None,
     ) -> None:
@@ -1086,17 +1087,19 @@ class AsyncRequestParser:
         be located.  After an upgrade the parser cannot be fed, so the
         chunk framing is stripped and the payloads delivered directly.
         """
-        segment = bytes(buffer[:length])
-        if self._upgraded:
-            self._deliver_upgrade_body(
-                _chunk_payload_parts(buffer[:length]), complete=False
-            )
-        else:
-            self._parser.feed_data(segment)
-        # Only once the bytes are accepted: a rejected segment is
-        # attributed, and charged to the limit, by the error path.
-        keep = self._chunk_wire_keep(buffer, length)
-        self._extend_wire(segment, keep, connection_wire)
+        # A view rather than a copy: httptools copies what it delivers
+        # and the wire copies only what it keeps.
+        with memoryview(buffer)[:length] as segment:
+            if self._upgraded:
+                self._deliver_upgrade_body(
+                    _chunk_payload_parts(buffer[:length]), complete=False
+                )
+            else:
+                self._parser.feed_data(segment)
+            # Only once the bytes are accepted: a rejected segment is
+            # attributed, and charged to the limit, by the error path.
+            keep = self._chunk_wire_keep(buffer, length)
+            self._extend_wire(segment, keep, connection_wire)
         del buffer[:length]
 
     async def _parse_chunked_body(
@@ -1166,7 +1169,10 @@ class AsyncRequestParser:
                         exc,
                     )
                 self._sync_connection_wire(connection_wire)
-            status = await self._read_more(reader, buffer)
+            # Inside a chunk, read up to its end at once: the bytes
+            # are known to belong to this body.
+            read_size = max(self._max_read, min(scan.missing, BODY_READ_SIZE))
+            status = await self._read_more(reader, buffer, read_size)
             if status is not _ReadStatus.DATA:
                 return self._finish_chunked_prefix(
                     reader,
@@ -1248,19 +1254,20 @@ class AsyncRequestParser:
         reached, the threshold stop inside the body, or the end of the
         buffer when the stream ended first.
         """
-        if self._upgraded:
-            self._deliver_upgrade_body(
-                _chunk_payload_parts(buffer[:offset]), complete=complete
-            )
-        else:
-            try:
-                self._parser.feed_data(bytes(buffer[:offset]))
-            except httptools.HttpParserError as exc:
-                return self._body_parse_error(
-                    reader, buffer, offset, connection_wire, exc
+        with memoryview(buffer)[:offset] as segment:
+            if self._upgraded:
+                self._deliver_upgrade_body(
+                    _chunk_payload_parts(buffer[:offset]), complete=complete
                 )
-        keep = self._chunk_wire_keep(buffer, offset)
-        self._extend_wire(buffer[:offset], keep, connection_wire)
+            else:
+                try:
+                    self._parser.feed_data(segment)
+                except httptools.HttpParserError as exc:
+                    return self._body_parse_error(
+                        reader, buffer, offset, connection_wire, exc
+                    )
+            keep = self._chunk_wire_keep(buffer, offset)
+            self._extend_wire(segment, keep, connection_wire)
 
         stream.unread_data(reader, buffer[offset:])
         self._sync_connection_wire(connection_wire)

@@ -144,6 +144,25 @@ def test_scan_chunk_payloads_reports_partial_chunk_data() -> None:
     assert scan.resume_from == 10
 
 
+@pytest.mark.parametrize(
+    ("buffer", "missing"),
+    [
+        # 10 data bytes and the CRLF follow the size line.
+        (b"a\r\n", 12),
+        (b"a\r\nabc", 9),
+        (b"a\r\n0123456789\r", 1),
+        (b"3\r\nabc\r\na;ext=1\r\nab", 10),
+        # Until the size line is complete nothing is known.
+        (b"3\r\nabc\r\na", 0),
+        (b"0\r\n", 0),
+    ],
+)
+def test_scan_chunk_payloads_reports_bytes_missing_from_partial_chunk(
+    buffer: bytes, missing: int
+) -> None:
+    assert scan_chunk_payloads(bytearray(buffer)).missing == missing
+
+
 def test_scan_chunk_payloads_size_line_cut_after_cr_is_incomplete() -> None:
     scan = scan_chunk_payloads(bytearray(b"5\r\nhello\r\n5\r"))
 

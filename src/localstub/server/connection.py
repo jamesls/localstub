@@ -311,7 +311,7 @@ class ConsumedByteSink:
     def __init__(self, state: ConnectionState) -> None:
         self._state = state
 
-    def extend(self, data: bytes | bytearray) -> None:
+    def extend(self, data: bytes | bytearray | memoryview) -> None:
         self._state.bytes_consumed += len(data)
         if self._state.received is not None:
             self._state.received.extend(data)
