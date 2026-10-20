@@ -42,7 +42,13 @@ from localstub.http.request import (
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.tcp import reset_stream
-from localstub.http.utils import serialize_header_line, status_phrase
+from localstub.http.utils import (
+    LazyBytes,
+    lazy_bytes_source,
+    serialize_header_line,
+    set_lazy_bytes,
+    status_phrase,
+)
 from localstub.middleware import (
     CloseConnection,
     CloseDuringRequest,
@@ -378,9 +384,18 @@ class RecordingStreamWriter:
     @property
     def bytes_sent(self) -> bytes:
         """Return bytes written for the current response."""
-        if not self._pending:
-            return b"".join(self._chunks)
-        return b"".join((*self._chunks, self._pending))
+        return self.sent_wire().join()
+
+    def sent_wire(self) -> LazyBytes:
+        """Return bytes written for the current response, unjoined.
+
+        A large write is one of the pieces as the object written, so a
+        recorded response body is shared rather than copied.
+        """
+        if self._pending:
+            self._chunks.append(bytes(self._pending))
+            self._pending.clear()
+        return LazyBytes(self._chunks)
 
     def start_response(self) -> None:
         """Start recording a new response."""
@@ -811,7 +826,9 @@ class HTTPConnection:
         parsed = outcome.parsed
         assert parsed is not None
         request = RecordedHTTPRequest.from_parsed(
-            parsed, outcome.wire_bytes, client=state.client
+            parsed,
+            lazy_bytes_source(outcome, "wire_bytes"),
+            client=state.client,
         )
         request_timestamp, _ = self._recorder.record_request(request)
         self._track_boundary(parsed)
@@ -913,7 +930,7 @@ class HTTPConnection:
             partial.method, response, close=close
         )
         self._write(head + wire_body)
-        return self._build_recorded_response(response, writer.bytes_sent)
+        return self._build_recorded_response(response, writer.sent_wire())
 
     def _encode_response(
         self,
@@ -944,7 +961,9 @@ class HTTPConnection:
         parsed = outcome.parsed
         assert parsed is not None
         request = RecordedHTTPRequest.from_parsed(
-            parsed, outcome.wire_bytes, client=state.client
+            parsed,
+            lazy_bytes_source(outcome, "wire_bytes"),
+            client=state.client,
         )
         request_timestamp, received_monotonic = self._recorder.record_request(
             request
@@ -1069,10 +1088,10 @@ class HTTPConnection:
 
     def _partial_response(self) -> RecordedHTTPResponse | None:
         """The response being written when the exchange failed, if any."""
-        if self._sending is None or not self._writer.bytes_sent:
+        if self._sending is None or not self._writer.sent_wire().parts:
             return None
         return self._build_recorded_response(
-            self._sending, self._writer.bytes_sent
+            self._sending, self._writer.sent_wire()
         )
 
     def _apply_close_policy(self, should_close: bool) -> bool:
@@ -1156,7 +1175,7 @@ class HTTPConnection:
 
         self._sending = response
         should_close, abort = await self._write_response(response, request)
-        recorded = self._build_recorded_response(response, writer.bytes_sent)
+        recorded = self._build_recorded_response(response, writer.sent_wire())
         if abort is None:
             self._state.phase = "after_response"
             return SendResult(recorded=recorded, should_close=should_close)
@@ -1248,7 +1267,10 @@ class HTTPConnection:
         strategy = self._pipeline.transmission()
         self._state.phase = "response_body"
         if isinstance(strategy, ImmediateTransmission):
-            self._write(head + wire_body)
+            # Two writes rather than one concatenation, so the body is
+            # never copied and the recording can share it.
+            self._write(head)
+            self._write(wire_body)
             await self._drain()
             return should_close, None
 
@@ -1307,17 +1329,19 @@ class HTTPConnection:
     def _build_recorded_response(
         self,
         response: HTTPResponse,
-        wire_bytes: bytes,
+        wire_bytes: LazyBytes,
     ) -> RecordedHTTPResponse:
-        return RecordedHTTPResponse(
+        recorded = RecordedHTTPResponse(
             response=HTTPResponse(
                 status=response.status,
                 headers=response.headers,
                 body=_normalize_body(response.body),
             ),
             reason=status_phrase(response.status),
-            wire_raw_bytes=wire_bytes,
+            wire_raw_bytes=b"",
         )
+        set_lazy_bytes(recorded, "wire_raw_bytes", wire_bytes)
+        return recorded
 
     def _start_close(self, event: ConnectionClosed) -> None:
         """Begin closing the writer the way ``event`` calls for.

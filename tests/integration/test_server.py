@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gc
+import pickle
 import socket
 import time
+import tracemalloc
 from datetime import UTC, datetime
 
 import httpx
@@ -2228,3 +2231,75 @@ async def test_requests_are_freed_without_the_cyclic_gc() -> None:
         gc.enable()
 
     assert leaked == []
+
+
+async def _send_raw_request(server: AsyncHTTPTestServer, data: bytes) -> None:
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    writer.write(data)
+    await read_http_response(reader, timeout=10)
+    writer.close()
+    await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire",
+    [
+        b"PUT /k HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        (
+            b"PUT /k HTTP/1.1\r\nHost: x\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n0\r\nx-amz-checksum: abc\r\n\r\n"
+        ),
+    ],
+)
+async def test_recorded_wire_bytes_behave_as_a_plain_field(
+    wire: bytes,
+) -> None:
+    async with AsyncHTTPTestServer() as server:
+        await _send_raw_request(server, wire)
+    recorded = server.requests[0]
+    response = server.responses[0]
+
+    rebuilt = RecordedHTTPRequest(
+        recorded.request,
+        recorded.as_received,
+        wire,
+        recorded.http_version,
+        recorded.client,
+    )
+    assert recorded.with_method("POST").wire_raw_bytes == wire
+    assert dataclasses.replace(recorded, client=None).wire_raw_bytes == wire
+    assert pickle.loads(pickle.dumps(recorded)) == recorded
+    assert recorded == rebuilt
+    assert hash(recorded) == hash(rebuilt)
+    assert recorded.wire_raw_bytes == wire
+    assert response.wire_raw_bytes.endswith(b"\r\n\r\n{}")
+    assert not hasattr(RecordedHTTPRequest, "wire_raw_bytes")
+
+
+@pytest.mark.asyncio
+async def test_recordings_hold_each_body_once() -> None:
+    size = 8 * 1024 * 1024
+    body = b"d" * size
+    tracemalloc.start()
+    try:
+        async with AsyncHTTPTestServer(
+            default_response=HTTPResponse.raw(body)
+        ) as server:
+            gc.collect()
+            before = tracemalloc.get_traced_memory()[0]
+            await _send_raw_request(
+                server,
+                b"PUT /k HTTP/1.1\r\nHost: x\r\n"
+                b"Content-Length: %d\r\n\r\n" % size + b"u" * size,
+            )
+            gc.collect()
+            retained = tracemalloc.get_traced_memory()[0] - before
+    finally:
+        tracemalloc.stop()
+
+    # The upload's body once; the download shares the response's body.
+    assert len(server.requests[0].wire_raw_bytes) > size
+    assert server.responses[0].wire_raw_bytes.endswith(body)
+    assert size <= retained < size * 1.5

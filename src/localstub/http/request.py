@@ -20,6 +20,12 @@ from localstub.http.framing import (
 from localstub.http.headers import HeaderItem, Headers
 from localstub.http.stream import ByteStream
 from localstub.http.uri import ParsedURI, parse_absolute_uri
+from localstub.http.utils import (
+    LazyBytes,
+    lazy_bytes_fields,
+    replace_keeping_lazy,
+    set_lazy_bytes,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -160,6 +166,29 @@ class HTTPRequest:
         return self.target
 
 
+def _share_body(
+    wire: bytes | LazyBytes,
+    body_parts: list[bytes],
+    body: bytes | None,
+) -> bytes | LazyBytes:
+    """Point the body section of *wire* at the joined *body*.
+
+    A Content-Length body is attributed to the wire as the very pieces
+    delivered as body parts, so when the wire ends with those same
+    objects its tail is the body byte for byte.  Referencing the
+    joined body instead lets the recording hold the body once.
+    """
+    if not isinstance(wire, LazyBytes) or not body_parts or body is None:
+        return wire
+    count = len(body_parts)
+    tail = wire.parts[-count:]
+    if len(tail) != count or any(
+        part is not piece for part, piece in zip(tail, body_parts, strict=True)
+    ):
+        return wire
+    return LazyBytes((*wire.parts[:-count], body))
+
+
 def _parsed_body(parsed: ParsedRequest) -> bytes | None:
     """Map a parsed body to HTTPRequest.body semantics (absent → None)."""
     if parsed.body_parts:
@@ -171,6 +200,7 @@ def _parsed_body(parsed: ParsedRequest) -> bytes | None:
     return None
 
 
+@lazy_bytes_fields("wire_raw_bytes")
 @dataclass(frozen=True)
 class RecordedHTTPRequest:
     """An HTTPRequest we witnessed on the wire, plus the evidence.
@@ -208,7 +238,7 @@ class RecordedHTTPRequest:
     def from_parsed(
         cls,
         parsed: ParsedRequest,
-        wire_raw_bytes: bytes,
+        wire_raw_bytes: bytes | LazyBytes,
         *,
         client: tuple[str, int] | None = None,
         writer: Writer | None = None,
@@ -221,20 +251,27 @@ class RecordedHTTPRequest:
         if client is None and writer is not None:
             client = client_address(writer)
 
+        body = _parsed_body(parsed)
         request = HTTPRequest(
             method=parsed.method or "",
             target=target,
             headers=Headers.from_raw_items(parsed.headers),
-            body=_parsed_body(parsed),
+            body=body,
         )
-        return cls(
+        recorded = cls(
             request=request,
             as_received=request,
-            wire_raw_bytes=wire_raw_bytes,
+            wire_raw_bytes=b"",
             http_version=parsed.http_version or "",
             client=client,
             body_complete=parsed.is_complete,
         )
+        set_lazy_bytes(
+            recorded,
+            "wire_raw_bytes",
+            _share_body(wire_raw_bytes, parsed.body_parts, body),
+        )
+        return recorded
 
     @property
     def method(self) -> str:
@@ -273,13 +310,25 @@ class RecordedHTTPRequest:
         return self.request.effective_path
 
     def with_method(self, method: str) -> RecordedHTTPRequest:
-        return replace(self, request=replace(self.request, method=method))
+        return replace_keeping_lazy(
+            self,
+            "wire_raw_bytes",
+            request=replace(self.request, method=method),
+        )
 
     def with_target(self, target: str) -> RecordedHTTPRequest:
-        return replace(self, request=replace(self.request, target=target))
+        return replace_keeping_lazy(
+            self,
+            "wire_raw_bytes",
+            request=replace(self.request, target=target),
+        )
 
     def with_headers(self, headers: Headers) -> RecordedHTTPRequest:
-        return replace(self, request=replace(self.request, headers=headers))
+        return replace_keeping_lazy(
+            self,
+            "wire_raw_bytes",
+            request=replace(self.request, headers=headers),
+        )
 
     @property
     def wire_body_bytes(self) -> bytes:
@@ -419,6 +468,7 @@ class ParseStop(Enum):
     """Reading the stream raised; ``error`` carries the exception."""
 
 
+@lazy_bytes_fields("wire_bytes")
 @dataclass(frozen=True)
 class ParseOutcome:
     """Result of a request parse call.
@@ -735,7 +785,9 @@ class AsyncRequestParser:
     ) -> ParseOutcome:
         result = self._protocol.result
         parsed = result if result.headers_complete else None
-        return ParseOutcome(parsed, bytes(self._wire), stop, error)
+        outcome = ParseOutcome(parsed, b"", stop, error)
+        set_lazy_bytes(outcome, "wire_bytes", LazyBytes(self._wire.parts))
+        return outcome
 
     def _headers_stopped(self, status: _ReadStatus) -> ParseOutcome:
         """Outcome for a header read that ended before they completed.

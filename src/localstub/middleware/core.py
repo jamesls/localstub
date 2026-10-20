@@ -12,7 +12,7 @@ from localstub.http.exchange import ConnectionClosed
 from localstub.http.request import HTTPRequestHeaders, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
-from localstub.http.utils import maybe_await
+from localstub.http.utils import maybe_await, replace_keeping_lazy
 
 
 class _Unset(Enum):
@@ -97,7 +97,12 @@ class ResponderContext:
             headers=next_headers,
             body=request.body if body is _UNSET else body,
         )
-        return replace(self, request=replace(recorded, request=next_request))
+        return replace(
+            self,
+            request=replace_keeping_lazy(
+                recorded, "wire_raw_bytes", request=next_request
+            ),
+        )
 
 
 @dataclass(frozen=True)
