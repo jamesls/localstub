@@ -87,3 +87,5 @@ pip install localstub
 
 - [Getting started](getting-started.md): write your first test
   against a plain-HTTP stub server.
+- [Large bodies and benchmarking](large-bodies.md): keep memory
+  bounded for large uploads and throughput benchmarks.

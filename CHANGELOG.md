@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+* Add `max_recorded_body_bytes` (CLI: `--max-recorded-body-bytes`) to keep
+  only the first N payload bytes of each request body while still reading
+  it to its end, so memory stays bounded for large uploads.
+  `RecordedHTTPRequest.full_body_size` gives the size received when a body
+  was cut short.
+* Large bodies cost less memory and time: request bodies are freed without
+  waiting for the cyclic garbage collector, a recorded request or response
+  holds its body once, and request bodies are read with fewer copies and
+  larger reads.
 * Add connection-lifecycle faults: `CloseConnection` (responder result,
   `reset`, `delay`), `CloseDuringRequest` / `close_during_request()`
   (header-phase close with `after_body_bytes`), `DropConnection(reset=...)`,

@@ -11,6 +11,7 @@ repo_name = "jamesls/localstub"
 nav = [
   { "Home" = "index.md" },
   { "Getting started" = "getting-started.md" },
+  { "Large bodies and benchmarking" = "large-bodies.md" },
 ]
 
 # extra_css = ["stylesheets/extra.css"]

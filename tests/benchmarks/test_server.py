@@ -4,6 +4,7 @@ import asyncio
 import json
 import selectors
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -141,6 +142,15 @@ def routed_server() -> AsyncHTTPTestServer:
 
 @pytest.fixture
 def routed_connection(
+    routed_loop: asyncio.AbstractEventLoop,
+    routed_server: AsyncHTTPTestServer,
+) -> Iterator[Connection]:
+    with _memory_connection(routed_loop, routed_server) as connection:
+        yield connection
+
+
+@contextmanager
+def _memory_connection(
     routed_loop: asyncio.AbstractEventLoop,
     routed_server: AsyncHTTPTestServer,
 ) -> Iterator[Connection]:
@@ -310,3 +320,80 @@ def test_recording_writer_body_in_small_writes(
     sent = benchmark(respond)
 
     assert sent == SMALL_PIECE * SMALL_PIECE_COUNT
+
+
+BULK_SIZE = 8 * 1024 * 1024
+BULK_BODY = bytes(range(256)) * (BULK_SIZE // 256)
+BULK_CHUNK = 64 * 1024
+_UPLOAD_HEAD = b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\n"
+CONTENT_LENGTH_UPLOAD = (
+    _UPLOAD_HEAD + b"Content-Length: %d\r\n\r\n" % BULK_SIZE + BULK_BODY
+)
+CHUNKED_UPLOAD = (
+    _UPLOAD_HEAD
+    + b"Transfer-Encoding: chunked\r\n\r\n"
+    + b"".join(
+        b"%x\r\n%s\r\n" % (BULK_CHUNK, BULK_BODY[start : start + BULK_CHUNK])
+        for start in range(0, BULK_SIZE, BULK_CHUNK)
+    )
+    + b"0\r\n\r\n"
+)
+DOWNLOAD = b"GET /bucket/key HTTP/1.1\r\nHost: localhost\r\n\r\n"
+LIMIT = 4096
+
+
+async def bulk_exchange(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request: bytes,
+) -> tuple[bytes, bytes]:
+    writer.write(request)
+    await writer.drain()
+    head = await reader.readuntil(b"\r\n\r\n")
+    length = int(head.split(b"Content-Length: ")[1].split(b"\r\n")[0])
+    return head, await reader.readexactly(length)
+
+
+@pytest.mark.parametrize(
+    ("request_bytes", "max_recorded_body_bytes", "recorded_size"),
+    [
+        pytest.param(CONTENT_LENGTH_UPLOAD, None, BULK_SIZE, id="put"),
+        pytest.param(CHUNKED_UPLOAD, None, BULK_SIZE, id="put-chunked"),
+        pytest.param(CONTENT_LENGTH_UPLOAD, LIMIT, LIMIT, id="put-limited"),
+        pytest.param(CHUNKED_UPLOAD, LIMIT, LIMIT, id="put-chunked-limited"),
+        pytest.param(DOWNLOAD, None, 0, id="get"),
+    ],
+)
+def test_server_roundtrip_bulk_body(
+    benchmark: BenchmarkFixture,
+    routed_loop: asyncio.AbstractEventLoop,
+    request_bytes: bytes,
+    max_recorded_body_bytes: int | None,
+    recorded_size: int,
+) -> None:
+    # The settings recommended for benchmarking, so samples measure the
+    # copies each body costs rather than an ever-growing history.
+    server = AsyncHTTPTestServer(
+        recording_buffer_size=1,
+        max_connection_bytes=0,
+        max_recorded_body_bytes=max_recorded_body_bytes,
+    )
+
+    def respond(ctx: ResponderContext) -> HTTPResponse:
+        download = ctx.request.method == "GET"
+        return HTTPResponse.raw(BULK_BODY if download else b"")
+
+    server.handler = respond
+    with _memory_connection(routed_loop, server) as (reader, writer):
+
+        def exchange_once() -> tuple[bytes, bytes]:
+            return routed_loop.run_until_complete(
+                bulk_exchange(reader, writer, request_bytes)
+            )
+
+        head, body = benchmark(exchange_once)
+
+    assert head.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert body == (BULK_BODY if request_bytes is DOWNLOAD else b"")
+    assert server.last_request is not None
+    assert len(server.last_request.body or b"") == recorded_size
