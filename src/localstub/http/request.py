@@ -225,6 +225,13 @@ class RecordedHTTPRequest:
     ``wire_raw_bytes`` the wire prefix including framing.  It is a fact
     about the observation, not the message, so it lives here and not on
     ``HTTPRequest``.
+
+    ``full_body_size`` is set only when the server's
+    ``max_recorded_body_bytes`` kept a prefix of a longer body: it is
+    the number of payload bytes received, while ``body`` holds the
+    kept prefix and ``wire_raw_bytes`` the wire bytes up to the same
+    payload byte, so any later chunk framing and trailers are absent.
+    It is ``None`` whenever ``body`` holds every payload byte received.
     """
 
     request: HTTPRequest
@@ -233,6 +240,7 @@ class RecordedHTTPRequest:
     http_version: str
     client: tuple[str, int] | None = None
     body_complete: bool = True
+    full_body_size: int | None = None
 
     @classmethod
     def from_parsed(
@@ -252,6 +260,7 @@ class RecordedHTTPRequest:
             client = client_address(writer)
 
         body = _parsed_body(parsed)
+        kept = len(body) if body is not None else 0
         request = HTTPRequest(
             method=parsed.method or "",
             target=target,
@@ -265,6 +274,9 @@ class RecordedHTTPRequest:
             http_version=parsed.http_version or "",
             client=client,
             body_complete=parsed.is_complete,
+            full_body_size=(
+                parsed.body_size if parsed.body_size > kept else None
+            ),
         )
         set_lazy_bytes(
             recorded,
@@ -368,6 +380,9 @@ class ParsedRequest:
     body_parts: list[bytes] = field(default_factory=list[bytes])
     is_complete: bool = False
     headers_complete: bool = False
+    # Payload bytes received, including any past the protocol's
+    # ``max_body_kept`` that were left out of ``body_parts``.
+    body_size: int = 0
 
     @property
     def body(self) -> bytes:
@@ -383,9 +398,16 @@ class RequestProtocol:
     request when httptools processes multiple requests in a single buffer.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_body_kept: int | None = None) -> None:
         self.result = ParsedRequest()
         self._parser: httptools.HttpRequestParser | None = None
+        self._max_body_kept = max_body_kept
+
+    def _body_room(self) -> int | None:
+        """Payload bytes still kept before the limit; ``None``: no limit."""
+        if self._max_body_kept is None:
+            return None
+        return max(self._max_body_kept - self.result.body_size, 0)
 
     def set_parser(self, parser: httptools.HttpRequestParser) -> None:
         """Set the parser reference for accessing parsed metadata."""
@@ -432,9 +454,19 @@ class RequestProtocol:
             self._parser = None
 
     def on_body(self, body: bytes) -> None:
-        """Called for each chunk of body data."""
-        if not self.result.is_complete:
+        """Called for each chunk of body data.
+
+        Every byte is counted; only those within ``max_body_kept`` are
+        kept.
+        """
+        if self.result.is_complete:
+            return
+        room = self._body_room()
+        self.result.body_size += len(body)
+        if room is None or len(body) <= room:
             self.result.body_parts.append(body)
+        elif room:
+            self.result.body_parts.append(body[:room])
 
     def on_message_complete(self) -> None:
         """Called when the message is fully parsed."""
@@ -442,10 +474,10 @@ class RequestProtocol:
             self.result.is_complete = True
 
 
-def _build_request_parser() -> tuple[
-    RequestProtocol, httptools.HttpRequestParser
-]:
-    protocol = RequestProtocol()
+def _build_request_parser(
+    max_body_kept: int | None = None,
+) -> tuple[RequestProtocol, httptools.HttpRequestParser]:
+    protocol = RequestProtocol(max_body_kept)
     parser = httptools.HttpRequestParser(protocol)
     protocol.set_parser(parser)
     return protocol, parser
@@ -565,9 +597,25 @@ class AsyncRequestParser:
     any later consumer of the reader picks them up in order.
     """
 
-    def __init__(self, max_read: int = 8192) -> None:
-        self._protocol, self._parser = _build_request_parser()
+    def __init__(
+        self,
+        max_read: int = 8192,
+        *,
+        max_body_kept: int | None = None,
+    ) -> None:
+        """``max_body_kept`` limits the payload bytes kept in the parsed
+        body and the attributed wire bytes; the rest of the body is still
+        read, counted in ``ParsedRequest.body_size`` and passed to the
+        connection sink, then dropped.
+        """
+        self._protocol, self._parser = _build_request_parser(max_body_kept)
         self._wire = _ByteParts()
+        # Payload bytes the wire may still keep, tracked apart from the
+        # protocol's count so a parse error cannot skew the cut.
+        self._wire_room = max_body_kept
+        # Set once the body limit cut the wire; later bytes are dropped.
+        self._wire_cut = False
+        self._head_size = 0
         # Pieces of ``_wire`` already passed to the connection sink.
         self._connection_wire_synced = 0
         self._max_read = max_read
@@ -693,6 +741,7 @@ class AsyncRequestParser:
 
         header_end = buffer.find(HEADER_TERMINATOR) + len(HEADER_TERMINATOR)
         self._wire.extend(buffer[:header_end])
+        self._head_size = len(self._wire)
         self._sync_connection_wire(connection_wire)
         return self._outcome(ParseStop.COMPLETE), buffer[header_end:]
 
@@ -860,10 +909,17 @@ class AsyncRequestParser:
         connection_wire: WireSink | None,
         error: Exception,
     ) -> ParseOutcome:
-        candidate = bytes(self._wire) + bytes(buffer[:consumed_guess])
+        replay = bytes(self._wire)
+        if self._wire_cut:
+            # The kept wire stops short of the bytes already fed, but
+            # the failing segment starts at a chunk-size boundary, so
+            # the head alone puts a fresh parser in the same state.
+            replay = replay[: self._head_size]
+        candidate = replay + bytes(buffer[:consumed_guess])
         error_offset = self._precise_error_offset(candidate)
-        body_offset = max(0, error_offset - len(self._wire))
-        self._wire.extend(buffer[:body_offset])
+        body_offset = max(0, error_offset - len(replay))
+        keep = self._chunk_wire_keep(buffer, body_offset)
+        self._extend_wire(buffer[:body_offset], keep, connection_wire)
         self._sync_connection_wire(connection_wire)
         stream.unread_data(reader, buffer[body_offset:])
         return self._outcome(ParseStop.PARSE_ERROR, error)
@@ -926,7 +982,9 @@ class AsyncRequestParser:
         # and attributed as the same object, without copies.
         consumed = min(len(buffer), target)
         if consumed:
-            self._deliver_length_body(bytes(buffer[:consumed]))
+            self._deliver_length_body(
+                bytes(buffer[:consumed]), connection_wire
+            )
             del buffer[:consumed]
             self._sync_connection_wire(connection_wire)
         status = _ReadStatus.DATA
@@ -948,7 +1006,7 @@ class AsyncRequestParser:
                 # A ByteStream may hand back more than was asked for.
                 stream.unread_data(reader, data[read_size:])
                 data = data[:read_size]
-            self._deliver_length_body(data)
+            self._deliver_length_body(data, connection_wire)
             consumed += len(data)
             self._sync_connection_wire(connection_wire)
 
@@ -958,14 +1016,68 @@ class AsyncRequestParser:
         self._sync_connection_wire(connection_wire)
         return self._body_outcome(status)
 
-    def _deliver_length_body(self, data: bytes) -> None:
+    def _deliver_length_body(
+        self,
+        data: bytes,
+        connection_wire: WireSink | None,
+    ) -> None:
         self._protocol.on_body(data)
-        self._wire.extend(data)
+        keep = self._wire_room
+        if keep is not None:
+            self._wire_room = max(keep - len(data), 0)
+        self._extend_wire(data, keep, connection_wire)
+
+    def _extend_wire(
+        self,
+        data: bytes | bytearray,
+        keep: int | None,
+        connection_wire: WireSink | None,
+    ) -> None:
+        """Attribute *data* to the request, keeping its first *keep* bytes.
+
+        ``keep`` of ``None`` keeps all of it.  Bytes the body limit cut
+        are not kept, but the connection sink still receives them.
+        """
+        if self._wire_cut:
+            keep = 0
+        if keep is None or keep >= len(data):
+            self._wire.extend(data)
+            return
+        self._wire.extend(data[:keep])
+        self._wire_cut = True
+        self._sync_connection_wire(connection_wire)
+        if connection_wire is not None:
+            connection_wire.extend(data[keep:] if keep else data)
+
+    def _chunk_wire_keep(self, buffer: bytearray, end: int) -> int | None:
+        """Wire bytes of chunked ``buffer[:end]`` within the body limit.
+
+        ``None`` keeps them all, framing and trailers included, unless
+        a payload byte in them is past the limit.
+        """
+        room = self._wire_room
+        if room is None or self._wire_cut:
+            return None
+        scan = scan_chunk_payloads(buffer[:end])
+        spans = (
+            scan.payloads
+            if scan.partial is None
+            else (
+                *scan.payloads,
+                scan.partial,
+            )
+        )
+        payload = sum(stop - start for start, stop in spans)
+        if payload <= room:
+            self._wire_room = room - payload
+            return None
+        return _chunk_limit_offset(scan, room)
 
     def _feed_chunks(
         self,
         buffer: bytearray,
         length: int,
+        connection_wire: WireSink | None,
     ) -> None:
         """Deliver the complete chunks in ``buffer[:length]``.
 
@@ -981,7 +1093,10 @@ class AsyncRequestParser:
             )
         else:
             self._parser.feed_data(segment)
-        self._wire.extend(segment)
+        # Only once the bytes are accepted: a rejected segment is
+        # attributed, and charged to the limit, by the error path.
+        keep = self._chunk_wire_keep(buffer, length)
+        self._extend_wire(segment, keep, connection_wire)
         del buffer[:length]
 
     async def _parse_chunked_body(
@@ -1039,7 +1154,9 @@ class AsyncRequestParser:
             counted += sum(end - start for start, end in scan.payloads)
             if scan.resume_from:
                 try:
-                    self._feed_chunks(buffer, scan.resume_from)
+                    self._feed_chunks(
+                        buffer, scan.resume_from, connection_wire
+                    )
                 except httptools.HttpParserError as exc:
                     return self._body_parse_error(
                         reader,
@@ -1107,7 +1224,10 @@ class AsyncRequestParser:
                 self._parser.feed_data(prefix)
             except httptools.HttpParserError:
                 LOG.debug("Parser rejected chunk prefix", exc_info=True)
-        self._wire.extend(prefix)
+        # The bad byte itself would fail the scan, so map the limit
+        # over the valid prefix only.
+        keep = self._chunk_wire_keep(buffer, error.offset - 1)
+        self._extend_wire(prefix, keep, connection_wire)
         self._sync_connection_wire(connection_wire)
         stream.unread_data(reader, buffer[error.offset :])
         return self._outcome(ParseStop.PARSE_ERROR, error)
@@ -1132,7 +1252,6 @@ class AsyncRequestParser:
             self._deliver_upgrade_body(
                 _chunk_payload_parts(buffer[:offset]), complete=complete
             )
-            self._wire.extend(buffer[:offset])
         else:
             try:
                 self._parser.feed_data(bytes(buffer[:offset]))
@@ -1140,7 +1259,8 @@ class AsyncRequestParser:
                 return self._body_parse_error(
                     reader, buffer, offset, connection_wire, exc
                 )
-            self._wire.extend(buffer[:offset])
+        keep = self._chunk_wire_keep(buffer, offset)
+        self._extend_wire(buffer[:offset], keep, connection_wire)
 
         stream.unread_data(reader, buffer[offset:])
         self._sync_connection_wire(connection_wire)

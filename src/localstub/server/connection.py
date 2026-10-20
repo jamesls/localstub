@@ -508,6 +508,7 @@ class HTTPConnection:
         services: ServerServices,
         sleep: Sleep,
         track_forwarder: TrackForwarder,
+        max_body_kept: int | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -517,6 +518,7 @@ class HTTPConnection:
         self._services = services
         self._sleep = sleep
         self._track_forwarder = track_forwarder
+        self._max_body_kept = max_body_kept
         self._sink = ConsumedByteSink(state)
         self._meta = ConnectionMeta(client=state.client)
         self._policy = KeepAlivePolicy()
@@ -740,7 +742,7 @@ class HTTPConnection:
         state.final_response = None
         self._final_send_close = False
         request_state: dict[str, Any] = {}
-        parser = AsyncRequestParser()
+        parser = AsyncRequestParser(max_body_kept=self._max_body_kept)
 
         outcome, remaining = await parser.parse_headers(
             self._reader, self._sink, initial_data=initial_data

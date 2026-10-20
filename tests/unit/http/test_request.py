@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, Mock
 
 import httptools
 import pytest
-from hypothesis import given
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 from localstub import HTTPRequest
 from localstub.http import stream
-from localstub.http.framing import ChunkScanError
+from localstub.http.framing import ChunkScanError, is_chunked_transfer
 from localstub.http.headers import Headers
 from localstub.http.request import (
     AsyncRequestParser,
@@ -2793,3 +2793,146 @@ async def test_invalid_initial_data_is_rejected_without_another_read() -> None:
     assert remaining == b""
     assert take_unread_data(reader) == b"unconsumed"
     reader.read.assert_not_awaited()
+
+
+@st.composite
+def _limited_parse_cases(
+    draw: st.DrawFn,
+) -> tuple[bytes, list[bytes], int]:
+    requests = draw(st.lists(_request_wires(), min_size=2, max_size=3))
+    wire = bytearray(b"".join(requests))
+    if draw(st.booleans()):
+        wire[draw(st.integers(0, len(wire) - 1))] = 1
+    limit = draw(st.integers(0, 80))
+    return bytes(wire), draw(fragments_of(bytes(wire))), limit
+
+
+async def _parse_stream(
+    fragments: list[bytes], max_body_kept: int | None
+) -> tuple[list[tuple[ParseOutcome, bytes]], bytes]:
+    reader = _fragment_reader(fragments)
+    results: list[tuple[ParseOutcome, bytes]] = []
+    while True:
+        sink = bytearray()
+        parser = AsyncRequestParser(max_body_kept=max_body_kept)
+        outcome = await parser.parse(reader, sink)
+        if not outcome.wire_bytes:
+            break
+        results.append((outcome, bytes(sink)))
+        if outcome.complete_request is None:
+            break
+    return results, take_unread_data(reader)
+
+
+_BAD_CRLF_AT_LIMIT = (
+    b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    b"2\r\n\x00\x00\r\nb;0\r\n" + bytes(11) + b"\x01\n0\r\n\r\n"
+)
+
+_BAD_TRAILER = (
+    b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    b"1\r\n\x00\r\n1\r\n\x00\r\n0\r\n\x01: \r\n\r\n"
+)
+
+
+@pytest.mark.asyncio
+@given(case=_limited_parse_cases())
+# A body that fits the limit exactly keeps its wire whole, even when a
+# framing error follows the last payload byte.
+@example(case=(_BAD_CRLF_AT_LIMIT, [_BAD_CRLF_AT_LIMIT], 13))
+# A trailer httptools rejects must not charge the body to the limit twice.
+@example(case=(_BAD_TRAILER, [_BAD_TRAILER], 2))
+async def test_body_limit_changes_only_what_is_kept(
+    case: tuple[bytes, list[bytes], int],
+) -> None:
+    _, fragments, limit = case
+    full, full_leftover = await _parse_stream(fragments, None)
+    kept, kept_leftover = await _parse_stream(fragments, limit)
+
+    assert kept_leftover == full_leftover
+    assert len(kept) == len(full)
+    for (outcome, sink), (full_outcome, full_wire) in zip(
+        kept, full, strict=True
+    ):
+        # The limit never changes what is consumed from the stream.
+        assert outcome.stop == full_outcome.stop
+        assert sink == full_wire
+        assert full_outcome.wire_bytes == full_wire
+        assert full_wire.startswith(outcome.wire_bytes)
+        if full_outcome.parsed is None:
+            assert outcome.parsed is None
+            continue
+        assert outcome.parsed is not None
+        body = full_outcome.parsed.body
+        assert outcome.parsed.body == body[:limit]
+        assert outcome.parsed.body_size == len(body)
+        if len(body) <= limit:
+            assert outcome.wire_bytes == full_wire
+        elif is_chunked_transfer(full_outcome.parsed.headers):
+            head = full_wire.index(b"\r\n\r\n") + 4
+            cut = head + _chunked_cut(full_wire[head:], limit)
+            assert outcome.wire_bytes == full_wire[:cut]
+        else:
+            head = len(full_wire) - len(body)
+            assert outcome.wire_bytes == full_wire[: head + limit]
+
+
+def _chunked_cut(chunked: bytes, limit: int) -> int:
+    """Offset just past the *limit*-th payload byte of a chunked body.
+
+    A cut at the end of a chunk includes the chunk's CRLF.
+    """
+    offset = 0
+    while limit:
+        line_end = chunked.index(b"\r\n", offset)
+        size = int(chunked[offset:line_end].split(b";")[0], 16)
+        data = line_end + 2
+        if size >= limit:
+            return data + limit + (2 if size == limit else 0)
+        limit -= size
+        offset = data + size + 2
+    return offset
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chunked", "bad"),
+    [
+        # Rejected by httptools after the chunk scanner accepted them.
+        (b"5\r\nhello\r\n0\r\nbad\x01trailer\r\n\r\n", b"\x01"),
+        (b"5\r\nhello\r\n3;\x01\r\nabc\r\n0\r\n\r\n", b"\x01"),
+        # Rejected by the chunk scanner.
+        (b"5\r\nhello\r\n3x\r\n", b"x"),
+    ],
+)
+@pytest.mark.parametrize("split", [None, 3, 12])
+async def test_body_limit_cuts_wire_before_a_framing_error(
+    chunked: bytes, bad: bytes, split: int | None
+) -> None:
+    # Consumed up to and including the rejected byte, as without a limit.
+    consumed = chunked.index(bad) + 1
+    data = _CHUNKED_HEADERS + chunked + _NEXT_REQUEST
+    cut = len(_CHUNKED_HEADERS) + (len(data) if split is None else split)
+    sink = bytearray()
+    reader = _fragment_reader([data[:cut], data[cut:]])
+
+    outcome = await AsyncRequestParser(max_body_kept=2).parse(reader, sink)
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert _partial(outcome).body == b"he"
+    assert _partial(outcome).body_size == 5
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5\r\nhe"
+    assert bytes(sink) == _CHUNKED_HEADERS + chunked[:consumed]
+
+
+@pytest.mark.asyncio
+async def test_body_limit_without_a_connection_sink() -> None:
+    headers = _content_length_headers(11)
+    reader = _fragment_reader([headers + b"hello", b" world"])
+
+    outcome = await AsyncRequestParser(max_body_kept=3).parse(reader)
+
+    assert outcome.complete_request is not None
+    assert outcome.complete_request.body == b"hel"
+    assert outcome.complete_request.body_size == 11
+    assert outcome.wire_bytes == headers + b"hel"

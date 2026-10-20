@@ -173,7 +173,30 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
             "(default: unlimited)"
         ),
     )
-    return parser.parse_args(args)
+    parser.add_argument(
+        "--max-recorded-body-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Keep only the first N bytes of each stubbed request body; "
+            "the rest is read and discarded (default: keep everything). "
+            "Requires --mode intercept, or --mode http-proxy with "
+            "--config-file"
+        ),
+    )
+    parsed = parser.parse_args(args)
+    stubbed = parsed.mode == "intercept" or (
+        parsed.mode == "http-proxy" and parsed.config_file is not None
+    )
+    if parsed.max_recorded_body_bytes is not None:
+        if parsed.max_recorded_body_bytes < 0:
+            parser.error("--max-recorded-body-bytes must be non-negative")
+        if not stubbed:
+            parser.error(
+                "--max-recorded-body-bytes needs a stub server: use "
+                "--mode intercept, or --mode http-proxy with --config-file"
+            )
+    return parsed
 
 
 def configure_server(
@@ -219,6 +242,7 @@ async def run_http_proxy(args: argparse.Namespace) -> None:
         port=args.port,
         on_headers_received=handle_expect_header,
         forward_proxy=forward_proxy,
+        max_recorded_body_bytes=args.max_recorded_body_bytes,
     )
     configure_server(server, args)
 
@@ -257,7 +281,9 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
     """Start and run the TLS proxy."""
     server: AsyncHTTPTestServer | None = None
     if args.mode == "intercept":
-        server = AsyncHTTPTestServer()
+        server = AsyncHTTPTestServer(
+            max_recorded_body_bytes=args.max_recorded_body_bytes
+        )
         configure_server(server, args)
 
     ca: TLSProxyCA | None = None
