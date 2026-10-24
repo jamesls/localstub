@@ -7,6 +7,10 @@
   it to its end, so memory stays bounded for large uploads.
   `RecordedHTTPRequest.full_body_size` gives the size received when a body
   was cut short.
+* Add `write_chunk_size` (CLI: `--write-chunk-size`) to send each response
+  body as writes of at most N bytes. Over TLS this lowers server CPU for
+  large bodies and speeds up fast clients such as the AWS CRT; slower
+  readers can see lower throughput, so the default is unchanged.
 * Large bodies cost less memory and time: request bodies are freed without
   waiting for the cyclic garbage collector, a recorded request or response
   holds its body once, and request bodies are read with fewer copies and

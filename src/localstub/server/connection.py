@@ -378,7 +378,7 @@ class RecordingStreamWriter:
         self._sent_buffer = sent_buffer
         self._coalesce_size = coalesce_size
         self._state = state
-        self._chunks: list[bytes] = []
+        self._chunks: list[bytes | memoryview] = []
         self._pending = bytearray()
 
     @property
@@ -402,7 +402,7 @@ class RecordingStreamWriter:
         self._chunks.clear()
         self._pending.clear()
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes | memoryview) -> None:
         if len(data) >= self._coalesce_size:
             if self._pending:
                 self._chunks.append(bytes(self._pending))
@@ -509,6 +509,7 @@ class HTTPConnection:
         sleep: Sleep,
         track_forwarder: TrackForwarder,
         max_body_kept: int | None = None,
+        write_chunk_size: int | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -519,6 +520,7 @@ class HTTPConnection:
         self._sleep = sleep
         self._track_forwarder = track_forwarder
         self._max_body_kept = max_body_kept
+        self._write_chunk_size = write_chunk_size
         self._sink = ConsumedByteSink(state)
         self._meta = ConnectionMeta(client=state.client)
         self._policy = KeepAlivePolicy()
@@ -1269,10 +1271,18 @@ class HTTPConnection:
         strategy = self._pipeline.transmission()
         self._state.phase = "response_body"
         if isinstance(strategy, ImmediateTransmission):
-            # Two writes rather than one concatenation, so the body is
+            # Head and body are written separately, so the body is
             # never copied and the recording can share it.
             self._write(head)
-            self._write(wire_body)
+            step = self._write_chunk_size
+            if step is None or len(wire_body) <= step:
+                self._write(wire_body)
+            else:
+                # Slices of one memoryview: still no copy of the body.
+                view = memoryview(wire_body)
+                for start in range(0, len(view), step):
+                    self._write(view[start : start + step])
+                    await self._drain()
             await self._drain()
             return should_close, None
 
@@ -1287,7 +1297,7 @@ class HTTPConnection:
         abort = await strategy.write_body(client_writer, wire_body)
         return should_close, abort
 
-    def _write(self, data: bytes) -> None:
+    def _write(self, data: bytes | memoryview) -> None:
         try:
             self._writer.write(data)
         except OSError as exc:

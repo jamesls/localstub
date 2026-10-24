@@ -78,7 +78,7 @@ class LazyBytes:
 
     __slots__ = ("parts",)
 
-    def __init__(self, parts: Iterable[bytes]) -> None:
+    def __init__(self, parts: Iterable[bytes | memoryview]) -> None:
         self.parts = tuple(parts)
 
     def join(self) -> bytes:

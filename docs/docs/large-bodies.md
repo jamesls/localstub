@@ -90,5 +90,32 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The `lstub` CLI accepts `--max-recorded-body-bytes` too, but it prints
-every exchange to the console, which costs time on each request.
+The `lstub` CLI accepts `--max-recorded-body-bytes` and
+`--write-chunk-size` too, but it prints every exchange to the console,
+which costs time on each request.
+
+## Large downloads over TLS
+
+By default each response body goes out in one write. Over TLS, through
+`AsyncTLSInterceptProxy`, that encrypts the whole body into buffers as
+large as the body, which costs CPU in page faults and cache misses.
+`write_chunk_size` sends each body as writes of at most that many bytes
+and waits for each to drain, so the buffers stay small:
+
+```python
+server = AsyncHTTPTestServer(
+    recording_buffer_size=1,
+    max_connection_bytes=0,
+    write_chunk_size=256 * 1024,
+)
+```
+
+Whether it helps depends on the client. On a 2-core machine, with the
+AWS CRT downloading 1 GiB in 8 MiB ranged GETs over 10 connections
+through the TLS proxy, 256 KiB writes cut server CPU by about 37% and
+raised throughput from about 9.5 to 11.5 Gbps. Sizes from 64 KiB to
+512 KiB performed about the same. With 10 connections read by Python's
+`ssl` module, server CPU fell by a similar amount but throughput fell
+from about 5 to 3.4 Gbps, because less data is queued for each reader.
+Measure with your own client before turning it on. Over plain HTTP it
+does not help.

@@ -172,6 +172,33 @@ class TestParseArgs:
         with pytest.raises(SystemExit):
             parse_args(flags)
 
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            ["-m", "http-proxy", "-f", "/tmp/stub.json"],
+            ["-m", "intercept"],
+        ],
+    )
+    def test_parse_args_write_chunk_size_with_stub_server(
+        self, flags: list[str]
+    ) -> None:
+        args = parse_args([*flags, "--write-chunk-size", "262144"])
+        assert args.write_chunk_size == 262144
+
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            ["-m", "http-proxy", "--write-chunk-size", "262144"],
+            ["-m", "forward", "--write-chunk-size", "262144"],
+            ["-m", "intercept", "--write-chunk-size", "0"],
+        ],
+    )
+    def test_parse_args_rejects_unusable_write_chunk_size(
+        self, flags: list[str]
+    ) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(flags)
+
 
 class TestConfigureServer:
     def test_configure_server_sets_keep_alive_from_flags(self) -> None:

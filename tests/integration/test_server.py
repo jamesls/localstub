@@ -2347,6 +2347,31 @@ async def test_max_recorded_body_bytes_bounds_memory_on_keep_alive() -> None:
     assert peak < size
 
 
+@pytest.mark.asyncio
+async def test_write_chunk_size_sends_and_records_the_whole_body() -> None:
+    # Not a multiple of the chunk size, and the pattern repeats every
+    # 251 bytes, so a misplaced or dropped slice changes the bytes.
+    size = 3 * 65536 + 5
+    body = (bytes(range(251)) * (size // 251 + 1))[:size]
+
+    async with (
+        AsyncHTTPTestServer(
+            default_response=HTTPResponse.raw(body), write_chunk_size=65536
+        ) as server,
+        httpx.AsyncClient() as client,
+    ):
+        # Two requests on one keep-alive connection: framing holds.
+        first = await client.get(f"{server.url}a")
+        second = await client.get(f"{server.url}b")
+
+    assert first.content == body
+    assert second.content == body
+    assert len({request.client for request in server.requests}) == 1
+    recorded = server.responses[-1]
+    assert recorded.response.body == body
+    assert recorded.wire_raw_bytes.endswith(b"\r\n\r\n" + body)
+
+
 _CHUNKED_HELLO = (
     b"PUT /k HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
 )
