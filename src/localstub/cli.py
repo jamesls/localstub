@@ -173,7 +173,49 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
             "(default: unlimited)"
         ),
     )
-    return parser.parse_args(args)
+    parser.add_argument(
+        "--max-recorded-body-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Keep only the first N bytes of each stubbed request body; "
+            "the rest is read and discarded (default: keep everything). "
+            "Requires --mode intercept, or --mode http-proxy with "
+            "--config-file"
+        ),
+    )
+    parser.add_argument(
+        "--write-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "Send each stubbed response body as writes of at most N "
+            "bytes, which lowers server CPU for large bodies over TLS "
+            "(default: one write per body). Requires --mode intercept, "
+            "or --mode http-proxy with --config-file"
+        ),
+    )
+    parsed = parser.parse_args(args)
+    stubbed = parsed.mode == "intercept" or (
+        parsed.mode == "http-proxy" and parsed.config_file is not None
+    )
+    if parsed.max_recorded_body_bytes is not None:
+        if parsed.max_recorded_body_bytes < 0:
+            parser.error("--max-recorded-body-bytes must be non-negative")
+        if not stubbed:
+            parser.error(
+                "--max-recorded-body-bytes needs a stub server: use "
+                "--mode intercept, or --mode http-proxy with --config-file"
+            )
+    if parsed.write_chunk_size is not None:
+        if parsed.write_chunk_size < 1:
+            parser.error("--write-chunk-size must be at least 1")
+        if not stubbed:
+            parser.error(
+                "--write-chunk-size needs a stub server: use "
+                "--mode intercept, or --mode http-proxy with --config-file"
+            )
+    return parsed
 
 
 def configure_server(
@@ -219,6 +261,8 @@ async def run_http_proxy(args: argparse.Namespace) -> None:
         port=args.port,
         on_headers_received=handle_expect_header,
         forward_proxy=forward_proxy,
+        max_recorded_body_bytes=args.max_recorded_body_bytes,
+        write_chunk_size=args.write_chunk_size,
     )
     configure_server(server, args)
 
@@ -257,7 +301,10 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
     """Start and run the TLS proxy."""
     server: AsyncHTTPTestServer | None = None
     if args.mode == "intercept":
-        server = AsyncHTTPTestServer()
+        server = AsyncHTTPTestServer(
+            max_recorded_body_bytes=args.max_recorded_body_bytes,
+            write_chunk_size=args.write_chunk_size,
+        )
         configure_server(server, args)
 
     ca: TLSProxyCA | None = None

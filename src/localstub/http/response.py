@@ -16,6 +16,7 @@ from localstub.http.framing import (
 )
 from localstub.http.headers import Headers
 from localstub.http.responsespec import HTTPResponse
+from localstub.http.utils import lazy_bytes_fields
 
 LOG = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class _ReadStatus(Enum):
     ERROR = auto()
 
 
+@lazy_bytes_fields("wire_raw_bytes")
 @dataclass(frozen=True)
 class RecordedHTTPResponse:
     """An HTTPResponse we witnessed on the wire, plus the evidence.

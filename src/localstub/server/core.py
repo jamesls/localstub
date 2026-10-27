@@ -110,6 +110,14 @@ async def _drain_pending_accepts() -> None:
         await asyncio.sleep(0)
 
 
+def _checked_write_chunk_size(size: int | None) -> int | None:
+    if size is not None and size < 1:
+        raise ValueError(
+            f"write_chunk_size must be at least 1 or None, got {size}"
+        )
+    return size
+
+
 def _default_throttle_key(_: RecordedHTTPRequest) -> str:
     return "global"
 
@@ -144,6 +152,17 @@ class AsyncHTTPTestServer:
         its own ``AsyncioClient``, closed when the server closes.
         ``upstream_client=`` injects a client you constructed; the
         server never closes an injected client.
+      * bounded memory for large uploads: ``max_recorded_body_bytes``
+        reads every request body to its end but keeps only its first
+        N payload bytes (see ``RecordedHTTPRequest.full_body_size``).
+        Handlers see the kept prefix.  It cannot be combined with
+        forwarding, which needs the whole request.
+      * ``write_chunk_size`` sends each response body as writes of at
+        most N bytes, waiting for each to drain.  Over TLS this keeps
+        the encryption buffers small, which cuts server CPU for large
+        bodies and helps fast clients such as the AWS CRT; a slower
+        reader can see lower throughput.  The default sends each body
+        in one write.
     """
 
     def __init__(
@@ -164,8 +183,25 @@ class AsyncHTTPTestServer:
         max_connection_bytes: int | None = DEFAULT_MAX_CONNECTION_BYTES,
         keep_alive_timeout: float | None = None,
         max_requests_per_connection: int | None = None,
+        max_recorded_body_bytes: int | None = None,
+        write_chunk_size: int | None = None,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
+        if max_recorded_body_bytes is not None:
+            if max_recorded_body_bytes < 0:
+                raise ValueError(
+                    "max_recorded_body_bytes must be non-negative or None, "
+                    f"got {max_recorded_body_bytes}"
+                )
+            if (
+                forward_proxy
+                or upstream_client is not None
+                or raw_forwarder is not None
+            ):
+                raise ValueError(
+                    "max_recorded_body_bytes cannot be combined with "
+                    "forwarding, which needs the whole request"
+                )
         if max_connection_bytes is not None and max_connection_bytes < 0:
             raise ValueError(
                 "max_connection_bytes must be non-negative or None, "
@@ -240,6 +276,8 @@ class AsyncHTTPTestServer:
             timestamp_provider=self._timestamp_provider,
         )
         self._max_connection_bytes = max_connection_bytes
+        self._max_recorded_body_bytes = max_recorded_body_bytes
+        self._write_chunk_size = _checked_write_chunk_size(write_chunk_size)
 
         # Connection-level raw bytes retained by client address, so tests
         # can read them after the connection is gone.
@@ -946,6 +984,8 @@ class AsyncHTTPTestServer:
             services=self._services,
             sleep=self._sleep,
             track_forwarder=self._track_forwarder,
+            max_body_kept=self._max_recorded_body_bytes,
+            write_chunk_size=self._write_chunk_size,
         )
         self._connections[writer] = connection
         return connection

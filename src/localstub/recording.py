@@ -90,7 +90,7 @@ class BoundedByteBuffer:
         """Number of bytes evicted because the buffer was full."""
         return self._dropped + self._overflow()
 
-    def extend(self, data: bytes | bytearray) -> None:
+    def extend(self, data: bytes | bytearray | memoryview) -> None:
         """Append *data*, evicting the oldest bytes past the maximum."""
         length = len(data)
         if not length:

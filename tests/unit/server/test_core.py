@@ -151,6 +151,12 @@ def test_negative_max_connection_bytes_raises_value_error() -> None:
         AsyncHTTPTestServer(max_connection_bytes=-1)
 
 
+@pytest.mark.parametrize("size", [0, -1])
+def test_write_chunk_size_below_one_raises_value_error(size: int) -> None:
+    with pytest.raises(ValueError, match="at least 1 or None"):
+        AsyncHTTPTestServer(write_chunk_size=size)
+
+
 def test_default_response_getter_returns_close_connection() -> None:
     close = CloseConnection()
     server = AsyncHTTPTestServer()

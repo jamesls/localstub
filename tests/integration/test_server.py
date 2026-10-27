@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import gc
+import pickle
 import socket
 import time
+import tracemalloc
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 import pytest
@@ -11,8 +16,10 @@ import pytest_asyncio
 
 from localstub import AsyncHTTPTestServer, AsyncioClient, HTTPRequest
 from localstub.http.headers import Headers
-from localstub.http.request import RecordedHTTPRequest
+from localstub.http.request import ParsedRequest, RecordedHTTPRequest
 from localstub.middleware import (
+    HeaderContext,
+    HeaderNext,
     ResponderContext,
     ResponderNext,
     ResponseSpec,
@@ -27,6 +34,7 @@ from localstub.server import (
     SendResponse,
     ThrottledTransmission,
 )
+from tests.integration.wire import read_http_response
 
 
 @pytest_asyncio.fixture
@@ -2172,3 +2180,248 @@ async def test_trimmed_request_loses_its_timestamp():
         assert server.get_request_timestamp(server.requests[0]) > 0
         with pytest.raises(ValueError, match="not found"):
             server.get_request_timestamp(first)
+
+
+@pytest.mark.asyncio
+async def test_requests_are_freed_without_the_cyclic_gc() -> None:
+    # Large-body traffic allocates few objects, so the cyclic GC rarely
+    # runs; a request body held in a reference cycle then stays alive
+    # long after the recorder evicted it.
+    async def headers(ctx: HeaderContext, call_next: HeaderNext):
+        return await call_next()
+
+    async def responder(ctx: ResponderContext, call_next: ResponderNext):
+        return await call_next()
+
+    async def sender(
+        ctx: SenderContext, response: ResponseSpec, call_next: SenderNext
+    ) -> SendResult:
+        return await call_next(response)
+
+    gc.collect()
+    gc.disable()
+    try:
+        async with AsyncHTTPTestServer(
+            handler=lambda ctx: HTTPResponse.text("ok"),
+            recording_buffer_size=1,
+        ) as server:
+            server.use_headers(headers)
+            server.use(responder)
+            server.use_sender(sender)
+            reader, writer = await asyncio.open_connection(
+                server.host, server.port
+            )
+            for _ in range(3):
+                writer.write(
+                    b"PUT / HTTP/1.1\r\nHost: x\r\n"
+                    b"Content-Length: 5\r\n\r\nhello"
+                )
+                await read_http_response(reader)
+            writer.close()
+            await writer.wait_closed()
+        gc.set_debug(gc.DEBUG_SAVEALL)
+        gc.collect()
+        leaked = [
+            obj
+            for obj in gc.garbage
+            if isinstance(obj, (ParsedRequest, RecordedHTTPRequest))
+        ]
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+        gc.enable()
+
+    assert leaked == []
+
+
+async def _send_raw_request(server: AsyncHTTPTestServer, data: bytes) -> None:
+    reader, writer = await asyncio.open_connection(server.host, server.port)
+    writer.write(data)
+    await read_http_response(reader, timeout=10)
+    writer.close()
+    await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire",
+    [
+        b"PUT /k HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+        (
+            b"PUT /k HTTP/1.1\r\nHost: x\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n0\r\nx-amz-checksum: abc\r\n\r\n"
+        ),
+    ],
+)
+async def test_recorded_wire_bytes_behave_as_a_plain_field(
+    wire: bytes,
+) -> None:
+    async with AsyncHTTPTestServer() as server:
+        await _send_raw_request(server, wire)
+    recorded = server.requests[0]
+    response = server.responses[0]
+
+    rebuilt = RecordedHTTPRequest(
+        recorded.request,
+        recorded.as_received,
+        wire,
+        recorded.http_version,
+        recorded.client,
+    )
+    assert recorded.with_method("POST").wire_raw_bytes == wire
+    assert dataclasses.replace(recorded, client=None).wire_raw_bytes == wire
+    assert pickle.loads(pickle.dumps(recorded)) == recorded
+    assert recorded == rebuilt
+    assert hash(recorded) == hash(rebuilt)
+    assert recorded.wire_raw_bytes == wire
+    assert response.wire_raw_bytes.endswith(b"\r\n\r\n{}")
+    assert not hasattr(RecordedHTTPRequest, "wire_raw_bytes")
+
+
+@pytest.mark.asyncio
+async def test_recordings_hold_each_body_once() -> None:
+    size = 8 * 1024 * 1024
+    body = b"d" * size
+    tracemalloc.start()
+    try:
+        async with AsyncHTTPTestServer(
+            default_response=HTTPResponse.raw(body)
+        ) as server:
+            gc.collect()
+            before = tracemalloc.get_traced_memory()[0]
+            await _send_raw_request(
+                server,
+                b"PUT /k HTTP/1.1\r\nHost: x\r\n"
+                b"Content-Length: %d\r\n\r\n" % size + b"u" * size,
+            )
+            gc.collect()
+            retained = tracemalloc.get_traced_memory()[0] - before
+    finally:
+        tracemalloc.stop()
+
+    # The upload's body once; the download shares the response's body.
+    assert len(server.requests[0].wire_raw_bytes) > size
+    assert server.responses[0].wire_raw_bytes.endswith(body)
+    assert size <= retained < size * 1.5
+
+
+@pytest.mark.asyncio
+async def test_max_recorded_body_bytes_bounds_memory_on_keep_alive() -> None:
+    size = 4 * 1024 * 1024
+    body = bytes(range(256)) * (size // 256)
+    head = b"PUT /k HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % size
+    seen: list[int] = []
+
+    def handler(ctx: ResponderContext) -> HTTPResponse:
+        seen.append(len(ctx.request.body or b""))
+        return HTTPResponse.text("ok")
+
+    async with AsyncHTTPTestServer(
+        handler=handler, max_recorded_body_bytes=1000
+    ) as server:
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        tracemalloc.start()
+        try:
+            for _ in range(16):
+                writer.write(head)
+                view = memoryview(body)
+                for offset in range(0, size, 65536):
+                    writer.write(view[offset : offset + 65536])
+                    await writer.drain()
+                await read_http_response(reader, timeout=10)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        writer.close()
+        await writer.wait_closed()
+
+    assert seen == [1000] * 16
+    assert len({request.client for request in server.requests}) == 1
+    recorded = server.requests[-1]
+    assert recorded.body == body[:1000]
+    assert recorded.full_body_size == size
+    assert recorded.wire_raw_bytes == head + body[:1000]
+    assert peak < size
+
+
+@pytest.mark.asyncio
+async def test_write_chunk_size_sends_and_records_the_whole_body() -> None:
+    # Not a multiple of the chunk size, and the pattern repeats every
+    # 251 bytes, so a misplaced or dropped slice changes the bytes.
+    size = 3 * 65536 + 5
+    body = (bytes(range(251)) * (size // 251 + 1))[:size]
+
+    async with (
+        AsyncHTTPTestServer(
+            default_response=HTTPResponse.raw(body), write_chunk_size=65536
+        ) as server,
+        httpx.AsyncClient() as client,
+    ):
+        # Two requests on one keep-alive connection: framing holds.
+        first = await client.get(f"{server.url}a")
+        second = await client.get(f"{server.url}b")
+
+    assert first.content == body
+    assert second.content == body
+    assert len({request.client for request in server.requests}) == 1
+    recorded = server.responses[-1]
+    assert recorded.response.body == body
+    assert recorded.wire_raw_bytes.endswith(b"\r\n\r\n" + body)
+
+
+_CHUNKED_HELLO = (
+    b"PUT /k HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+)
+_CHUNKED_BODY = (
+    b"5\r\nhello\r\n6\r\n world\r\n0\r\nx-amz-checksum: abc\r\n\r\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit", "body", "wire_body", "full_body_size"),
+    [
+        (7, b"hello w", b"5\r\nhello\r\n6\r\n w", 11),
+        (5, b"hello", b"5\r\nhello\r\n", 11),
+        (0, b"", b"", 11),
+        (11, b"hello world", _CHUNKED_BODY, None),
+    ],
+)
+async def test_max_recorded_body_bytes_cuts_chunked_wire_at_the_limit(
+    limit: int, body: bytes, wire_body: bytes, full_body_size: int | None
+) -> None:
+    async with AsyncHTTPTestServer(max_recorded_body_bytes=limit) as server:
+        reader, writer = await asyncio.open_connection(
+            server.host, server.port
+        )
+        # Pipelined: the dropped bytes must not swallow the next request.
+        writer.write((_CHUNKED_HELLO + _CHUNKED_BODY) * 2)
+        await read_http_response(reader)
+        await read_http_response(reader)
+        writer.close()
+        await writer.wait_closed()
+
+    assert len(server.requests) == 2
+    for recorded in server.requests:
+        assert recorded.body == body
+        assert recorded.wire_raw_bytes == _CHUNKED_HELLO + wire_body
+        assert recorded.full_body_size == full_body_size
+        assert recorded.body_complete
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"forward_proxy": True, "max_recorded_body_bytes": 10}, "forward"),
+        ({"max_recorded_body_bytes": -1}, "non-negative"),
+    ],
+)
+async def test_max_recorded_body_bytes_rejects_unusable_settings(
+    kwargs: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        AsyncHTTPTestServer(**kwargs)
