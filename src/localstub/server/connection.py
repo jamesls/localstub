@@ -384,7 +384,11 @@ class RecordingStreamWriter:
     @property
     def bytes_sent(self) -> bytes:
         """Return bytes written for the current response."""
-        return self.sent_wire().join()
+        # Joined here rather than through sent_wire(), so a read neither
+        # allocates a LazyBytes nor seals the pending bytes.
+        if not self._pending:
+            return b"".join(self._chunks)
+        return b"".join((*self._chunks, self._pending))
 
     def sent_wire(self) -> LazyBytes:
         """Return bytes written for the current response, unjoined.

@@ -18,12 +18,18 @@ from localstub import (
     ResponderNext,
     ResponseSpec,
 )
+from localstub.http.utils import LazyBytes
 from localstub.recording import DEFAULT_MAX_CONNECTION_BYTES, BoundedByteBuffer
 from localstub.server import RecordingStreamWriter
 
 RESPONSE_OBJECT = {"ok": True, "items": [1, 2, 3]}
 RESPONSE_BODY = json.dumps(RESPONSE_OBJECT).encode("utf-8")
 LARGE_BODY = b"b" * (64 * 1024)
+LARGE_RESPONSE_HEAD = (
+    b"HTTP/1.1 200 OK\r\n"
+    b"Content-Type: application/octet-stream\r\n"
+    b"Content-Length: %d\r\n\r\n" % len(LARGE_BODY)
+)
 BODY_PIECE = b"p" * 8192
 BODY_PIECE_COUNT = 128
 SMALL_PIECE = b"s" * 16
@@ -286,6 +292,25 @@ def test_recording_writer_single_write_response(
     sent = benchmark(respond)
 
     assert sent is LARGE_BODY
+
+
+def test_recording_writer_head_and_body_response(
+    benchmark: BenchmarkFixture,
+    recording_writer: RecordingStreamWriter,
+) -> None:
+    # The server writes a response's head and body separately and
+    # records them unjoined, so the recording shares the body.
+    def respond() -> LazyBytes:
+        recording_writer.start_response()
+        recording_writer.write(LARGE_RESPONSE_HEAD)
+        recording_writer.write(LARGE_BODY)
+        return recording_writer.sent_wire()
+
+    sent = benchmark(respond)
+
+    head, body = sent.parts
+    assert head == LARGE_RESPONSE_HEAD
+    assert body is LARGE_BODY
 
 
 def test_recording_writer_body_in_many_writes(
