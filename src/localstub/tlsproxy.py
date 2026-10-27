@@ -68,6 +68,23 @@ async def _drain_pending_accepts() -> None:
         await asyncio.sleep(0)
 
 
+async def _close_and_wait(
+    writer: asyncio.StreamWriter,
+    client_transport: asyncio.WriteTransport,
+) -> None:
+    # Cancellation aborts the client socket transport rather than waiting
+    # for the peer's TLS shutdown reply.
+    writer.close()
+    close_task = asyncio.create_task(writer.wait_closed())
+    try:
+        # aclose() also awaits this protocol's close waiter.
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        client_transport.abort()
+        await asyncio.gather(close_task, return_exceptions=True)
+        raise
+
+
 def _hexdump(data: bytes, bytes_per_line: int = 32) -> str:
     """Format bytes as tcpdump -X style hexdump.
 
@@ -366,7 +383,9 @@ class AsyncTLSInterceptProxy:
         writer: asyncio.StreamWriter,
     ) -> None:
         _CLIENT_TASK.set(asyncio.current_task())
-        active_writer = writer
+        # The writer whose close is awaited on the way out; None while no
+        # writer's protocol owns the client transport.
+        active_writer: asyncio.StreamWriter | None = writer
         # Extract client port for logging
         peername = writer.get_extra_info("peername")
         client_port = peername[1] if peername else 0
@@ -387,18 +406,25 @@ class AsyncTLSInterceptProxy:
             writer.write(response_bytes)
             await writer.drain()
 
+            # start_tls() hands the transport to a new protocol, so the
+            # plain writer never sees the connection close and waiting on
+            # it would hang.  Neither this task nor aclose() waits on it
+            # from here on.
+            active_writer = None
+            self._client_writers.discard(writer)
             try:
                 tls_reader, tls_writer = await self._upgrade_to_tls(
                     writer, connect_host
                 )
             except (ConnectionResetError, ssl.SSLError) as exc:
                 # Many real clients immediately drop the connection if they
-                # don't trust our ephemeral CA. Treat this as a normal
-                # condition and avoid a noisy stack trace; provide a helpful
-                # hint instead.
+                # don't trust our ephemeral CA, or close the tunnel before
+                # starting TLS at all. Treat this as a normal condition and
+                # avoid a noisy stack trace; provide a helpful hint instead.
                 LOG.warning(
-                    "TLS handshake from client failed for %s:%s; "
-                    "client likely rejected the proxy CA (%s): %s",
+                    "TLS handshake from client failed for %s:%s; the "
+                    "client may have rejected the proxy CA (%s) or closed "
+                    "the tunnel without starting TLS: %r",
                     connect_host,
                     connect_port,
                     self._ca.ca_pem_path(),
@@ -406,7 +432,8 @@ class AsyncTLSInterceptProxy:
                 )
                 _close_log(f"lstub --> {client_id}", "TLS handshake failed")
                 return
-            active_writer = self._replace_client_writer(writer, tls_writer)
+            active_writer = tls_writer
+            self._client_writers.add(tls_writer)
 
             if self._default_mode == "forward":
                 await self._forward(
@@ -437,15 +464,8 @@ class AsyncTLSInterceptProxy:
             _close_log(f"lstub --> {client_id}", "unexpected error")
         finally:
             try:
-                active_writer.close()
-                close_task = asyncio.create_task(active_writer.wait_closed())
-                try:
-                    # aclose() also awaits this protocol's close waiter.
-                    await asyncio.shield(close_task)
-                except asyncio.CancelledError:
-                    writer.transport.abort()
-                    await asyncio.gather(close_task, return_exceptions=True)
-                    raise
+                if active_writer is not None:
+                    await _close_and_wait(active_writer, writer.transport)
             except OSError:
                 LOG.debug(
                     "Failed to close TLS proxy client writer",
@@ -456,16 +476,8 @@ class AsyncTLSInterceptProxy:
                 # Close its transport if shutdown fails or is cancelled.
                 writer.close()
                 self._client_writers.discard(writer)
-                self._client_writers.discard(active_writer)
-
-    def _replace_client_writer(
-        self,
-        current: asyncio.StreamWriter,
-        replacement: asyncio.StreamWriter,
-    ) -> asyncio.StreamWriter:
-        self._client_writers.add(replacement)
-        self._client_writers.discard(current)
-        return replacement
+                if active_writer is not None:
+                    self._client_writers.discard(active_writer)
 
     def _client_connected(
         self,
