@@ -1,29 +1,32 @@
 # Large bodies and benchmarking
 
-localstub records every request it receives, so a test can assert on
-it afterwards. With large uploads, such as multi-gigabyte S3 objects,
-or when the server is the endpoint of a throughput benchmark, those
-recordings are what uses memory. This page shows the settings that
-keep memory bounded.
+localstub records every request it receives so that a test can assert on it
+afterwards. For large uploads, such as multi-gigabyte objects, or for a
+throughput benchmark, those recordings account for most of the server's memory
+use. This page covers the settings that bound that memory, and an option that
+cuts server CPU use for large downloads over TLS.
 
-## What the server keeps
+## Recorded data
 
 - Each recorded request holds its body. For a `Content-Length` body,
-  `wire_raw_bytes` shares it and is assembled only when you read it,
-  so the body is held once. A chunked body's wire bytes include the
-  chunk framing, so they are held alongside the body.
-- Each recorded response shares the body of the `HTTPResponse` you
-  configured, so serving one `bytes` object for every download keeps
-  one copy no matter how many responses are recorded.
+  `wire_raw_bytes` reuses the body's bytes and builds its value only
+  when you read it, so the request holds one copy of the body. For a
+  chunked body, the wire bytes include the chunk framing, so the
+  request holds them in addition to the body.
+- Each recorded response refers to the body of the `HTTPResponse` you
+  configured instead of copying it. If every download serves the same
+  `bytes` object, the server holds one copy of it however many
+  responses it records.
 - The server keeps the most recent `recording_buffer_size` requests,
   responses and exchanges (256 by default).
-- For each client address it keeps the most recent
-  `max_connection_bytes` bytes sent and received (1 MiB by default).
+- For each client address, the server keeps a byte log of the most
+  recent `max_connection_bytes` bytes sent and received (1 MiB by
+  default).
 
-So with the defaults, a stream of 1 GiB `Content-Length` uploads
-keeps up to 256 GiB of request bodies.
+With the defaults, a stream of 1 GiB `Content-Length` uploads keeps up
+to 256 GiB of request bodies.
 
-## Bounding memory
+## Bound memory use
 
 ```python
 server = AsyncHTTPTestServer(
@@ -35,37 +38,38 @@ server = AsyncHTTPTestServer(
 
 - `recording_buffer_size=1` keeps only the latest request, response
   and exchange.
-- `max_connection_bytes=0` turns off the per-connection byte log.
-- `max_recorded_body_bytes=1024` reads every request body to its end,
-  so framing and keep-alive work as usual, but keeps only its first
-  1024 bytes.
+- `max_connection_bytes=0` turns off the byte log.
+- `max_recorded_body_bytes=1024` keeps only the first 1024 bytes of
+  each request body. The server still reads every body to its end, so
+  framing and keep-alive work as usual.
 
-With all three, memory stays flat however large the bodies are and
-however many requests arrive.
+With all three settings, memory use stays constant regardless of body
+size or request count. The repository's
+`docs/examples/large_uploads.py` shows this configuration with 64 MiB
+uploads.
 
-`docs/examples/large_uploads.py` in the repository shows this with
-64 MiB uploads.
+## Truncated request bodies
 
-## What a limited recording contains
+If a request body is longer than `max_recorded_body_bytes`, the server
+truncates the recorded body:
 
-When `max_recorded_body_bytes` cuts a body short:
-
-- `request.body` is the first N bytes of the payload. Handlers and
-  middleware see the same prefix.
+- `request.body` holds the first `max_recorded_body_bytes` bytes of
+  the payload. Handlers and middleware see the same prefix.
 - `request.full_body_size` is the number of payload bytes the client
-  sent. It is `None` when the body was kept whole.
-- `request.wire_raw_bytes` stops at the same payload byte, so later
-  chunk framing and trailers, such as a trailing checksum, are not
-  recorded.
+  sent. If the server kept the whole body, it is `None`.
+- `request.wire_raw_bytes` ends at the same payload byte. The server
+  does not record the chunk framing or trailers that follow, such as
+  a trailing checksum.
 
-The option cannot be combined with forwarding (`forward_proxy`,
-`upstream_client` or `raw_forwarder`), which needs the whole request.
+Forwarding needs the whole request, so `max_recorded_body_bytes`
+cannot be combined with `forward_proxy`, `upstream_client` or
+`raw_forwarder`. The constructor raises `ValueError` if you pass both.
 
-## Running a benchmark endpoint
+## Run a benchmark endpoint
 
 The server runs on one asyncio event loop. Run it in its own process
-so the client under test does not compete with it for the same core
-and interpreter lock:
+so the client under test does not compete with it for the same CPU
+core and the interpreter lock:
 
 ```python
 import asyncio
@@ -90,17 +94,20 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The `lstub` CLI accepts `--max-recorded-body-bytes` and
-`--write-chunk-size` too, but it prints every exchange to the console,
-which costs time on each request.
+The `lstub` CLI also accepts `--max-recorded-body-bytes` and
+`--write-chunk-size`. The CLI prints every exchange to the console,
+which adds time to each request, so use a script like the one above
+for benchmarks.
 
-## Large downloads over TLS
+## Large TLS downloads
 
-By default each response body goes out in one write. Over TLS, through
-`AsyncTLSInterceptProxy`, that encrypts the whole body into buffers as
-large as the body, which costs CPU in page faults and cache misses.
-`write_chunk_size` sends each body as writes of at most that many bytes
-and waits for each to drain, so the buffers stay small:
+By default, the server sends each response body in one write. Through
+`AsyncTLSInterceptProxy`, that write encrypts the whole body into
+buffers as large as the body, and filling those buffers costs CPU in
+page faults and cache misses. If you set `write_chunk_size`, the
+server splits each body into writes of at most that many bytes and
+waits for each write to drain before it sends the next. The buffers
+then stay small:
 
 ```python
 server = AsyncHTTPTestServer(
@@ -110,12 +117,14 @@ server = AsyncHTTPTestServer(
 )
 ```
 
-Whether it helps depends on the client. On a 2-core machine, with the
-AWS CRT downloading 1 GiB in 8 MiB ranged GETs over 10 connections
-through the TLS proxy, 256 KiB writes cut server CPU by about 37% and
-raised throughput from about 9.5 to 11.5 Gbps. Sizes from 64 KiB to
-512 KiB performed about the same. With 10 connections read by Python's
-`ssl` module, server CPU fell by a similar amount but throughput fell
-from about 5 to 3.4 Gbps, because less data is queued for each reader.
-Measure with your own client before turning it on. Over plain HTTP it
-does not help.
+`write_chunk_size` helps only over TLS, and only with some clients. In
+one test on a 2-core machine, the AWS CRT downloaded 1 GiB through the
+TLS proxy in 8 MiB ranged GETs over 10 connections. With 256 KiB
+writes, server CPU use fell by about 37% and throughput rose from
+about 9.5 to 11.5 Gbps. Write sizes from 64 KiB to 512 KiB gave about
+the same results. A client that read 10 connections with Python's
+`ssl` module saw server CPU use fall by a similar amount, but its
+throughput fell from about 5 to 3.4 Gbps because less data is queued
+for each reader.
+
+Measure with your own client before you turn on `write_chunk_size`.
