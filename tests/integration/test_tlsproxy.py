@@ -374,6 +374,72 @@ async def test_aclose_cancels_forward_connection_after_tls_upgrade() -> None:
         await upstream.wait_closed()
 
 
+async def _open_tunnel_without_tls(
+    proxy: AsyncTLSInterceptProxy,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    reader, writer = await asyncio.open_connection(*proxy.address)
+    writer.write(
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+    )
+    await writer.drain()
+    response = await asyncio.wait_for(
+        reader.readuntil(b"\r\n\r\n"), timeout=1.0
+    )
+    assert response.startswith(b"HTTP/1.1 200")
+    return reader, writer
+
+
+async def _assert_aclose_finishes(
+    proxy: AsyncTLSInterceptProxy, timeout: float
+) -> None:
+    # Fail rather than hang when shutdown is stuck: cancelling aclose(), as
+    # wait_for() does, or calling it again (e.g. from `async with`) waits
+    # on the stuck shutdown.  The test loop's teardown cancels it instead.
+    close_task = asyncio.create_task(proxy.aclose())
+    done, _ = await asyncio.wait({close_task}, timeout=timeout)
+    assert close_task in done
+    await close_task
+
+
+@pytest.mark.parametrize("drop", ["close", "write_eof"])
+@pytest.mark.asyncio
+async def test_aclose_completes_after_client_drops_tunnel_before_tls(
+    drop: str,
+) -> None:
+    proxy = AsyncTLSInterceptProxy()
+    await proxy.start()
+    reader, writer = await _open_tunnel_without_tls(proxy)
+    try:
+        if drop == "close":
+            writer.close()
+            await writer.wait_closed()
+        else:
+            writer.write_eof()
+            # The proxy closes its end once the handshake fails.
+            eof = await asyncio.wait_for(reader.read(), timeout=1.0)
+            assert eof == b""
+
+        await _assert_aclose_finishes(proxy, timeout=2.0)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_aclose_completes_while_client_withholds_tls_handshake() -> None:
+    proxy = AsyncTLSInterceptProxy()
+    await proxy.start()
+    reader, writer = await _open_tunnel_without_tls(proxy)
+    try:
+        await _assert_aclose_finishes(proxy, timeout=3.0)
+
+        eof = await asyncio.wait_for(reader.read(), timeout=0.5)
+        assert eof == b""
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 @pytest.mark.asyncio
 async def test_aclose_called_from_request_handler_completes() -> None:
     aclose_finished = asyncio.Event()
