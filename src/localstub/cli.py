@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import shlex
 import signal
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -342,6 +343,19 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
             )
             console.print(f"[dim]CA certificate:[/] {proxy.ca.ca_pem_path()}")
             console.print(f"[dim]Keystore:[/] {proxy.ca.ca_pkcs12_path()}")
+            console.print()
+            console.print("[dim]Client environment:[/]")
+            for name, value in proxy.client_env_vars().items():
+                # Printed verbatim on one line so it can be pasted into a
+                # shell, however long the path or whatever it contains.
+                console.print(
+                    f"export {name}={shlex.quote(value)}",
+                    markup=False,
+                    highlight=False,
+                    emoji=False,
+                    soft_wrap=True,
+                )
+            console.print()
             console.print("[dim]Press Ctrl+C to stop[/]")
             console.print()
 

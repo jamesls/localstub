@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import shlex
 import signal
 import socket
 import ssl
@@ -73,6 +74,63 @@ async def test_cli_intercept_mode_writes_recorded_traffic(
         records = output_path.read_text().splitlines()
         assert len(records) == 1
         assert json.loads(records[0])["request"]["path"] == "/recorded"
+    finally:
+        cli_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cli_task
+
+
+def _parse_exports(output: str) -> dict[str, str]:
+    exports: dict[str, str] = {}
+    for line in output.splitlines():
+        if line.startswith("export "):
+            _, assignment = shlex.split(line)
+            name, _, value = assignment.partition("=")
+            exports[name] = value
+    return exports
+
+
+@pytest.mark.asyncio
+async def test_cli_prints_exports_that_route_a_client_to_the_stub(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with socket.socket() as available_port:
+        available_port.bind(("127.0.0.1", 0))
+        port = available_port.getsockname()[1]
+
+    # A space in the CA path fails unless the exports are shell-quoted,
+    # and the shortcode fails unless Rich's emoji expansion is disabled.
+    ca_dir = tmp_path / "ca dir:smile:"
+    args = parse_args([
+        "--mode",
+        "intercept",
+        "--port",
+        str(port),
+        "--ca-dir",
+        str(ca_dir),
+    ])
+    cli_task = asyncio.create_task(run_tls_proxy(args))
+
+    try:
+        output = ""
+        async with asyncio.timeout(2.0):
+            while "Press Ctrl+C" not in output:
+                await asyncio.sleep(0.01)
+                output += capsys.readouterr().out
+
+        exports = _parse_exports(output)
+        verify_context = ssl.create_default_context(
+            cafile=exports["SSL_CERT_FILE"]
+        )
+        async with httpx.AsyncClient(
+            proxy=exports["HTTPS_PROXY"],
+            verify=verify_context,
+            http2=False,
+        ) as client:
+            response = await client.get("https://example.com/exported")
+
+        assert response.status_code == 200
     finally:
         cli_task.cancel()
         with pytest.raises(asyncio.CancelledError):

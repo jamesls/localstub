@@ -38,6 +38,11 @@
   `localstub` and closes its pool with `aclose()` or `async with`.
   `AsyncHTTPTestServer(forward_proxy=True)` builds a server-owned client
   and closes it in `aclose()`; the CLI uses this.
+* Add `AsyncTLSInterceptProxy.client_env_vars()`, which returns the environment
+  variables that route a client's HTTPS traffic through the proxy:
+  `HTTPS_PROXY`, plus `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+  `CURL_CA_BUNDLE` and `AWS_CA_BUNDLE` pointing at the proxy's CA. The
+  `lstub` CLI prints them as `export` lines when it starts.
 * Header values may contain non-ASCII octets (obs-text). `Headers` keeps
   the original bytes and decodes them as Latin-1; `Headers.raw` exposes the
   bytes and `Headers.from_raw_items()` builds headers from them. Server

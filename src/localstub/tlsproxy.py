@@ -223,6 +223,27 @@ class AsyncTLSInterceptProxy:
     def ca(self) -> TLSProxyCA:
         return self._ca
 
+    def client_env_vars(self) -> dict[str, str]:
+        """Environment variables that route a client's HTTPS through here.
+
+        ``HTTPS_PROXY`` names this proxy, and the CA bundle variables
+        that common clients read name this proxy's CA.  Returns a new
+        dict the caller can edit.  Raises RuntimeError before the proxy
+        has started.
+        """
+        proxy_url = self.endpoint_url
+        ca_bundle = str(self._ca.ca_pem_path())
+        # Intentionally omit lowercase https_proxy. This mapping targets
+        # common environment variables such as HTTPS_PROXY, following the
+        # more common uppercase naming convention.
+        return {
+            "HTTPS_PROXY": proxy_url,
+            "SSL_CERT_FILE": ca_bundle,
+            "REQUESTS_CA_BUNDLE": ca_bundle,
+            "CURL_CA_BUNDLE": ca_bundle,
+            "AWS_CA_BUNDLE": ca_bundle,
+        }
+
     async def next_request(
         self, timeout: float | None = None
     ) -> RecordedHTTPRequest:

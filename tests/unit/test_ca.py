@@ -96,6 +96,15 @@ class TestFromDirectory:
         assert ca.ca_pem_path() == ca_dir / "ca.pem"
         assert ca.ca_pkcs12_path() == ca_dir / "ca.p12"
 
+    def test_relative_directory_yields_absolute_paths(
+        self, tmp_path: Path
+    ) -> None:
+        ca_dir = tmp_path / "relative_ca"
+        ca = TLSProxyCA.from_directory(Path(os.path.relpath(ca_dir)))
+
+        assert ca.ca_pem_path() == ca_dir / "ca.pem"
+        assert ca.ca_pkcs12_path() == ca_dir / "ca.p12"
+
     def test_generates_ca_when_directory_is_empty(
         self, tmp_path: Path
     ) -> None:

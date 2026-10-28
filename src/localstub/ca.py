@@ -70,9 +70,11 @@ class TLSProxyCA:
                     f.write(self._ca.cert_pem.bytes())
                     self._ca_pem_path = Path(f.name)
             else:
-                self._ca_pem_path = pem_path
+                # Resolved now so the paths stay valid when exported to a
+                # process running from a different working directory.
+                self._ca_pem_path = pem_path.resolve()
             self._ca_pkcs12_path = (
-                pkcs12_path
+                pkcs12_path.resolve()
                 if pkcs12_path is not None
                 else self._ca_pem_path.with_suffix(".p12")
             )

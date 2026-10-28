@@ -160,6 +160,23 @@ async def test_proxy_endpoint_url_matches_bound_address() -> None:
 
 
 @pytest.mark.asyncio
+async def test_client_env_vars_point_at_proxy_url_and_ca_bundle() -> None:
+    proxy = AsyncTLSInterceptProxy()
+    with pytest.raises(RuntimeError):
+        proxy.client_env_vars()
+
+    async with proxy:
+        ca_bundle = str(proxy.ca.ca_pem_path())
+        assert proxy.client_env_vars() == {
+            "HTTPS_PROXY": proxy.endpoint_url,
+            "SSL_CERT_FILE": ca_bundle,
+            "REQUESTS_CA_BUNDLE": ca_bundle,
+            "CURL_CA_BUNDLE": ca_bundle,
+            "AWS_CA_BUNDLE": ca_bundle,
+        }
+
+
+@pytest.mark.asyncio
 async def test_next_request_and_response_timeout_raise():
     proxy = AsyncTLSInterceptProxy()
 

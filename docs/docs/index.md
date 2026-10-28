@@ -9,8 +9,9 @@ wire so your tests can inspect it.
 localstub also includes a TLS intercept proxy so you can test a client
 without changing its code. Set the `HTTPS_PROXY` and CA bundle
 environment variables that most HTTP clients already honor, and the
-client's traffic goes to the stub instead of the real server. This
-also lets you see the exact bytes an existing client sends.
+client's traffic goes to the stub instead of the real server.
+`proxy.client_env_vars()` returns those variables. This also lets you see
+the exact bytes an existing client sends.
 
 !!! warning "Pre-1.0 software"
 
