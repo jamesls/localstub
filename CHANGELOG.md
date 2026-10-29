@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.0
 
 * Add `max_recorded_body_bytes` (CLI: `--max-recorded-body-bytes`) to keep
   only the first N payload bytes of each request body while still reading
