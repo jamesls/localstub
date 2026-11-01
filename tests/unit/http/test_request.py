@@ -2861,6 +2861,13 @@ _BAD_EXTENSION_BEFORE_SCAN_ERROR = (
     b"2\r\n\x00\x00\r\n1;\x01\r\n\x00\r\nX"
 )
 
+# Each read ends with a chunk-size line whose data starts the next read.
+_SIZE_LINES_BEFORE_DATA = [
+    _CHUNKED_HEADERS + b"1\r\n",
+    b"a\r\n1\r\n",
+    b"b\r\n0\r\n\r\n",
+]
+
 
 @pytest.mark.asyncio
 @given(case=_limited_parse_cases())
@@ -2878,6 +2885,10 @@ _BAD_EXTENSION_BEFORE_SCAN_ERROR = (
         2,
     )
 )
+# A size line read before its data is cut with that data, at the limit
+# or once a full chunk has spent it.
+@example(case=(b"".join(_SIZE_LINES_BEFORE_DATA), _SIZE_LINES_BEFORE_DATA, 0))
+@example(case=(b"".join(_SIZE_LINES_BEFORE_DATA), _SIZE_LINES_BEFORE_DATA, 1))
 async def test_body_limit_changes_only_what_is_kept(
     case: tuple[bytes, list[bytes], int],
 ) -> None:

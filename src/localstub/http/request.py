@@ -1203,7 +1203,13 @@ class AsyncRequestParser:
                     complete=True,
                 )
 
-            if scan.partial is not None and scan.data_left:
+            if (
+                scan.partial is not None
+                and scan.data_left
+                # A size line waits for its chunk's first data byte, so
+                # the limit cuts it from the wire however reads split.
+                and scan.partial[1] > scan.partial[0]
+            ):
                 # Inside a chunk's data, every buffered byte belongs to
                 # the body, so all of them are delivered now.
                 deliver, data_left = len(buffer), scan.data_left
