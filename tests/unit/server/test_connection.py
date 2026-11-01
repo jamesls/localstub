@@ -213,6 +213,7 @@ def _harness(
     received: BoundedByteBuffer | None = None,
     sent: BoundedByteBuffer | None = None,
     timestamp_provider: TimestampProvider | None = None,
+    write_chunk_size: int | None = None,
 ) -> Harness:
     responded: list[str] = []
     forwarders: list[RawForwarder] = []
@@ -266,6 +267,7 @@ def _harness(
         ),
         sleep=sleep or RecordingSleep(),
         track_forwarder=forwarders.append,
+        write_chunk_size=write_chunk_size,
     )
     return Harness(
         reader=stream_reader,
@@ -1658,6 +1660,69 @@ async def test_header_phase_send_drain_failure_preserves_response(
     assert recorded.status == response.status
     assert recorded.wire_raw_bytes == harness.written
     assert closed.bytes_written == len(recorded.wire_raw_bytes)
+
+
+_SLICED_BODY = b"0123456789"
+
+
+async def _send_from_headers(
+    ctx: HeaderContext, call_next: HeaderNext
+) -> HeaderDecision:
+    _ = call_next
+    await ctx.send(HTTPResponse.raw(_SLICED_BODY))
+    return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["header", "responder"])
+async def test_write_chunk_size_drains_each_body_slice(phase: str) -> None:
+    body = _SLICED_BODY
+    harness = _harness(
+        response=HTTPResponse.raw(body),
+        header_middlewares=[_send_from_headers] if phase == "header" else None,
+        write_chunk_size=4,
+    )
+    harness.feed(GET, eof=True)
+
+    await harness.run()
+
+    calls = [
+        (name, bytes(args[0]) if args else None)
+        for name, args, _ in harness.writer.mock_calls
+        if name in {"write", "drain"}
+    ]
+    head = calls[0][1]
+    assert head is not None
+    assert calls[1:7] == [
+        ("write", body[:4]),
+        ("drain", None),
+        ("write", body[4:8]),
+        ("drain", None),
+        ("write", body[8:]),
+        ("drain", None),
+    ]
+    assert harness.recorder.responses[0].wire_raw_bytes == head + body
+
+
+@pytest.mark.asyncio
+async def test_header_phase_send_failure_mid_body_keeps_sent_bytes() -> None:
+    writer = fake_writer()
+    writer.drain.side_effect = ConnectionResetError("peer reset")
+    harness = _harness(
+        header_middlewares=[_send_from_headers],
+        writer=writer,
+        write_chunk_size=4,
+    )
+    harness.feed(POST_HEAD + b"0123456789", eof=True)
+
+    closed = await harness.run()
+
+    assert closed.reason == "client"
+    exchange = harness.recorder.exchanges[0]
+    assert exchange.closed is closed
+    assert exchange.response is not None
+    assert exchange.response.wire_raw_bytes.endswith(b"\r\n\r\n0123")
+    assert exchange.response.wire_raw_bytes == harness.written
 
 
 @pytest.mark.asyncio

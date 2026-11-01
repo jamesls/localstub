@@ -145,22 +145,55 @@ def test_scan_chunk_payloads_reports_partial_chunk_data() -> None:
 
 
 @pytest.mark.parametrize(
-    ("buffer", "missing"),
+    ("buffer", "data_left"),
     [
-        # 10 data bytes and the CRLF follow the size line.
-        (b"a\r\n", 12),
-        (b"a\r\nabc", 9),
-        (b"a\r\n0123456789\r", 1),
-        (b"3\r\nabc\r\na;ext=1\r\nab", 10),
+        # 10 data bytes follow the size line.
+        (b"a\r\n", 10),
+        (b"a\r\nabc", 7),
+        (b"3\r\nabc\r\na;ext=1\r\nab", 8),
+        # Only the CRLF is still to come.
+        (b"a\r\n0123456789\r", 0),
         # Until the size line is complete nothing is known.
         (b"3\r\nabc\r\na", 0),
         (b"0\r\n", 0),
     ],
 )
-def test_scan_chunk_payloads_reports_bytes_missing_from_partial_chunk(
-    buffer: bytes, missing: int
+def test_scan_chunk_payloads_reports_data_left_in_partial_chunk(
+    buffer: bytes, data_left: int
 ) -> None:
-    assert scan_chunk_payloads(bytearray(buffer)).missing == missing
+    assert scan_chunk_payloads(bytearray(buffer)).data_left == data_left
+
+
+@pytest.mark.parametrize(
+    ("buffer", "payloads", "partial", "resume_from", "data_left"),
+    [
+        (b"lo\r\n3\r\nabc\r\n", ((0, 2), (7, 10)), None, 12, 0),
+        (b"lo\r\n3\r\nab", ((0, 2),), (7, 9), 4, 1),
+        (b"l", (), (0, 1), 0, 1),
+        (b"lo\r", (), (0, 2), 0, 0),
+    ],
+)
+def test_scan_chunk_payloads_with_data_left_resumes_inside_a_chunk(
+    buffer: bytes,
+    payloads: tuple[tuple[int, int], ...],
+    partial: tuple[int, int] | None,
+    resume_from: int,
+    data_left: int,
+) -> None:
+    # The rest of "5\r\nhello\r\n" after "5\r\nhel" was consumed.
+    scan = scan_chunk_payloads(bytearray(buffer), data_left=2)
+
+    assert scan.payloads == payloads
+    assert scan.partial == partial
+    assert scan.resume_from == resume_from
+    assert scan.data_left == data_left
+
+
+def test_scan_chunk_payloads_with_data_left_checks_the_chunk_crlf() -> None:
+    with pytest.raises(ChunkScanError) as excinfo:
+        scan_chunk_payloads(bytearray(b"loX\n"), data_left=2)
+
+    assert excinfo.value.offset == 3
 
 
 def test_scan_chunk_payloads_size_line_cut_after_cr_is_incomplete() -> None:

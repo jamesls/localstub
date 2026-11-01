@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+* `AsyncTLSInterceptProxy.client_env_vars()`, and the `lstub` exports,
+  also set `https_proxy` and an empty `NO_PROXY` and `no_proxy`. curl,
+  Python's urllib and httpx prefer an inherited `https_proxy` over
+  `HTTPS_PROXY`, and an inherited exclusion could skip the proxy.
+* Fixes:
+  * `max_recorded_body_bytes` bounds memory for chunked uploads with
+    large chunks. A chunk's data is handled as it arrives instead of
+    being buffered until the chunk ends.
+  * A request body cut short by `max_recorded_body_bytes` is held once
+    instead of twice.
+  * A malformed chunked request whose body fits within
+    `max_recorded_body_bytes` keeps its whole `wire_raw_bytes`.
+  * `AsyncTLSInterceptProxy(max_read=...)` caps every read of a
+    forwarded request again, including reads of its body.
+  * Recorded responses sent with `write_chunk_size` can be pickled and
+    deep-copied.
+  * Responses sent from header middleware (`ctx.send()` or
+    `on_headers_received`) honor `write_chunk_size`, and their
+    recordings share the response body instead of copying it.
+
 ## v0.1.0
 
 * Add `max_recorded_body_bytes` (CLI: `--max-recorded-body-bytes`) to keep

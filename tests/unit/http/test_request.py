@@ -1235,20 +1235,6 @@ async def test_http_request_reader_without_writer_has_none_client() -> None:
     assert request.client is None
 
 
-@pytest.mark.asyncio
-async def test_http_request_reader_with_custom_max_read() -> None:
-    request_data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
-    reader = asyncio.StreamReader()
-    reader.feed_data(request_data)
-    reader.feed_eof()
-
-    http_reader = HTTPRequestReader(max_read=1024)
-    request = await http_reader.read_request(reader)
-
-    assert request is not None
-    assert request.method == "GET"
-
-
 def test_http_request_json_body_returns_none_for_missing_body() -> None:
     request = HTTPRequest(method="GET", target="/")
     assert request.json_body is None
@@ -2687,6 +2673,42 @@ async def test_http_request_reader_without_content_headers_has_no_body() -> (
     assert request.body_complete
 
 
+class _ReadSizeRecorder:
+    """A byte stream over fixed bytes that records each read's size."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.sizes: list[int] = []
+
+    async def read(self, n: int = -1) -> bytes:
+        self.sizes.append(n)
+        size = len(self._data) if n < 0 else n
+        data, self._data = self._data[:size], self._data[size:]
+        return data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_data",
+    [
+        b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        _content_length_headers(100) + bytes(100),
+        _CHUNKED_HEADERS + b"64\r\n" + bytes(100) + b"\r\n0\r\n\r\n",
+    ],
+    ids=["no-body", "content-length", "chunked"],
+)
+async def test_http_request_reader_never_reads_more_than_max_read(
+    request_data: bytes,
+) -> None:
+    reader = _ReadSizeRecorder(request_data)
+
+    request = await HTTPRequestReader(max_read=16).read_request(reader)
+
+    assert request is not None
+    assert request.wire_raw_bytes == request_data
+    assert all(0 < size <= 16 for size in reader.sizes)
+
+
 @pytest.mark.asyncio
 async def test_from_parsed_threshold_outcome_marks_body_incomplete() -> None:
     headers = _content_length_headers(5)
@@ -2834,6 +2856,11 @@ _BAD_TRAILER = (
     b"1\r\n\x00\r\n1\r\n\x00\r\n0\r\n\x01: \r\n\r\n"
 )
 
+_BAD_EXTENSION_BEFORE_SCAN_ERROR = (
+    b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+    b"2\r\n\x00\x00\r\n1;\x01\r\n\x00\r\nX"
+)
+
 
 @pytest.mark.asyncio
 @given(case=_limited_parse_cases())
@@ -2842,6 +2869,15 @@ _BAD_TRAILER = (
 @example(case=(_BAD_CRLF_AT_LIMIT, [_BAD_CRLF_AT_LIMIT], 13))
 # A trailer httptools rejects must not charge the body to the limit twice.
 @example(case=(_BAD_TRAILER, [_BAD_TRAILER], 2))
+# httptools rejects the extension, so the payload after it, which the
+# scanner counts before its own error, never reaches the body.
+@example(
+    case=(
+        _BAD_EXTENSION_BEFORE_SCAN_ERROR,
+        [_BAD_EXTENSION_BEFORE_SCAN_ERROR],
+        2,
+    )
+)
 async def test_body_limit_changes_only_what_is_kept(
     case: tuple[bytes, list[bytes], int],
 ) -> None:
@@ -2905,7 +2941,9 @@ def _chunked_cut(chunked: bytes, limit: int) -> int:
         (b"5\r\nhello\r\n3x\r\n", b"x"),
     ],
 )
-@pytest.mark.parametrize("split", [None, 3, 12])
+# Split after the first size line, inside its data once the limit cut
+# the wire, or inside the second size line.
+@pytest.mark.parametrize("split", [None, 3, 6, 12])
 async def test_body_limit_cuts_wire_before_a_framing_error(
     chunked: bytes, bad: bytes, split: int | None
 ) -> None:

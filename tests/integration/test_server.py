@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import gc
 import pickle
@@ -2280,13 +2281,37 @@ async def test_recorded_wire_bytes_behave_as_a_plain_field(
 
 
 @pytest.mark.asyncio
-async def test_recordings_hold_each_body_once() -> None:
+@pytest.mark.parametrize(
+    ("max_recorded_body_bytes", "respond_early"),
+    [
+        pytest.param(None, False, id="whole-body"),
+        # Half the body plus one byte, so the cut falls inside a read.
+        pytest.param(4 * 1024 * 1024 + 1, False, id="cut-body"),
+        pytest.param(None, True, id="header-phase-download"),
+    ],
+)
+async def test_recordings_hold_each_body_once(
+    max_recorded_body_bytes: int | None, respond_early: bool
+) -> None:
     size = 8 * 1024 * 1024
+    kept = size if max_recorded_body_bytes is None else max_recorded_body_bytes
     body = b"d" * size
+
+    async def download(
+        headers: HTTPRequestHeaders, send: SendResponse
+    ) -> bool:
+        _ = headers
+        await send(HTTPResponse.raw(body))
+        return True
+
     tracemalloc.start()
     try:
+        # Without the byte log, the memory retained is the recordings'.
         async with AsyncHTTPTestServer(
-            default_response=HTTPResponse.raw(body)
+            default_response=HTTPResponse.raw(body),
+            max_connection_bytes=0,
+            max_recorded_body_bytes=max_recorded_body_bytes,
+            on_headers_received=download if respond_early else None,
         ) as server:
             gc.collect()
             before = tracemalloc.get_traced_memory()[0]
@@ -2295,22 +2320,47 @@ async def test_recordings_hold_each_body_once() -> None:
                 b"PUT /k HTTP/1.1\r\nHost: x\r\n"
                 b"Content-Length: %d\r\n\r\n" % size + b"u" * size,
             )
+            # An early response can reach the client before the server
+            # has read the whole upload.
+            await server.next_exchange(timeout=10)
             gc.collect()
             retained = tracemalloc.get_traced_memory()[0] - before
     finally:
         tracemalloc.stop()
 
-    # The upload's body once; the download shares the response's body.
-    assert len(server.requests[0].wire_raw_bytes) > size
+    # The kept upload body once; the download shares the response's
+    # body, whichever phase sent it.
+    assert len(server.requests[0].wire_raw_bytes) > kept
     assert server.responses[0].wire_raw_bytes.endswith(body)
-    assert size <= retained < size * 1.5
+    assert kept <= retained < kept * 1.5
+
+
+_KEEP_ALIVE_UPLOAD = 4 * 1024 * 1024
 
 
 @pytest.mark.asyncio
-async def test_max_recorded_body_bytes_bounds_memory_on_keep_alive() -> None:
-    size = 4 * 1024 * 1024
+@pytest.mark.parametrize(
+    ("framing", "body_end"),
+    [
+        pytest.param(
+            b"Content-Length: %d\r\n\r\n" % _KEEP_ALIVE_UPLOAD,
+            b"",
+            id="content-length",
+        ),
+        # One chunk holds the whole body, so no chunk ends inside it.
+        pytest.param(
+            b"Transfer-Encoding: chunked\r\n\r\n%x\r\n" % _KEEP_ALIVE_UPLOAD,
+            b"\r\n0\r\n\r\n",
+            id="one-chunk",
+        ),
+    ],
+)
+async def test_max_recorded_body_bytes_bounds_memory_on_keep_alive(
+    framing: bytes, body_end: bytes
+) -> None:
+    size = _KEEP_ALIVE_UPLOAD
     body = bytes(range(256)) * (size // 256)
-    head = b"PUT /k HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % size
+    head = b"PUT /k HTTP/1.1\r\nHost: x\r\n" + framing
     seen: list[int] = []
 
     def handler(ctx: ResponderContext) -> HTTPResponse:
@@ -2331,6 +2381,7 @@ async def test_max_recorded_body_bytes_bounds_memory_on_keep_alive() -> None:
                 for offset in range(0, size, 65536):
                     writer.write(view[offset : offset + 65536])
                     await writer.drain()
+                writer.write(body_end)
                 await read_http_response(reader, timeout=10)
             peak = tracemalloc.get_traced_memory()[1]
         finally:
@@ -2367,6 +2418,13 @@ async def test_write_chunk_size_sends_and_records_the_whole_body() -> None:
     assert first.content == body
     assert second.content == body
     assert len({request.client for request in server.requests}) == 1
+    exchange = server.exchanges[-1]
+    # Copied before anything reads wire_raw_bytes, which would cache the
+    # joined bytes in place of the slices of the body.
+    pickled = pickle.loads(pickle.dumps(exchange))
+    copied = copy.deepcopy(exchange)
+    assert pickled == exchange
+    assert copied == exchange
     recorded = server.responses[-1]
     assert recorded.response.body == body
     assert recorded.wire_raw_bytes.endswith(b"\r\n\r\n" + body)
