@@ -84,6 +84,12 @@ class LazyBytes:
     def join(self) -> bytes:
         return b"".join(self.parts)
 
+    def __reduce__(self) -> tuple[type[bytes], tuple[bytes]]:
+        # Pickled and deep-copied as the joined bytes: a part can be a
+        # memoryview, which neither supports, and a record restored
+        # from either then holds plain bytes.
+        return (bytes, (self.join(),))
+
 
 class _LazyBytesAttribute:
     """Data descriptor reading a ``bytes`` dataclass field lazily.

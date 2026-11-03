@@ -29,17 +29,19 @@ class ChunkPayloadScan:
     data arrives.  ``end`` is the offset past the chunked body once
     the terminal chunk and any trailers are complete.  ``resume_from``
     is the chunk-size boundary of the first incomplete chunk, so a
-    caller can rescan from there after appending data.  ``missing`` is
-    how many bytes that chunk still lacks, its CRLF included, once its
-    size line is complete, and ``0`` otherwise; reading no more than
-    that never reads past the chunked body.
+    caller can rescan from there after appending data; it is the scan
+    start instead when that chunk is the one the scan resumed inside.
+    ``data_left`` is how many data bytes that chunk still lacks once
+    its size line is complete, and ``0`` otherwise.  A caller that
+    consumes the buffer up to the end of a ``partial`` with data left
+    passes ``data_left`` to the scan of the bytes that follow.
     """
 
     payloads: tuple[tuple[int, int], ...]
     partial: tuple[int, int] | None
     end: int | None
     resume_from: int
-    missing: int = 0
+    data_left: int = 0
 
 
 def content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
@@ -148,24 +150,29 @@ def _check_chunk_terminator(buffer: bytearray, data_end: int) -> None:
 def scan_chunk_payloads(
     buffer: bytearray,
     start: int = 0,
+    *,
+    data_left: int = 0,
 ) -> ChunkPayloadScan:
     """Locate chunk payloads from a known chunk-size boundary.
 
     Complete chunks are reported with their data ranges so a caller
     can map a payload byte count to a wire offset; the first
     incomplete chunk is reported as ``partial`` once its size line is
-    complete.  Raises ChunkScanError on a malformed chunk-size line or
-    a bad chunk-data terminator.
+    complete.  A positive ``data_left`` starts the scan inside a chunk
+    whose size line came earlier: that many of its data bytes, then
+    its CRLF, come first.  Raises ChunkScanError on a malformed
+    chunk-size line or a bad chunk-data terminator.
     """
     payloads: list[tuple[int, int]] = []
     index = start
+    chunk = (
+        (data_left, start)
+        if data_left
+        else _scan_chunk_size_line(buffer, start)
+    )
 
-    while True:
-        chunk_size_line = _scan_chunk_size_line(buffer, index)
-        if chunk_size_line is None:
-            return ChunkPayloadScan(tuple(payloads), None, None, index)
-
-        chunk_size, data_start = chunk_size_line
+    while chunk is not None:
+        chunk_size, data_start = chunk
 
         if chunk_size == 0:
             end = _terminal_chunk_end(buffer, data_start)
@@ -180,9 +187,12 @@ def scan_chunk_payloads(
                 partial,
                 None,
                 index,
-                missing=data_end + 2 - len(buffer),
+                data_left=max(data_end - len(buffer), 0),
             )
         _check_chunk_terminator(buffer, data_end)
 
         payloads.append((data_start, data_end))
         index = data_end + 2
+        chunk = _scan_chunk_size_line(buffer, index)
+
+    return ChunkPayloadScan(tuple(payloads), None, None, index)

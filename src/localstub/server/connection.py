@@ -76,6 +76,11 @@ from localstub.server.transmission import (
 
 LOG = logging.getLogger(__name__)
 
+# Largest read while parsing a request.  A read returns as soon as any
+# bytes are buffered, so a large size costs a small request nothing and
+# lets a large body arrive in few reads.
+REQUEST_MAX_READ = 256 * 1024
+
 Sleep = Callable[[float], Awaitable[None]]
 TrackForwarder = Callable[[RawForwarder], None]
 HeaderApp = Callable[[HeaderContext], Awaitable[HeaderDecision]]
@@ -748,7 +753,9 @@ class HTTPConnection:
         state.final_response = None
         self._final_send_close = False
         request_state: dict[str, Any] = {}
-        parser = AsyncRequestParser(max_body_kept=self._max_body_kept)
+        parser = AsyncRequestParser(
+            max_read=REQUEST_MAX_READ, max_body_kept=self._max_body_kept
+        )
 
         outcome, remaining = await parser.parse_headers(
             self._reader, self._sink, initial_data=initial_data
@@ -917,28 +924,26 @@ class HTTPConnection:
             close = self._should_close_after(
                 partial, response, self._completed_with_current()
             )
-        recorded = self._write_early_response(partial, response, close=close)
-        if is_interim:
-            state.interim_responses.append(recorded)
-        else:
-            state.final_response = recorded
-            self._final_send_close = close
-        await self._drain()
-
-    def _write_early_response(
-        self,
-        partial: HTTPRequestHeaders,
-        response: HTTPResponse,
-        *,
-        close: bool,
-    ) -> RecordedHTTPResponse:
         writer = self._writer
         writer.start_response()
         head, wire_body = self._encode_response(
             partial.method, response, close=close
         )
-        self._write(head + wire_body)
-        return self._build_recorded_response(response, writer.sent_wire())
+        self._write(head)
+        try:
+            await self._write_body(wire_body)
+        finally:
+            # Filed even when the client goes away part way through the
+            # body, with the bytes written so far.
+            recorded = self._build_recorded_response(
+                response, writer.sent_wire()
+            )
+            if is_interim:
+                state.interim_responses.append(recorded)
+            else:
+                state.final_response = recorded
+                self._final_send_close = close
+        await self._drain()
 
     def _encode_response(
         self,
@@ -1275,18 +1280,8 @@ class HTTPConnection:
         strategy = self._pipeline.transmission()
         self._state.phase = "response_body"
         if isinstance(strategy, ImmediateTransmission):
-            # Head and body are written separately, so the body is
-            # never copied and the recording can share it.
             self._write(head)
-            step = self._write_chunk_size
-            if step is None or len(wire_body) <= step:
-                self._write(wire_body)
-            else:
-                # Slices of one memoryview: still no copy of the body.
-                view = memoryview(wire_body)
-                for start in range(0, len(view), step):
-                    self._write(view[start : start + step])
-                    await self._drain()
+            await self._write_body(wire_body)
             await self._drain()
             return should_close, None
 
@@ -1300,6 +1295,23 @@ class HTTPConnection:
         )
         abort = await strategy.write_body(client_writer, wire_body)
         return should_close, abort
+
+    async def _write_body(self, body: bytes) -> None:
+        """Write a response body right after its head.
+
+        The body is written apart from the head, so it is never copied
+        and the recording can share it.  With ``write_chunk_size`` it
+        goes out as slices of one memoryview, each drained before the
+        next, which still copies nothing.
+        """
+        step = self._write_chunk_size
+        if step is None or len(body) <= step:
+            self._write(body)
+            return
+        view = memoryview(body)
+        for start in range(0, len(view), step):
+            self._write(view[start : start + step])
+            await self._drain()
 
     def _write(self, data: bytes | memoryview) -> None:
         try:

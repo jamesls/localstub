@@ -226,18 +226,24 @@ class AsyncTLSInterceptProxy:
     def client_env_vars(self) -> dict[str, str]:
         """Environment variables that route a client's HTTPS through here.
 
-        ``HTTPS_PROXY`` names this proxy, and the CA bundle variables
-        that common clients read name this proxy's CA.  Returns a new
-        dict the caller can edit.  Raises RuntimeError before the proxy
-        has started.
+        ``HTTPS_PROXY`` and ``https_proxy`` name this proxy, and the CA
+        bundle variables that common clients read name this proxy's CA.
+        Both spellings are set because curl, Python's urllib (and so
+        requests and botocore) and httpx prefer the lowercase one, so an
+        inherited ``https_proxy`` would otherwise win.  ``NO_PROXY`` and
+        ``no_proxy`` are set empty, so no inherited exclusion lets a host
+        skip this proxy.  Clients apply them to every proxy, so a client
+        that also inherits ``HTTP_PROXY`` sends all plain HTTP to it.
+        Returns a new dict the caller can edit.  Raises RuntimeError
+        before the proxy has started.
         """
         proxy_url = self.endpoint_url
         ca_bundle = str(self._ca.ca_pem_path())
-        # Intentionally omit lowercase https_proxy. This mapping targets
-        # common environment variables such as HTTPS_PROXY, following the
-        # more common uppercase naming convention.
         return {
             "HTTPS_PROXY": proxy_url,
+            "https_proxy": proxy_url,
+            "NO_PROXY": "",
+            "no_proxy": "",
             "SSL_CERT_FILE": ca_bundle,
             "REQUESTS_CA_BUNDLE": ca_bundle,
             "CURL_CA_BUNDLE": ca_bundle,

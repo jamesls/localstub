@@ -169,11 +169,47 @@ async def test_client_env_vars_point_at_proxy_url_and_ca_bundle() -> None:
         ca_bundle = str(proxy.ca.ca_pem_path())
         assert proxy.client_env_vars() == {
             "HTTPS_PROXY": proxy.endpoint_url,
+            "https_proxy": proxy.endpoint_url,
+            "NO_PROXY": "",
+            "no_proxy": "",
             "SSL_CERT_FILE": ca_bundle,
             "REQUESTS_CA_BUNDLE": ca_bundle,
             "CURL_CA_BUNDLE": ca_bundle,
             "AWS_CA_BUNDLE": ca_bundle,
         }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        # Clients prefer the lowercase name when both are set, and
+        # nothing listens on port 1.
+        ("https_proxy", "http://127.0.0.1:1"),
+        # An exclusion that matches the host skips the proxy.
+        ("NO_PROXY", "stub.invalid"),
+        ("no_proxy", "stub.invalid"),
+    ],
+)
+async def test_client_env_vars_override_inherited_proxy_settings(
+    name: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(name, value)
+    async with (
+        AsyncHTTPTestServer() as server,
+        AsyncTLSInterceptProxy(server=server) as proxy,
+    ):
+        server.set_json_response({"ok": True})
+        for env_name, env_value in proxy.client_env_vars().items():
+            monkeypatch.setenv(env_name, env_value)
+        # The client reads its proxy and CA bundle from the environment.
+        async with httpx.AsyncClient() as client:
+            response = await client.get("https://stub.invalid/routed")
+
+    assert response.json() == {"ok": True}
+    assert server.requests[0].headers["host"] == "stub.invalid"
 
 
 @pytest.mark.asyncio
