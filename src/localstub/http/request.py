@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import httptools
 
@@ -567,6 +568,39 @@ def _chunk_limit_offset(scan: ChunkPayloadScan, budget: int) -> int | None:
     return None
 
 
+class _ChunkDelivery(NamedTuple):
+    """What to deliver of an undelivered chunked buffer after a scan.
+
+    The first ``length`` bytes are delivered, ``payload`` of them
+    chunk data, stopping ``data_left`` data bytes before the end of a
+    chunk, or at a chunk-size boundary when that is zero.  The parser
+    is fed the first ``feed`` bytes, which can extend past ``length``.
+    """
+
+    length: int
+    feed: int
+    data_left: int
+    payload: int
+
+
+def _chunk_delivery(scan: ChunkPayloadScan, buffered: int) -> _ChunkDelivery:
+    """Choose what to deliver of the ``buffered`` bytes ``scan`` covers."""
+    payload = sum(end - start for start, end in scan.payloads)
+    if scan.partial is None or not scan.data_left:
+        return _ChunkDelivery(scan.resume_from, scan.resume_from, 0, payload)
+    start, end = scan.partial
+    if end > start:
+        # Inside a chunk's data, every buffered byte belongs to the
+        # body, so all of them are delivered now.
+        return _ChunkDelivery(
+            buffered, buffered, scan.data_left, payload + end - start
+        )
+    # A size line waits for its chunk's first data byte, so the limit
+    # cuts it from the wire however reads split.  The parser still
+    # checks it now, so a bad one is reported even if no data follows.
+    return _ChunkDelivery(scan.resume_from, buffered, 0, payload)
+
+
 class _ByteParts:
     """Append-only bytes kept as the pieces they arrived in.
 
@@ -623,6 +657,9 @@ class AsyncRequestParser:
         # Data bytes still to come of the chunk the delivered bytes stop
         # inside; zero when they stop at a chunk-size boundary.
         self._chunk_data_left = 0
+        # Leading undelivered chunked bytes already fed: a size line
+        # whose data has not arrived yet.
+        self._chunk_fed = 0
         self._head_size = 0
         # Pieces of ``_wire`` already passed to the connection sink.
         self._connection_wire_synced = 0
@@ -829,7 +866,7 @@ class AsyncRequestParser:
         """Describe what has been parsed so far without reading further.
 
         For a parse call that was cancelled: the outcome carries the
-        headers and the body parts delivered before the interruption,
+        headers and the body parts received before the interruption,
         as a ``COMPLETE`` stop whose message is incomplete, the same
         shape as a stage the caller limited on purpose.
         """
@@ -1112,39 +1149,38 @@ class AsyncRequestParser:
     def _feed_chunks(
         self,
         buffer: bytearray,
-        length: int,
+        delivery: _ChunkDelivery,
         connection_wire: WireSink | None,
-        *,
-        data_left: int,
     ) -> None:
-        """Deliver the chunked bytes in ``buffer[:length]``.
+        """Deliver the chunked bytes in ``buffer[:delivery.length]``.
 
-        ``length`` is a chunk-size boundary, or with a positive
-        ``data_left`` it stops inside a chunk's data with that many
-        data bytes still to come.  The bytes are removed from the buffer
-        once the parser accepted them; when the parser raises they stay
-        so the error offset can be located.  After an upgrade the parser
-        cannot be fed, so the chunk framing is stripped and the payloads
+        The bytes are removed from the buffer once the parser accepted
+        them; when the parser raises they stay so the error offset can
+        be located.  The parser is fed up to ``delivery.feed``, which
+        includes a size line still waiting for its data, but never
+        the same bytes twice.  After an upgrade the parser cannot be
+        fed, so the chunk framing is stripped and the payloads
         delivered directly.
         """
-        # A view rather than a copy: httptools copies what it delivers
+        # Views rather than copies: httptools copies what it delivers
         # and the wire copies only what it keeps.
+        length = delivery.length
+        if self._upgraded:
+            self._deliver_upgrade_body(
+                _chunk_payload_parts(buffer[:length], self._chunk_data_left),
+                complete=False,
+            )
+        else:
+            with memoryview(buffer)[self._chunk_fed : delivery.feed] as data:
+                self._parser.feed_data(data)
+        # Only once the bytes are accepted: a rejected segment is
+        # attributed, and charged to the limit, by the error path.
+        keep = self._chunk_wire_keep(buffer, length)
         with memoryview(buffer)[:length] as segment:
-            if self._upgraded:
-                self._deliver_upgrade_body(
-                    _chunk_payload_parts(
-                        buffer[:length], self._chunk_data_left
-                    ),
-                    complete=False,
-                )
-            else:
-                self._parser.feed_data(segment)
-            # Only once the bytes are accepted: a rejected segment is
-            # attributed, and charged to the limit, by the error path.
-            keep = self._chunk_wire_keep(buffer, length)
             self._extend_wire(segment, keep, connection_wire)
         del buffer[:length]
-        self._chunk_data_left = data_left
+        self._chunk_data_left = delivery.data_left
+        self._chunk_fed = delivery.feed - length
 
     async def _parse_chunked_body(
         self,
@@ -1155,12 +1191,15 @@ class AsyncRequestParser:
     ) -> ParseOutcome:
         """Consume chunk framing, delivering chunk data as it arrives.
 
-        ``buffer`` only ever holds bytes not yet delivered to the
-        parser, so every scan starts at offset zero, at a chunk-size
-        boundary or ``_chunk_data_left`` bytes before the end of a
-        chunk's data, and a cancelled parse leaves the delivered prefix
-        recorded.  A chunk's data is delivered without waiting for the
-        chunk to end, so a large chunk never accumulates in the buffer.
+        ``buffer`` only ever holds bytes not yet delivered, so every
+        scan starts at offset zero, at a chunk-size boundary or
+        ``_chunk_data_left`` bytes before the end of a chunk's data.
+        The parser has seen none of them except the first
+        ``_chunk_fed``: a size line it checked while its data has not
+        arrived.  A cancelled parse delivers the buffer as the end of
+        the stream does, so everything received stays recorded.  A
+        chunk's data is delivered without waiting for the chunk to
+        end, so a large chunk never accumulates in the buffer.
         """
         counted = 0
         while True:
@@ -1203,39 +1242,23 @@ class AsyncRequestParser:
                     complete=True,
                 )
 
-            if (
-                scan.partial is not None
-                and scan.data_left
-                # A size line waits for its chunk's first data byte, so
-                # the limit cuts it from the wire however reads split.
-                and scan.partial[1] > scan.partial[0]
-            ):
-                # Inside a chunk's data, every buffered byte belongs to
-                # the body, so all of them are delivered now.
-                deliver, data_left = len(buffer), scan.data_left
-                spans = (*scan.payloads, scan.partial)
-            else:
-                deliver, data_left = scan.resume_from, 0
-                spans = scan.payloads
-            counted += sum(end - start for start, end in spans)
-            if deliver:
+            delivery = _chunk_delivery(scan, len(buffer))
+            counted += delivery.payload
+            if delivery.feed:
                 try:
-                    self._feed_chunks(
-                        buffer,
-                        deliver,
-                        connection_wire,
-                        data_left=data_left,
-                    )
+                    self._feed_chunks(buffer, delivery, connection_wire)
                 except httptools.HttpParserError as exc:
                     return self._body_parse_error(
                         reader,
                         buffer,
-                        deliver,
+                        delivery.feed,
                         connection_wire,
                         exc,
                     )
                 self._sync_connection_wire(connection_wire)
-            status = await self._read_more(reader, buffer)
+            status = await self._read_more_chunked(
+                reader, buffer, connection_wire
+            )
             if status is not _ReadStatus.DATA:
                 return self._finish_chunked_prefix(
                     reader,
@@ -1245,6 +1268,31 @@ class AsyncRequestParser:
                     status,
                     complete=False,
                 )
+
+    async def _read_more_chunked(
+        self,
+        reader: ByteStream,
+        buffer: bytearray,
+        connection_wire: WireSink | None,
+    ) -> _ReadStatus:
+        """Read more of a chunked body, keeping what arrived if cancelled.
+
+        Only the snapshot reports a cancelled parse, so the buffer is
+        delivered as the end of the stream would deliver it, and that
+        outcome is dropped.
+        """
+        try:
+            return await self._read_more(reader, buffer)
+        except asyncio.CancelledError:
+            self._finish_chunked_prefix(
+                reader,
+                buffer,
+                len(buffer),
+                connection_wire,
+                _ReadStatus.EOF,
+                complete=False,
+            )
+            raise
 
     def _chunk_scan_error(
         self,
@@ -1295,7 +1343,7 @@ class AsyncRequestParser:
             )
         else:
             try:
-                self._parser.feed_data(prefix)
+                self._parser.feed_data(prefix[self._chunk_fed :])
             except httptools.HttpParserError:
                 LOG.debug("Parser rejected chunk prefix", exc_info=True)
         # The bad byte itself would fail the scan, so map the limit
@@ -1339,7 +1387,8 @@ class AsyncRequestParser:
                 )
             else:
                 try:
-                    self._parser.feed_data(segment)
+                    with segment[self._chunk_fed :] as unfed:
+                        self._parser.feed_data(unfed)
                 except httptools.HttpParserError as exc:
                     return self._body_parse_error(
                         reader, buffer, offset, connection_wire, exc

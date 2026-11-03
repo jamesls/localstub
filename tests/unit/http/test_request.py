@@ -2555,6 +2555,34 @@ async def test_continue_parse_body_bad_extension_at_end_is_parse_error() -> (
     assert leftover == b"\r\nhello\r\n0\r\n\r\n"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chunks", "body", "kept"),
+    [
+        (b"5;\x01\r\n", b"", b"5;\x01"),
+        (b"3\r\nabc\r\n5;\x01\r\n", b"abc", b"3\r\nabc\r\n5;\x01"),
+    ],
+)
+async def test_continue_parse_body_bad_size_line_rejected_before_its_data(
+    chunks: bytes,
+    body: bytes,
+    kept: bytes,
+) -> None:
+    # The client stays connected after the bad size line and sends
+    # nothing more, so the line must be rejected without its data.
+    reader = asyncio.StreamReader()
+    reader.feed_data(_CHUNKED_HEADERS + chunks)
+    parser = AsyncRequestParser()
+
+    outcome = await asyncio.wait_for(parser.parse(reader), timeout=1.0)
+
+    assert outcome.stop is ParseStop.PARSE_ERROR
+    assert isinstance(outcome.error, httptools.HttpParserError)
+    assert _partial(outcome).body == body
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + kept
+    assert take_unread_data(reader) == b"\r\n"
+
+
 def test_snapshot_before_parsing_reports_no_request() -> None:
     outcome = AsyncRequestParser().snapshot()
 
@@ -2582,13 +2610,27 @@ async def test_snapshot_after_headers_reports_incomplete_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_snapshot_after_cancelled_body_read_keeps_delivered_chunks() -> (
-    None
-):
+@pytest.mark.parametrize(
+    ("received", "body"),
+    [
+        (b"5\r\nhello\r\n", b"hello"),
+        # Bytes held until more arrive: a size line waiting for its
+        # data, a partial size line, and a chunk waiting for its CRLF.
+        (b"1\r\n", b""),
+        (b"5\r\nhello\r\n1\r\n", b"hello"),
+        (b"5", b""),
+        (b"5\r\nhello", b"hello"),
+    ],
+)
+async def test_snapshot_after_cancelled_body_read_keeps_received_bytes(
+    received: bytes,
+    body: bytes,
+) -> None:
     reader = asyncio.StreamReader()
-    reader.feed_data(_CHUNKED_HEADERS + b"5\r\nhello\r\n")
+    reader.feed_data(_CHUNKED_HEADERS + received)
+    connection_wire = bytearray()
     parser = AsyncRequestParser()
-    task = asyncio.create_task(parser.parse(reader))
+    task = asyncio.create_task(parser.parse(reader, connection_wire))
     await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -2597,9 +2639,10 @@ async def test_snapshot_after_cancelled_body_read_keeps_delivered_chunks() -> (
     outcome = parser.snapshot()
 
     assert outcome.stop is ParseStop.COMPLETE
-    assert _partial(outcome).body == b"hello"
+    assert _partial(outcome).body == body
     assert not _partial(outcome).is_complete
-    assert outcome.wire_bytes == _CHUNKED_HEADERS + b"5\r\nhello\r\n"
+    assert outcome.wire_bytes == _CHUNKED_HEADERS + received
+    assert bytes(connection_wire) == _CHUNKED_HEADERS + received
     assert outcome.complete_request is None
 
 
