@@ -40,6 +40,20 @@ def test_constructor_honors_provided_ca_without_pem_path() -> None:
     assert ca.ca_pem_path().read_bytes() == existing_ca.cert_pem.bytes()
 
 
+def test_constructor_names_pem_file_that_holds_no_certificate(
+    tmp_path: Path,
+) -> None:
+    pem_path = tmp_path / "ca.pem"
+    pem_path.write_bytes(b"")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        TLSProxyCA(ca=trustme.CA(), pem_path=pem_path)
+
+    assert str(exc_info.value) == (
+        f"No PEM certificate found in: {pem_path.resolve()}"
+    )
+
+
 class TestContextCache:
     def test_reuses_context_for_repeated_host(self) -> None:
         ca = TLSProxyCA()

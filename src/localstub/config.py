@@ -78,7 +78,9 @@ def _parse_response_spec(spec: dict[str, Any]) -> ConfiguredResponse:
     if resp_type == "json":
         return HTTPResponse.json(body, status=status, headers=headers)
     elif resp_type == "text":
-        text = body if isinstance(body, str) else str(body) if body else ""
+        # A missing body is empty; any other value, falsy ones such as
+        # ``0`` included, is sent as its string form.
+        text = "" if body is None else str(body)
         return HTTPResponse.text(text, status=status, headers=headers)
     elif resp_type == "raw":
         raw_bytes: bytes

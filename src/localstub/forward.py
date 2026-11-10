@@ -284,9 +284,11 @@ class RawForwarder:
             return None
 
         upstream_reader, upstream_writer = upstream
+        # One label for both directions, so a request and its response
+        # are logged under the same upstream name.
+        upstream_label = upstream_id or f"{host}:{port}"
         try:
             if self._wire_log is not None:
-                upstream_label = upstream_id or f"{host}:{port}"
                 self._wire_log(
                     f"{upstream_label} <-- lstub",
                     request_wire_bytes,
@@ -298,7 +300,7 @@ class RawForwarder:
                 upstream_reader=upstream_reader,
                 client_writer=client_writer,
                 request_method=request_method,
-                upstream_id=upstream_id,
+                upstream_id=upstream_label,
                 client_id=client_id,
             )
         finally:
@@ -543,6 +545,8 @@ class RawForwarder:
             )
 
         response: ForwardResult | None
+        if self._wire_log is not None:
+            self._wire_log(f"{upstream_label} --> lstub", response_wire)
         if self._response_transformer is not None and status >= 200:
             response = await self._apply_transformation_and_relay(
                 parsed=parsed_response,
@@ -552,7 +556,6 @@ class RawForwarder:
             )
         else:
             if self._wire_log is not None:
-                self._wire_log(f"{upstream_label} --> lstub", response_wire)
                 self._wire_log(f"lstub --> {client_label}", response_wire)
             client_writer.write(response_wire)
             await client_writer.drain()

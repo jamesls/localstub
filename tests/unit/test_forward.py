@@ -12,6 +12,8 @@ from localstub.forward import (
     ForwardError,
     RawForwarder,
     StreamClientWriter,
+    TransformContext,
+    TransformResult,
 )
 from localstub.http.request import AsyncRequestParser, RecordedHTTPRequest
 from localstub.http.tcp import pack_linger_option
@@ -76,6 +78,61 @@ async def test_forward_with_100_continue_preserves_interrupted_upload_wire(
     assert recorded.wire_raw_bytes == header_wire + body_wire
     client_writer.write.assert_called_once_with(continue_wire)
     upstream_writer.write.assert_called_once_with(header_wire)
+
+
+@pytest.mark.asyncio
+async def test_forward_with_100_continue_logs_transformed_early_response() -> (
+    None
+):
+    header_wire = (
+        b"PUT /upload HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Content-Length: 10\r\n"
+        b"Expect: 100-continue\r\n\r\n"
+    )
+    client_reader = asyncio.StreamReader()
+    client_reader.feed_data(header_wire)
+    parser = AsyncRequestParser()
+    headers, remaining = await parser.parse_headers(client_reader)
+    assert headers.parsed is not None
+    rejection_wire = (
+        b"HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n"
+    )
+    upstream_reader = asyncio.StreamReader()
+    upstream_reader.feed_data(rejection_wire)
+    upstream_reader.feed_eof()
+    logged: list[tuple[str, bytes]] = []
+
+    def wire_log(direction: str, data: bytes) -> None:
+        logged.append((direction, data))
+
+    def keep_response(context: TransformContext) -> TransformResult:
+        _ = context
+        return TransformResult()
+
+    forwarder = RawForwarder(
+        response_transformer=keep_response, wire_log=wire_log
+    )
+
+    await forwarder.forward_with_100_continue(
+        parser=parser,
+        parsed_headers=headers.parsed,
+        header_wire_bytes=headers.wire_bytes,
+        remaining_buffer=remaining,
+        client_reader=client_reader,
+        client_writer=create_autospec(ClientWriter, instance=True),
+        upstream_reader=upstream_reader,
+        upstream_writer=create_autospec(asyncio.StreamWriter, instance=True),
+        request_method="PUT",
+        upstream_id="origin",
+        client_id="client:1",
+    )
+
+    assert logged == [
+        ("origin <-- lstub", header_wire),
+        ("origin --> lstub", rejection_wire),
+        ("lstub --> client:1", rejection_wire),
+    ]
 
 
 @pytest.mark.asyncio

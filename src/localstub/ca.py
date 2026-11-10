@@ -138,7 +138,7 @@ class TLSProxyCA:
             pem_block = b"-----BEGIN CERTIFICATE-----" + chunk
             cert = x509.load_pem_x509_certificate(pem_block)
             return cert
-        raise RuntimeError(f"No PEM certificate found in: {self.ca_pem_path}")
+        raise RuntimeError(f"No PEM certificate found in: {self._ca_pem_path}")
 
     def _convert_to_pkcs12_truststore(
         self,
