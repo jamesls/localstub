@@ -133,3 +133,11 @@ dmypy.json
 .pyre/
 .worktrees/
 .benchmarks/
+# Tool caches.  Each ignores itself through a nested .gitignore, but
+# hatchling reads only this file, so without these an sdist built after
+# `poe check` would ship them.
+.import_linter_cache/
+.grimp_cache/
+.ruff_cache/
+.codspeed/
+.ast-bro/
