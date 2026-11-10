@@ -397,6 +397,21 @@ async def test_multi_response_parser_buffers_large_body_parts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multi_response_parser_cuts_wire_at_bad_trailer_byte() -> None:
+    chunk = b"3e8\r\n" + b"x" * 1000 + b"\r\n"
+    accepted = (
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + chunk * 6
+    )
+    reader = _create_mock_reader([accepted + b"0\r\nbad trailer\r\n\r\n"])
+    parser = AsyncMultiResponseParser()
+
+    parsed, wire = await parser.next_response(reader)
+
+    assert parsed is None
+    assert wire == accepted + b"0\r\nbad "
+
+
+@pytest.mark.asyncio
 async def test_multi_response_parser_parses_switching_protocols() -> None:
     response = (
         b"HTTP/1.1 101 Switching Protocols\r\n"

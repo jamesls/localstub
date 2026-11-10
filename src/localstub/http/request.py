@@ -932,18 +932,34 @@ class AsyncRequestParser:
             connection_wire.extend(part)
         self._connection_wire_synced = len(parts)
 
-    def _precise_error_offset(self, data: bytes) -> int:
-        protocol, parser = _build_request_parser()
+    def _precise_error_offset(
+        self,
+        data: bytes,
+        *,
+        accepted: bytes = b"",
+    ) -> int:
+        """Count the bytes of *data* up to the one that stops the parse.
 
-        for index, value in enumerate(data, start=1):
-            try:
+        A fresh parser takes *data* one byte at a time, which is the
+        only way to learn which byte it rejects, or which one completes
+        a message.  *accepted* is what the request's own parser took
+        before *data*.  It is replayed in one call to put the fresh
+        parser in the same state, so the byte-at-a-time scan covers
+        *data* alone however large the body before it.  ``0`` means
+        the parser rejected *accepted* itself.
+        """
+        # Nothing reads this parser's body, so none of it is kept.
+        protocol, parser = _build_request_parser(max_body_kept=0)
+        index = 0
+        try:
+            if accepted:
+                parser.feed_data(accepted)
+            for index, value in enumerate(data, start=1):
                 parser.feed_data(bytes((value,)))
-            except httptools.HttpParserError:
-                return index
-
-            if protocol.result.is_complete:
-                return index
-
+                if protocol.result.is_complete:
+                    return index
+        except httptools.HttpParserError:
+            return index
         return len(data)
 
     def _body_parse_error(
@@ -963,9 +979,9 @@ class AsyncRequestParser:
             replay = replay[: self._head_size]
             if self._chunk_data_left:
                 replay += b"%x\r\n" % self._chunk_data_left
-        candidate = replay + bytes(buffer[:consumed_guess])
-        error_offset = self._precise_error_offset(candidate)
-        body_offset = max(0, error_offset - len(replay))
+        body_offset = self._precise_error_offset(
+            bytes(buffer[:consumed_guess]), accepted=replay
+        )
         keep = self._chunk_wire_keep(buffer, body_offset)
         self._extend_wire(buffer[:body_offset], keep, connection_wire)
         self._sync_connection_wire(connection_wire)

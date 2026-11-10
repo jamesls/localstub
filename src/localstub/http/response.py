@@ -21,6 +21,10 @@ from localstub.http.utils import lazy_bytes_fields
 LOG = logging.getLogger(__name__)
 
 
+# Bytes fed at a time while narrowing a parse failure down to one block.
+_ERROR_SCAN_BLOCK = 4096
+
+
 class _ReadStatus(Enum):
     DATA = auto()
     EOF = auto()
@@ -140,6 +144,15 @@ class ResponseProtocol:
             self.message_complete = True
 
 
+def _build_response_parser() -> tuple[
+    ResponseProtocol, httptools.HttpResponseParser
+]:
+    protocol = ResponseProtocol()
+    parser = httptools.HttpResponseParser(protocol)
+    protocol.set_parser(parser)
+    return protocol, parser
+
+
 class AsyncResponseParser:
     """Async wrapper for httptools.HttpResponseParser with wire
     tracking.
@@ -257,9 +270,7 @@ class AsyncMultiResponseParser:
             Tuple of (parsed_response, wire_bytes).
             Returns (None, wire_bytes) on parse error or EOF.
         """
-        protocol = ResponseProtocol()
-        parser = httptools.HttpResponseParser(protocol)
-        protocol.set_parser(parser)
+        protocol, parser = _build_response_parser()
 
         is_head = (
             request_method is not None and request_method.upper() == "HEAD"
@@ -344,20 +355,46 @@ class AsyncMultiResponseParser:
                 return None
 
     def _precise_error_offset(self, data: bytes) -> int:
-        protocol = ResponseProtocol()
-        parser = httptools.HttpResponseParser(protocol)
-        protocol.set_parser(parser)
+        """Count the bytes of *data* up to the one that stops the parse.
 
-        for index, value in enumerate(data, start=1):
-            try:
-                parser.feed_data(bytes((value,)))
-            except httptools.HttpParserError:
-                return index
-
-            if protocol.message_complete:
-                return index
-
+        Only a parser fed one byte at a time shows which byte it
+        rejects, or which one completes a message.  Feeding whole
+        blocks first finds the block the parse stops in; the bytes
+        before it are then replayed in one call and that block alone
+        is scanned, so the cost does not grow with the body.
+        """
+        start = self._stopping_block(data)
+        protocol, parser = _build_response_parser()
+        index = start
+        try:
+            if start:
+                parser.feed_data(data[:start])
+            for index in range(start + 1, len(data) + 1):
+                parser.feed_data(data[index - 1 : index])
+                if protocol.message_complete:
+                    return index
+        except httptools.HttpParserError:
+            return index
         return len(data)
+
+    def _stopping_block(self, data: bytes) -> int:
+        """Return the offset of the block in which a parse of *data* stops.
+
+        Any stop counts, so the byte-at-a-time scan that follows meets
+        the same event at the same byte as a scan of all of *data*.
+        When nothing stops the parse this is the last block, which
+        that scan then reads through to the end.
+        """
+        protocol, parser = _build_response_parser()
+        start = 0
+        for start in range(0, len(data), _ERROR_SCAN_BLOCK):
+            try:
+                parser.feed_data(data[start : start + _ERROR_SCAN_BLOCK])
+            except (httptools.HttpParserError, httptools.HttpParserUpgrade):
+                break
+            if protocol.message_complete:
+                break
+        return start
 
     async def _parse_content_length_body(
         self,
