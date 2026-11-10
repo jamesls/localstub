@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from types import TracebackType
 from typing import Any, Self
 
+from localstub.clock import Clock, MonotonicClock
 from localstub.forward import RawForwarder
 from localstub.http.client import HTTPClient
 from localstub.http.clients.asyncio import AsyncioClient
@@ -75,8 +76,6 @@ from localstub.server.transmission import (
     TransmissionStrategy,
 )
 from localstub.throttle import (
-    Clock,
-    MonotonicClock,
     ThrottleDecision,
     ThrottleKeyFunc,
     TokenBucketThrottler,

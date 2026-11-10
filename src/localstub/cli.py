@@ -26,6 +26,10 @@ from localstub.tlsproxy import AsyncTLSInterceptProxy
 from localstub.traffic_jsonl import exchange_to_json_obj
 
 DEFAULT_PORT = 8888
+# The server keeps a byte log per client address for tests to read back.
+# Nothing in the CLI reads it, and a long-running proxy sees a new
+# address for every connection, so the logs would only accumulate.
+_NO_CONNECTION_BYTE_LOG = 0
 type TrafficOutput = TextIO | anyio.AsyncFile[str]
 
 
@@ -154,7 +158,11 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         "-f",
         "--config-file",
         type=Path,
-        help="Path to JSON config file for intercept mode responses",
+        help=(
+            "Path to JSON config file of stubbed responses. Used by "
+            "--mode intercept, and by --mode http-proxy, which then "
+            "serves them instead of forwarding. Ignored by --mode forward"
+        ),
     )
     parser.add_argument(
         "--keep-alive-timeout",
@@ -262,6 +270,7 @@ async def run_http_proxy(args: argparse.Namespace) -> None:
         port=args.port,
         on_headers_received=handle_expect_header,
         forward_proxy=forward_proxy,
+        max_connection_bytes=_NO_CONNECTION_BYTE_LOG,
         max_recorded_body_bytes=args.max_recorded_body_bytes,
         write_chunk_size=args.write_chunk_size,
     )
@@ -303,6 +312,7 @@ async def run_tls_proxy(args: argparse.Namespace) -> None:
     server: AsyncHTTPTestServer | None = None
     if args.mode == "intercept":
         server = AsyncHTTPTestServer(
+            max_connection_bytes=_NO_CONNECTION_BYTE_LOG,
             max_recorded_body_bytes=args.max_recorded_body_bytes,
             write_chunk_size=args.write_chunk_size,
         )
