@@ -108,7 +108,7 @@ async def test_raw_proxy_fault_adapter_preserves_first_drop_reset(
     ):
         proxy.set_keep_alive(max_requests=max_requests)
         request = (
-            f"GET {upstream.url}/ HTTP/1.1\r\n"
+            f"GET {upstream.url} HTTP/1.1\r\n"
             f"Host: {upstream.host}:{upstream.port}\r\n\r\n"
         ).encode()
         data, observed_reset = await _exchange_raw(proxy, request)

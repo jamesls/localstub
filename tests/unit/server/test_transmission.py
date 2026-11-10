@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from unittest.mock import AsyncMock, create_autospec
 
 import pytest
@@ -32,20 +31,6 @@ async def test_immediate_transmission_sends_all_at_once() -> None:
     assert writer.write.call_args[0][0] == body
     assert writer.drain.call_count == 1
     assert recorder.bytes_sent == body
-
-
-@pytest.mark.asyncio
-async def test_immediate_transmission_without_tracking() -> None:
-    strategy = ImmediateTransmission()
-    body = b"test data"
-
-    writer = AsyncMock(spec=asyncio.StreamWriter)
-
-    await strategy.write_body(writer, body)
-
-    assert writer.write.call_count == 1
-    assert writer.write.call_args[0][0] == body
-    assert writer.drain.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -143,22 +128,6 @@ def test_throttled_transmission_rejects_negative_chunk_size() -> None:
 
 
 @pytest.mark.asyncio
-async def test_faulty_transmission_delay() -> None:
-    strategy = FaultyTransmission(faults=[Delay(0.05)])
-    body = b"abc"
-
-    writer = AsyncMock(spec=asyncio.StreamWriter)
-    recorder = RecordingStreamWriter(writer)
-
-    start = time.time()
-    await strategy.write_body(recorder, body)
-    elapsed = time.time() - start
-
-    assert elapsed >= 0.045
-    assert recorder.bytes_sent == body
-
-
-@pytest.mark.asyncio
 async def test_faulty_transmission_truncate() -> None:
     strategy = FaultyTransmission(faults=[TruncateBody(3)])
     body = b"hello"
@@ -246,6 +215,7 @@ async def test_faulty_transmission_uses_injected_sleep() -> None:
 
     assert await strategy.write_body(writer, b"abc") is None
     sleep.assert_awaited_once_with(0.5)
+    writer.write.assert_called_once_with(b"abc")
 
 
 @pytest.mark.asyncio

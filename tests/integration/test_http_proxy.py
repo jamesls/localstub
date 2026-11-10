@@ -140,7 +140,7 @@ async def _connect_when_ready(
 
 
 @pytest_asyncio.fixture
-async def upstream_server() -> AsyncHTTPTestServer:
+async def upstream_server() -> AsyncIterator[AsyncHTTPTestServer]:
     """Create an upstream server that the proxy will forward to."""
     async with AsyncHTTPTestServer() as server:
         server.set_json_response({"upstream": True, "status": "ok"})
