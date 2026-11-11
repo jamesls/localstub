@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from localstub.server import HTTPRequestHeaders, HTTPResponse, SendResponse
 
 

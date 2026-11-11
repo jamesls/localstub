@@ -156,6 +156,8 @@ root_package = "localstub"
 name = "Modules import downward only; siblings on a row are independent"
 type = "layers"
 containers = ["localstub"]
+# A module left out of the layers would be unconstrained; fail instead.
+exhaustive = true
 layers = [
   "cli",
   "tlsproxy | traffic_jsonl | config | handlers",
@@ -171,11 +173,12 @@ layers = [
 name = "localstub.http layers: headers up to clients and proxy"
 type = "layers"
 containers = ["localstub.http"]
+exhaustive = true
 layers = [
   "clients | proxy",
   "client | connection | exchange",
   "request | response",
-  "responsespec | framing | stream | uri | utils | upstream",
+  "responsespec | framing | stream | uri | utils | upstream | tcp",
   "headers",
 ]
 
@@ -199,6 +202,5 @@ source_modules = [
 ]
 forbidden_modules = ["localstub.console"]
 
-# Uncomment if you want to add a CLI script.
 [project.scripts]
 lstub = "localstub.cli:main"

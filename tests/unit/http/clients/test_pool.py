@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import socket
 import weakref
 from collections.abc import AsyncIterator, Callable
@@ -949,15 +950,21 @@ async def test_close_error_does_not_break_release() -> None:
 
 
 @pytest.mark.asyncio
-async def test_drain_swallows_os_error_from_wait_closed() -> None:
+async def test_drain_swallows_os_error_from_wait_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     opener = FakeOpener()
     pool = ConnectionPool(opener)
     connection = await pool.acquire(ORIGIN_A)
     opener.writers[0].wait_closed = AsyncMock(side_effect=OSError("reset"))
 
-    await pool.release(connection, reusable=False)
+    with caplog.at_level(logging.DEBUG, logger="localstub.http.clients.pool"):
+        await pool.release(connection, reusable=False)
+        await pool.aclose()
 
-    await pool.aclose()
+    assert [record.getMessage() for record in caplog.records] == [
+        "Error while draining pooled connection"
+    ]
 
 
 @pytest.mark.asyncio
@@ -1156,9 +1163,10 @@ async def test_closed_connection_does_not_retain_origin() -> None:
     connection = await pool.acquire(origin)
 
     await pool.release(connection, reusable=False)
-    await pool.aclose()
     del connection, origin
     await asyncio.sleep(0)
     gc.collect()
 
+    # Checked before aclose(), which forgets every origin by itself.
     assert reference() is None
+    await pool.aclose()

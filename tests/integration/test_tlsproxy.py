@@ -2748,30 +2748,6 @@ def _recv_http_response_from_prefetched(
         timer.cancel()
 
 
-def _recv_http_response(
-    sock: ssl.SSLSocket,
-    *,
-    timeout_message: str,
-) -> bytes:
-    headers, body_start = _recv_until_with_timeout(
-        sock,
-        b"\r\n\r\n",
-        timeout=3.0,
-        timeout_message=timeout_message,
-    )
-    content_length = _parse_content_length(headers)
-    if content_length is None:
-        return headers + body_start
-    if len(body_start) < content_length:
-        body_start += _recv_exactly_with_timeout(
-            sock,
-            content_length - len(body_start),
-            timeout=3.0,
-            timeout_message=timeout_message,
-        )
-    return headers + body_start[:content_length]
-
-
 @pytest.mark.asyncio
 async def test_forward_client_waits_for_100_continue_before_sending_body():
     upstream_server = await asyncio.start_server(

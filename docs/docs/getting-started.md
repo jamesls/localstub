@@ -2,8 +2,8 @@
 
 This page shows how to install localstub and write your first test:
 stub a JSON response, make a request with a real HTTP client, and
-assert on the request the server recorded. You need Python 3.12 or
-newer.
+assert on the request the server recorded. You need Python 3.12
+through 3.14.
 
 ## Installation
 

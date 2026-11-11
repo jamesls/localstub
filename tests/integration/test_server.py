@@ -891,15 +891,12 @@ async def test_server_handles_multiple_chunks_varying_sizes(server, client):
     assert server.last_request is not None
     assert server.last_request.body == b"abbcccdddd"
 
-    # Verify raw wire bytes contain chunk size prefixes
+    # The whole chunked body is pinned: a bare size such as b"1\r\n"
+    # also matches the request line's "HTTP/1.1\r\n".
     wire_bytes = server.last_request.wire_raw_bytes
-    assert wire_bytes is not None
-    # Should contain hex chunk sizes: 1, 2, 3, 4, and final 0
-    assert b"1\r\n" in wire_bytes
-    assert b"2\r\n" in wire_bytes
-    assert b"3\r\n" in wire_bytes
-    assert b"4\r\n" in wire_bytes
-    assert b"0\r\n" in wire_bytes
+    assert wire_bytes.endswith(
+        b"\r\n\r\n1\r\na\r\n2\r\nbb\r\n3\r\nccc\r\n4\r\ndddd\r\n0\r\n\r\n"
+    )
 
 
 @pytest.mark.asyncio
@@ -971,14 +968,10 @@ async def test_connection_bytes_with_chunked_encoding(server, client):
 
     # Should contain chunked transfer encoding header
     assert b"Transfer-Encoding: chunked" in conn_bytes
-    # Should contain chunk size prefixes in hex
-    assert b"5\r\n" in conn_bytes  # "first" = 5 bytes
-    assert b"6\r\n" in conn_bytes  # "second" = 6 bytes
-    # Should contain the actual chunk data
-    assert b"first" in conn_bytes
-    assert b"second" in conn_bytes
-    # Should contain final chunk marker
-    assert b"0\r\n" in conn_bytes
+    # Each chunk with its hex size line, then the final chunk marker.
+    assert conn_bytes.endswith(
+        b"\r\n\r\n5\r\nfirst\r\n6\r\nsecond\r\n0\r\n\r\n"
+    )
 
 
 @pytest.mark.asyncio
@@ -1141,43 +1134,6 @@ async def test_clear_requests_resets_sequence_index(server, client):
 
     response4 = await client.get(server.url)
     assert response4.json() == {"attempt": 2}
-
-
-@pytest.mark.asyncio
-async def test_response_sequence_for_retry_testing():
-    async with AsyncHTTPTestServer() as server:
-        # Configure server to fail twice, then succeed
-        server.set_response_sequence([
-            HTTPResponse(status=500),  # First attempt fails
-            HTTPResponse(status=500),  # First retry fails
-            HTTPResponse.json({"success": True}),  # Second retry succeeds
-        ])
-
-        # Simulate a client with retry logic
-        async with httpx.AsyncClient() as client:
-            attempts = 0
-            max_attempts = 3
-
-            for attempt in range(max_attempts):
-                attempts += 1
-                response = await client.get(server.url)
-
-                if response.status_code == 200:
-                    # Success!
-                    assert response.json() == {"success": True}
-                    break
-
-                # Retry on 500
-                assert response.status_code == 500
-
-            # Should have made exactly 3 attempts
-            assert attempts == 3
-            assert len(server.requests) == 3
-
-            # Verify the sequence worked correctly
-            assert server.requests[0].method == "GET"
-            assert server.requests[1].method == "GET"
-            assert server.requests[2].method == "GET"
 
 
 @pytest.mark.asyncio

@@ -903,14 +903,13 @@ class AsyncTLSInterceptProxy:
             reason = status_line.decode("ascii", errors="replace")
             _close_log(f"lstub --> {client_id}", f"sent {reason}")
             writer.close()
-            if hasattr(writer, "wait_closed"):
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    LOG.debug(
-                        "Failed to close client writer",
-                        exc_info=True,
-                    )
+            try:
+                await writer.wait_closed()
+            except Exception:
+                LOG.debug(
+                    "Failed to close client writer",
+                    exc_info=True,
+                )
 
 
 def fault_step_transformer(
@@ -919,8 +918,8 @@ def fault_step_transformer(
     """Create a ResponseTransformer from FaultStep instances.
 
     This adapter allows reusing the fault injection primitives from
-    server.py (ByteFlip, TruncateBody, Delay, DropConnection) with
-    the proxy's response transformation.
+    ``localstub.server`` (ByteFlip, TruncateBody, Delay,
+    DropConnection) with the proxy's response transformation.
 
     Example:
         from localstub.server import ByteFlip, Delay

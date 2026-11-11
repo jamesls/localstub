@@ -133,7 +133,7 @@ def test_server_accepts_recorder_in_legacy_positional_slot() -> None:
         recorder,
     )
 
-    assert server.requests == []
+    assert server.recorder is recorder
 
 
 def test_zero_recording_buffer_size_raises_value_error() -> None:

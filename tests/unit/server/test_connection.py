@@ -515,8 +515,6 @@ async def test_cancelling_run_during_wait_closed_aborts_transport() -> None:
 async def test_shutdown_from_inside_loop_records_and_exits_after_request() -> (
     None
 ):
-    harness = _harness(response=HTTPResponse.json({"ok": True}))
-
     def handler(ctx: ResponderContext) -> ResponseSpec:
         _ = ctx
         harness.connection.shutdown()

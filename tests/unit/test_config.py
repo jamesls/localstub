@@ -95,6 +95,18 @@ class TestParseResponseSpec:
 
         assert response.body == b"12345"
 
+    def test_parse_text_response_converts_falsy_non_string_to_string(
+        self, tmp_path: Path
+    ) -> None:
+        spec = {"type": "text", "body": 0}
+        config_file = write_config_file(tmp_path, {"response": spec})
+        config = load_config(config_file)
+
+        assert config.single_response is not None
+        response = config.single_response
+
+        assert response.body == b"0"
+
     def test_parse_raw_response_with_utf8_body(self, tmp_path: Path) -> None:
         spec = {"type": "raw", "body": "raw data", "encoding": "utf-8"}
         config_file = write_config_file(tmp_path, {"response": spec})

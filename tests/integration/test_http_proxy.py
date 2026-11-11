@@ -140,7 +140,7 @@ async def _connect_when_ready(
 
 
 @pytest_asyncio.fixture
-async def upstream_server() -> AsyncHTTPTestServer:
+async def upstream_server() -> AsyncIterator[AsyncHTTPTestServer]:
     """Create an upstream server that the proxy will forward to."""
     async with AsyncHTTPTestServer() as server:
         server.set_json_response({"upstream": True, "status": "ok"})
@@ -1257,3 +1257,24 @@ class TestRawForwarding:
         finally:
             upstream.close()
             await upstream.wait_closed()
+
+    @pytest.mark.asyncio
+    async def test_wire_log_names_upstream_the_same_in_both_directions(
+        self,
+    ) -> None:
+        directions: list[str] = []
+
+        def wire_log(direction: str, data: bytes) -> None:
+            _ = data
+            directions.append(direction)
+
+        async with _keepalive_upstream() as (host, port, _):
+            forwarder = RawForwarder(wire_log=wire_log)
+            async with AsyncHTTPTestServer(raw_forwarder=forwarder) as proxy:
+                await _send_proxy_request(proxy, host, port)
+
+        assert directions == [
+            f"{host}:{port} <-- lstub",
+            f"{host}:{port} --> lstub",
+            "lstub --> client",
+        ]
