@@ -1,8 +1,4 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## Project Overview
+# Project Overview
 
 localstub is a Python library providing an asyncio-based HTTP test server for testing SDK clients. It records raw HTTP requests (including chunked framing and trailers) and allows configurable responses.
 
@@ -39,31 +35,17 @@ uv run pytest tests/integration/test_server.py::test_server_receives_request_and
 uv run pytest -v tests/
 ```
 
-**Hard requirement**: If you add or modify tests (or any code that relies on them),
-you MUST run `poe test` before handoff.
-
 ### Code Quality
 
-You MUST run `poe auto-check` if you make ANY code changes. No exceptions.
-This includes:
-- New code
-- Modified code
-- Deleted code
-- Test changes
-- Resolving merge conflicts
-- Resolving rebase conflicts
-- Any edit to any file for any reason
-
-Run `poe auto-check` IMMEDIATELY after making changes, BEFORE any git
-operations (commit, rebase --continue, merge --continue, etc.).
-
-This is a HARD REQUIREMENT. Do not skip this step. Do not defer this step.
+Run `poe auto-check` after every edit, including test changes and resolved
+merge or rebase conflicts, and before any git operation that records the
+result (commit, `rebase --continue`, `merge --continue`). It auto-fixes
+formatting and lint, then runs pyright, ast-grep, and import-linter.
 
 ### Test Discipline
 
-For ANY change that touches runtime code or tests (anything beyond docs/comment
-edits), you MUST run the full test suite via `poe test` before handoff. No
-exceptions. The expectation is: code change → `poe auto-check` → `poe test`.
+For any change beyond docs or comments, run the full suite with `poe test`
+before handoff. The sequence is: change → `poe auto-check` → `poe test`.
 
 ## Code Architecture
 
@@ -73,7 +55,8 @@ exceptions. The expectation is: code change → `poe auto-check` → `poe test`.
 - Main test server class using asyncio's `start_server`
 - Records all incoming requests in `.requests` list and `.last_request`
 - Supports both static responses and dynamic handler functions
-- Handler can be sync or async: `Callable[[HTTPRequest], Awaitable[HTTPResponse] | HTTPResponse]`
+- Handler (`ResponderHandler`, `src/localstub/router.py`) can be sync or
+  async: `Callable[[ResponderContext], ResponseSpec | Awaitable[ResponseSpec]]`
 - Keep-alive policy via `set_keep_alive(...)`; connection faults via
   `CloseConnection`, `CloseDuringRequest`, and `DropConnection`
 
@@ -82,11 +65,12 @@ exceptions. The expectation is: code change → `poe auto-check` → `poe test`.
 - Publishes exactly one `ConnectionClosed` event per connection
   (`.closed_connections`, `.last_closed_connection`, `.next_closed_connection()`)
 
-**HTTPRequest** (`src/localstub/http/request.py`)
-- Captures HTTP request details including method, path, headers, body
-- `wire_raw_bytes` contains exact bytes received from the wire, including chunked framing
-- `json_body` property for convenient JSON access
-- `client` tuple contains (host, port) of the client
+**HTTPRequest / RecordedHTTPRequest** (`src/localstub/http/request.py`)
+- `HTTPRequest` is the RFC 9110 request: method, target, headers, body;
+  `json_body` property for convenient JSON access
+- `RecordedHTTPRequest` is what `.requests` / `.last_request` return: it
+  wraps the request with `wire_raw_bytes` (exact bytes off the wire,
+  including chunked framing) and `client` (host, port)
 
 **HTTPResponse** (`src/localstub/http/responsespec.py`)
 - Dataclass for configuring HTTP responses
@@ -101,21 +85,6 @@ exceptions. The expectation is: code change → `poe auto-check` → `poe test`.
 4. **Async Context Manager**: Use `async with AsyncHTTPTestServer() as server:` for automatic cleanup
 5. **Request Queue**: `.next_request(timeout=...)` allows awaiting the next incoming request
 
-### Project Structure
-
-```
-src/localstub/
-  __init__.py      # Public re-exports
-  server/          # AsyncHTTPTestServer (core.py), HTTPConnection
-                   # (connection.py), transmission strategies
-  http/            # Parser, headers, responses, exchange records
-  middleware/      # Responder / sender / header middleware and faults
-
-tests/
-  unit/            # Unit tests
-  integration/     # Integration tests with httpx client
-```
-
 ## Code Style
 
 - **Line length**: 79 characters (enforced by ruff)
@@ -123,12 +92,8 @@ tests/
 - **Type hints**: Required (pyright enforces this)
 - **Imports**: `from __future__ import annotations` for modern type hints
 
-You MUST load the various `python-coding:*` skills when you are checking or
-reviewing code, e.g. `python-coding:coding-guidelines`, etc.  The content
-in those python coding skills are REQUIREMENTS and cannot be ignored.
-
-You MUST NOT use `# type: ignore` or `# noqa` comments anywhere in the code.
-Both of these comments are completely BANNED from the code base.
+Don't use `# type: ignore` or `# noqa`; fix the underlying issue instead.
+`rules/no-suppression-comments.yml` rejects them in `poe auto-check`.
 
 ## Coverage
 
