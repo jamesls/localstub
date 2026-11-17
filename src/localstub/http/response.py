@@ -5,7 +5,11 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-import httptools
+from httptools.parser import (
+    HttpParserError,
+    HttpParserUpgrade,
+    HttpResponseParser,
+)
 
 from localstub.http.framing import (
     HEADER_TERMINATOR,
@@ -107,10 +111,10 @@ class ResponseProtocol:
 
     def __init__(self) -> None:
         self.result = ParsedResponse()
-        self._parser: httptools.HttpResponseParser | None = None
+        self._parser: HttpResponseParser | None = None
         self.message_complete = False
 
-    def set_parser(self, parser: httptools.HttpResponseParser) -> None:
+    def set_parser(self, parser: HttpResponseParser) -> None:
         """Set the parser reference for accessing metadata."""
         self._parser = parser
 
@@ -144,11 +148,9 @@ class ResponseProtocol:
             self.message_complete = True
 
 
-def _build_response_parser() -> tuple[
-    ResponseProtocol, httptools.HttpResponseParser
-]:
+def _build_response_parser() -> tuple[ResponseProtocol, HttpResponseParser]:
     protocol = ResponseProtocol()
-    parser = httptools.HttpResponseParser(protocol)
+    parser = HttpResponseParser(protocol)
     protocol.set_parser(parser)
     return protocol, parser
 
@@ -164,7 +166,7 @@ class AsyncResponseParser:
 
     def __init__(self, max_read: int = 8192) -> None:
         self._protocol = ResponseProtocol()
-        self._parser = httptools.HttpResponseParser(self._protocol)
+        self._parser = HttpResponseParser(self._protocol)
         self._protocol.set_parser(self._parser)
         self._wire = bytearray()
         self._max_read = max_read
@@ -202,7 +204,7 @@ class AsyncResponseParser:
             if not data:
                 try:
                     self._parser.feed_data(b"")
-                except httptools.HttpParserError:
+                except HttpParserError:
                     pass
                 break
 
@@ -210,7 +212,7 @@ class AsyncResponseParser:
 
             try:
                 self._parser.feed_data(data)
-            except httptools.HttpParserError:
+            except HttpParserError:
                 return None, bytes(self._wire)
 
             if is_head and self._protocol.result.http_version is not None:
@@ -284,9 +286,9 @@ class AsyncMultiResponseParser:
         header_wire = bytes(self._buffer[:header_end])
         try:
             parser.feed_data(header_wire)
-        except httptools.HttpParserUpgrade:
+        except HttpParserUpgrade:
             pass
-        except httptools.HttpParserError:
+        except HttpParserError:
             error_offset = self._precise_error_offset(header_wire)
             wire = bytes(self._buffer[:error_offset])
             del self._buffer[:error_offset]
@@ -373,7 +375,7 @@ class AsyncMultiResponseParser:
                 parser.feed_data(data[index - 1 : index])
                 if protocol.message_complete:
                     return index
-        except httptools.HttpParserError:
+        except HttpParserError:
             return index
         return len(data)
 
@@ -390,7 +392,7 @@ class AsyncMultiResponseParser:
         for start in range(0, len(data), _ERROR_SCAN_BLOCK):
             try:
                 parser.feed_data(data[start : start + _ERROR_SCAN_BLOCK])
-            except (httptools.HttpParserError, httptools.HttpParserUpgrade):
+            except (HttpParserError, HttpParserUpgrade):
                 break
             if protocol.message_complete:
                 break
@@ -400,7 +402,7 @@ class AsyncMultiResponseParser:
         self,
         reader: asyncio.StreamReader,
         protocol: ResponseProtocol,
-        parser: httptools.HttpResponseParser,
+        parser: HttpResponseParser,
         wire: bytearray,
         content_length: int,
     ) -> tuple[ParsedResponse | None, bytes]:
@@ -417,7 +419,7 @@ class AsyncMultiResponseParser:
             segment = bytes(self._buffer[:segment_length])
             try:
                 parser.feed_data(segment)
-            except httptools.HttpParserError:
+            except HttpParserError:
                 return self._body_parse_error(wire, segment_length)
 
             wire.extend(segment)
@@ -432,7 +434,7 @@ class AsyncMultiResponseParser:
         self,
         reader: asyncio.StreamReader,
         protocol: ResponseProtocol,
-        parser: httptools.HttpResponseParser,
+        parser: HttpResponseParser,
         wire: bytearray,
     ) -> tuple[ParsedResponse | None, bytes]:
         scan_from = 0
@@ -449,7 +451,7 @@ class AsyncMultiResponseParser:
                 chunked_body = bytes(self._buffer[:chunked_end])
                 try:
                     parser.feed_data(chunked_body)
-                except httptools.HttpParserError:
+                except HttpParserError:
                     return self._body_parse_error(wire, chunked_end)
 
                 wire.extend(chunked_body)
@@ -468,7 +470,7 @@ class AsyncMultiResponseParser:
         self,
         reader: asyncio.StreamReader,
         protocol: ResponseProtocol,
-        parser: httptools.HttpResponseParser,
+        parser: HttpResponseParser,
         wire: bytearray,
     ) -> tuple[ParsedResponse | None, bytes]:
         while True:
@@ -476,7 +478,7 @@ class AsyncMultiResponseParser:
                 segment = bytes(self._buffer)
                 try:
                     parser.feed_data(segment)
-                except httptools.HttpParserError:
+                except HttpParserError:
                     return self._body_parse_error(wire, len(segment))
                 wire.extend(segment)
                 self._buffer.clear()

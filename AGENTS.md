@@ -40,7 +40,7 @@ uv run pytest -v tests/
 Run `poe auto-check` after every edit, including test changes and resolved
 merge or rebase conflicts, and before any git operation that records the
 result (commit, `rebase --continue`, `merge --continue`). It auto-fixes
-formatting and lint, then runs pyright, ast-grep, and import-linter.
+formatting and lint, then runs pyrefly, ast-grep, and import-linter.
 
 ### Test Discipline
 
@@ -89,7 +89,7 @@ before handoff. The sequence is: change → `poe auto-check` → `poe test`.
 
 - **Line length**: 79 characters (enforced by ruff)
 - **Quote style**: Preserve existing quotes (configured in ruff)
-- **Type hints**: Required (pyright enforces this)
+- **Type hints**: Required (pyrefly enforces this in strict mode)
 - **Imports**: `from __future__ import annotations` for modern type hints
 
 Don't use `# type: ignore` or `# noqa`; fix the underlying issue instead.

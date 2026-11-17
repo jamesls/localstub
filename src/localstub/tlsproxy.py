@@ -7,7 +7,7 @@ from asyncio import transports
 from contextvars import ContextVar
 from datetime import datetime
 from types import TracebackType
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Self, cast, override
 
 from rich.markup import escape as rich_escape
 
@@ -152,6 +152,7 @@ class TLSStreamReaderProtocol(asyncio.StreamReaderProtocol):
         super().__init__(stream_reader)
         self._reader_ref = stream_reader
 
+    @override
     def eof_received(self) -> bool:
         self._reader_ref.feed_eof()
         return False
