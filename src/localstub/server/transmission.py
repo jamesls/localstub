@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, override
 
 
 class Writer(Protocol):
@@ -59,6 +59,7 @@ class TransmissionStrategy:
 class ImmediateTransmission(TransmissionStrategy):
     """Default transmission strategy - send entire body immediately."""
 
+    @override
     async def write_body(
         self,
         writer: Writer,
@@ -96,6 +97,7 @@ class ThrottledTransmission(TransmissionStrategy):
         self.delay = delay
         self._sleep = sleep
 
+    @override
     async def write_body(
         self,
         writer: Writer,
@@ -227,6 +229,7 @@ class FaultyTransmission(TransmissionStrategy):
         self._base = base or ImmediateTransmission()
         self._sleep = sleep
 
+    @override
     async def write_body(
         self,
         writer: Writer,

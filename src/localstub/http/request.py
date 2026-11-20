@@ -7,7 +7,11 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import Any, NamedTuple, Protocol
 
-import httptools
+from httptools.parser import (
+    HttpParserError,
+    HttpParserUpgrade,
+    HttpRequestParser,
+)
 
 from localstub.http import stream
 from localstub.http.framing import (
@@ -397,7 +401,7 @@ class RequestProtocol:
 
     def __init__(self, max_body_kept: int | None = None) -> None:
         self.result = ParsedRequest()
-        self._parser: httptools.HttpRequestParser | None = None
+        self._parser: HttpRequestParser | None = None
         self._max_body_kept = max_body_kept
 
     def _body_room(self) -> int | None:
@@ -406,7 +410,7 @@ class RequestProtocol:
             return None
         return max(self._max_body_kept - self.result.body_size, 0)
 
-    def set_parser(self, parser: httptools.HttpRequestParser) -> None:
+    def set_parser(self, parser: HttpRequestParser) -> None:
         """Set the parser reference for accessing parsed metadata."""
         self._parser = parser
 
@@ -481,9 +485,9 @@ class RequestProtocol:
 
 def _build_request_parser(
     max_body_kept: int | None = None,
-) -> tuple[RequestProtocol, httptools.HttpRequestParser]:
+) -> tuple[RequestProtocol, HttpRequestParser]:
     protocol = RequestProtocol(max_body_kept)
-    parser = httptools.HttpRequestParser(protocol)
+    parser = HttpRequestParser(protocol)
     protocol.set_parser(parser)
     return protocol, parser
 
@@ -765,9 +769,9 @@ class AsyncRequestParser:
             segment = bytes(buffer[fed:feed_end])
             try:
                 self._parser.feed_data(segment)
-            except httptools.HttpParserUpgrade:
+            except HttpParserUpgrade:
                 self._note_upgrade()
-            except httptools.HttpParserError as exc:
+            except HttpParserError as exc:
                 self._header_error = exc
                 error_offset = self._precise_error_offset(
                     bytes(buffer[:feed_end])
@@ -958,7 +962,7 @@ class AsyncRequestParser:
                 parser.feed_data(bytes((value,)))
                 if protocol.result.is_complete:
                     return index
-        except httptools.HttpParserError:
+        except HttpParserError:
             return index
         return len(data)
 
@@ -1263,7 +1267,7 @@ class AsyncRequestParser:
             if delivery.feed:
                 try:
                     self._feed_chunks(buffer, delivery, connection_wire)
-                except httptools.HttpParserError as exc:
+                except HttpParserError as exc:
                     return self._body_parse_error(
                         reader,
                         buffer,
@@ -1360,7 +1364,7 @@ class AsyncRequestParser:
         else:
             try:
                 self._parser.feed_data(prefix[self._chunk_fed :])
-            except httptools.HttpParserError:
+            except HttpParserError:
                 LOG.debug("Parser rejected chunk prefix", exc_info=True)
         # The bad byte itself would fail the scan, so map the limit
         # over the valid prefix only.  httptools can reject framing the
@@ -1405,7 +1409,7 @@ class AsyncRequestParser:
                 try:
                     with segment[self._chunk_fed :] as unfed:
                         self._parser.feed_data(unfed)
-                except httptools.HttpParserError as exc:
+                except HttpParserError as exc:
                     return self._body_parse_error(
                         reader, buffer, offset, connection_wire, exc
                     )

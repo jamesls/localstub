@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Mapping
 from datetime import UTC, datetime
-from email.message import Message
 from pathlib import Path
 from typing import Literal, TextIO
 
@@ -41,12 +39,8 @@ def _client_json(
     return {"host": host, "port": port}
 
 
-def _headers_json(
-    headers: Headers | Message | Mapping[str, str] | None,
-) -> dict[str, str]:
-    if headers is None:
-        return {}
-    return {str(k): str(v) for k, v in headers.items()}
+def _headers_json(headers: Headers) -> dict[str, str]:
+    return dict(headers.items())
 
 
 def _request_body_json(request: RecordedHTTPRequest) -> str | None:

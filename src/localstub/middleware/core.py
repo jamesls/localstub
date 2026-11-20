@@ -171,7 +171,7 @@ class CloseDuringRequest:
     def __bool__(self) -> bool:
         """Refuse boolean coercion.
 
-        Pyright does not flag ``if not decision`` on the union, so
+        Pyrefly does not flag ``if not decision`` on the union, so
         this runtime guard is the only thing that stops an old-style
         wrapper from silently discarding the fault. The cost is that
         generic code, including test helpers, cannot truth-test the
