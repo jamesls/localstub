@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.1.2
+
+* The `lstub` CLI no longer keeps a raw byte log for each client
+  address. The CLI never read these logs, and a long-running proxy
+  could hold up to 1 MiB in each direction for every address it saw.
+* The `--config-file` help now explains how the option affects each
+  mode.
+* Fixes:
+  * Finding the failing byte of a malformed chunked body no longer
+    re-parses the whole message, which blocked the event loop. A
+    16 MiB upload with a malformed trailer stalled every connection
+    for almost five seconds and now takes about 8 ms. The reported
+    error offsets are unchanged.
+  * The `TLSProxyCA` "No PEM certificate found" error names the
+    missing file.
+  * A config file `"type": "text"` response with a body of `0` or
+    `false` serves that value, not an empty body.
+  * `RawForwarder` wire logs record an early final response to an
+    `Expect: 100-continue` request when a response transformer is
+    installed, and log a request and its response under the same
+    `host:port` label.
+  * The sdist no longer includes `.import_linter_cache/`.
+
 ## v0.1.1
 
 * `AsyncTLSInterceptProxy.client_env_vars()`, and the `lstub` exports,
