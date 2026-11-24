@@ -90,3 +90,5 @@ This example used plain HTTP against `server.url`. From here you can:
   (see the example on the [landing page](index.md)).
 - Inspect the raw wire bytes of each request, including chunked
   framing and trailers, via `request.wire_raw_bytes`.
+- Test a WebSocket client: accept, reject, or drop its handshakes and
+  drive each session (see [WebSockets](websockets.md)).

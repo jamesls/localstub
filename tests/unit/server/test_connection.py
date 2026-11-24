@@ -21,6 +21,7 @@ from localstub.http.headers import Headers
 from localstub.http.stream import ByteStream, unread_data
 from localstub.http.utils import maybe_await
 from localstub.middleware import (
+    AcceptWebSocket,
     CloseConnection,
     CloseDuringRequest,
     ForwardProxyResponse,
@@ -63,6 +64,9 @@ from localstub.server.connection import (
     SenderApp,
 )
 from localstub.server.transmission import Delay, FaultStep
+from localstub.websocket.deflate import PerMessageDeflate
+from localstub.websocket.frames import FrameDecoder, Opcode, WebSocketFrame
+from localstub.websocket.session import WebSocketSession
 from tests.unit.server.fakes import RecordingSleep, fake_writer, settle
 
 CLIENT = ("127.0.0.1", 4321)
@@ -214,6 +218,7 @@ def _harness(
     sent: BoundedByteBuffer | None = None,
     timestamp_provider: TimestampProvider | None = None,
     write_chunk_size: int | None = None,
+    publish_websocket: Callable[[WebSocketSession], None] | None = None,
 ) -> Harness:
     responded: list[str] = []
     forwarders: list[RawForwarder] = []
@@ -268,6 +273,7 @@ def _harness(
         sleep=sleep or RecordingSleep(),
         track_forwarder=forwarders.append,
         write_chunk_size=write_chunk_size,
+        publish_websocket=publish_websocket,
     )
     return Harness(
         reader=stream_reader,
@@ -3045,3 +3051,457 @@ def _response_history_length(
             expected_count = index + 1
             break
     return expected_count
+
+
+WS_GET = (
+    b"GET /ws HTTP/1.1\r\nHost: localhost\r\n"
+    b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+    b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    b"Sec-WebSocket-Version: 13\r\n\r\n"
+)
+WS_MASK = b"\x01\x02\x03\x04"
+WS_ACCEPT_HEAD = (
+    b"HTTP/1.1 101 Switching Protocols\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Connection: Upgrade\r\n"
+    b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+)
+
+
+def _client_frame(frame: WebSocketFrame) -> bytes:
+    return dataclasses.replace(frame, mask_key=WS_MASK).encode()
+
+
+def _server_frames(harness: Harness) -> list[WebSocketFrame]:
+    _, _, frames = harness.written.partition(b"\r\n\r\n")
+    return [decoded.frame for decoded in FrameDecoder().feed(frames)]
+
+
+@dataclass
+class _Sessions:
+    sessions: list[WebSocketSession] = field(
+        default_factory=list[WebSocketSession]
+    )
+    exchanges_at_publish: list[int] = field(default_factory=list[int])
+    recorder: TrafficRecorder | None = None
+    published: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __call__(self, session: WebSocketSession) -> None:
+        assert self.recorder is not None
+        self.exchanges_at_publish.append(len(self.recorder.exchanges))
+        self.sessions.append(session)
+        self.published.set()
+
+    async def next(self) -> WebSocketSession:
+        await asyncio.wait_for(self.published.wait(), timeout=1.0)
+        return self.sessions[-1]
+
+
+def _ws_harness(
+    accept: AcceptWebSocket | Responder | None = None,
+    **kwargs: Any,
+) -> tuple[Harness, _Sessions]:
+    sessions = _Sessions()
+    harness = _harness(
+        response=accept or AcceptWebSocket(),
+        publish_websocket=sessions,
+        **kwargs,
+    )
+    sessions.recorder = harness.recorder
+    return harness, sessions
+
+
+@pytest.mark.asyncio
+async def test_accept_writes_101_and_records_exchange_before_session() -> None:
+    harness, sessions = _ws_harness()
+    harness.feed(WS_GET + _client_frame(WebSocketFrame.close(1000)))
+
+    closed = await harness.run()
+
+    assert harness.written.startswith(WS_ACCEPT_HEAD)
+    assert sessions.exchanges_at_publish == [1]
+    [exchange] = harness.recorder.exchanges
+    assert exchange.closed is None
+    assert exchange.response is not None
+    assert exchange.response.status == 101
+    assert exchange.response.wire_raw_bytes == WS_ACCEPT_HEAD
+    [record] = harness.recorder.websockets
+    assert record is sessions.sessions[0].recorded
+    assert record.handshake is exchange
+    assert record.closed is closed
+    assert closed.reason == "websocket_close"
+    assert closed.phase == "websocket"
+    assert closed.requests_completed == 1
+    assert closed.bytes_written == len(harness.written)
+    assert closed.bytes_consumed == len(WS_GET) + 8
+    assert _server_frames(harness) == [WebSocketFrame.close(1000)]
+
+
+@pytest.mark.asyncio
+async def test_bytes_past_handshake_are_first_frames_read() -> None:
+    harness, sessions = _ws_harness(AcceptWebSocket(auto_close=False))
+    harness.feed(
+        WS_GET + _client_frame(WebSocketFrame.text("early")), eof=True
+    )
+
+    closed = await harness.run()
+
+    [message] = sessions.sessions[0].recorded.client_messages
+    assert message.text == "early"
+    assert closed.reason == "client"
+
+
+@pytest.mark.parametrize(
+    ("request_bytes", "status"),
+    [
+        (WS_GET.replace(b"Upgrade: websocket\r\n", b""), 426),
+        (WS_GET.replace(b"Version: 13", b"Version: 8"), 426),
+        (WS_GET.replace(b"GET", b"PUT", 1), 400),
+        (WS_GET.replace(b"Connection: Upgrade", b"Connection: x"), 400),
+        (WS_GET.replace(b"dGhlIHNhbXBsZSBub25jZQ==", b"short"), 400),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rejected_handshake_gets_status_and_connection_persists(
+    request_bytes: bytes, status: int
+) -> None:
+    harness, sessions = _ws_harness()
+    harness.feed(request_bytes + GET_TWO, eof=True)
+
+    closed = await harness.run()
+
+    assert sessions.sessions == []
+    first, second = harness.recorder.exchanges
+    assert first.response is not None
+    assert first.response.status == status
+    assert b"handshake rejected" in first.response.response.body
+    assert second.request.target == "/two"
+    assert closed.reason == "client"
+    assert closed.phase == "idle"
+
+
+@pytest.mark.asyncio
+async def test_accept_validates_request_as_received() -> None:
+    def rewrite(ctx: ResponderContext) -> ResponseSpec:
+        _ = ctx
+        return AcceptWebSocket()
+
+    async def strip_upgrade(
+        ctx: SenderContext, response: ResponseSpec, call_next: SenderNext
+    ) -> SendResult:
+        rewritten = ctx.request.with_headers(Headers.empty())
+        return await call_next(
+            response, ctx=dataclasses.replace(ctx, request=rewritten)
+        )
+
+    harness, sessions = _ws_harness(
+        rewrite, sender_middlewares=[strip_upgrade]
+    )
+    harness.feed(WS_GET + _client_frame(WebSocketFrame.close(1000)))
+
+    await harness.run()
+
+    assert harness.written.startswith(WS_ACCEPT_HEAD)
+    assert len(sessions.sessions) == 1
+
+
+@pytest.mark.asyncio
+async def test_sender_middleware_sees_101_without_close() -> None:
+    results: list[SendResult] = []
+
+    async def observe(
+        ctx: SenderContext, response: ResponseSpec, call_next: SenderNext
+    ) -> SendResult:
+        result = await call_next(response, ctx=ctx)
+        results.append(result)
+        return result
+
+    harness, _ = _ws_harness(sender_middlewares=[observe])
+    harness.feed(WS_GET + _client_frame(WebSocketFrame.close(1000)))
+
+    await harness.run()
+
+    [result] = results
+    assert result.recorded is not None
+    assert result.recorded.status == 101
+    assert not result.should_close
+    assert result.closed is None
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        KeepAlivePolicy(max_requests=1),
+        KeepAlivePolicy(timeout=0.0),
+        KeepAlivePolicy(timeout=0.01, advertise=True, max_requests=5),
+    ],
+)
+@pytest.mark.asyncio
+async def test_keep_alive_policy_does_not_close_switched_connection(
+    policy: KeepAlivePolicy,
+) -> None:
+    harness, sessions = _ws_harness(keep_alive=policy)
+    harness.feed(WS_GET)
+    task = asyncio.create_task(harness.run())
+    session = await sessions.next()
+    await settle()
+
+    assert not session.ended
+    assert b"Connection: close" not in harness.written
+    assert b"Keep-Alive" not in harness.written
+    harness.feed(_client_frame(WebSocketFrame.close(1000)))
+    closed = await asyncio.wait_for(task, timeout=1.0)
+    assert closed.reason == "websocket_close"
+
+
+@pytest.mark.asyncio
+async def test_session_drop_closes_with_reset() -> None:
+    harness, sessions = _ws_harness()
+    harness.feed(WS_GET)
+    task = asyncio.create_task(harness.run())
+    session = await sessions.next()
+
+    await session.drop(reset=True)
+    closed = await asyncio.wait_for(task, timeout=1.0)
+
+    assert closed.reason == "websocket_drop"
+    assert closed.phase == "websocket"
+    assert closed.reset
+    assert harness.writer.transport.abort.called
+    assert _server_frames(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_drop_then_shutdown_keeps_drop() -> None:
+    release = asyncio.Event()
+
+    async def handler(ws: WebSocketSession) -> None:
+        await ws.drop()
+        await release.wait()
+
+    harness, sessions = _ws_harness(AcceptWebSocket(handler=handler))
+    harness.feed(WS_GET)
+    task = asyncio.create_task(harness.run())
+    session = await sessions.next()
+    await settle()
+
+    harness.connection.shutdown()
+    release.set()
+    closed = await asyncio.wait_for(task, timeout=1.0)
+
+    assert closed.reason == "websocket_drop"
+    assert session.recorded.closed is closed
+
+
+@pytest.mark.asyncio
+async def test_client_eof_ends_session_with_client() -> None:
+    harness, _ = _ws_harness()
+    harness.feed(WS_GET, eof=True)
+
+    closed = await harness.run()
+
+    assert closed.reason == "client"
+    assert closed.phase == "websocket"
+
+
+@pytest.mark.asyncio
+async def test_strict_violation_closes_with_protocol_error() -> None:
+    harness, _ = _ws_harness()
+    harness.feed(WS_GET + WebSocketFrame.text("unmasked").encode())
+
+    closed = await harness.run()
+
+    assert closed.reason == "protocol_error"
+    assert closed.phase == "websocket"
+    assert _server_frames(harness) == [WebSocketFrame.close(1002)]
+
+
+@pytest.mark.asyncio
+async def test_handler_return_closes_with_1000() -> None:
+    async def handler(ws: WebSocketSession) -> None:
+        await ws.send_text("hi")
+
+    harness, _ = _ws_harness(AcceptWebSocket(handler=handler))
+    harness.feed(WS_GET)
+    task = asyncio.create_task(harness.run())
+    await settle()
+    harness.feed(_client_frame(WebSocketFrame.close(1000)))
+
+    closed = await asyncio.wait_for(task, timeout=1.0)
+
+    assert closed.reason == "websocket_close"
+    assert _server_frames(harness) == [
+        WebSocketFrame.text("hi"),
+        WebSocketFrame.close(1000),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handler_raise_closes_with_1011_and_error() -> None:
+    async def handler(ws: WebSocketSession) -> None:
+        _ = ws
+        raise RuntimeError("boom")
+
+    harness, _ = _ws_harness(AcceptWebSocket(handler=handler))
+    harness.feed(WS_GET)
+
+    closed = await harness.run()
+
+    assert closed.reason == "error"
+    assert closed.phase == "websocket"
+    assert _server_frames(harness) == [WebSocketFrame.close(1011)]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ends_open_session_without_close_frame() -> None:
+    harness, sessions = _ws_harness()
+    harness.feed(WS_GET)
+    task = asyncio.create_task(harness.run())
+    session = await sessions.next()
+
+    harness.connection.shutdown()
+    closed = await asyncio.wait_for(task, timeout=1.0)
+
+    assert closed.reason == "shutdown"
+    assert closed.phase == "websocket"
+    assert session.recorded.closed is closed
+    assert _server_frames(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_handler_shutdown_is_not_cancelled_from_inside() -> None:
+    finished: list[bool] = []
+
+    async def handler(ws: WebSocketSession) -> None:
+        assert harness.connection.owns_current_task()
+        harness.connection.shutdown()
+        await asyncio.sleep(0)
+        finished.append(ws.ended)
+
+    harness, _ = _ws_harness(AcceptWebSocket(handler=handler))
+    assert not harness.connection.owns_current_task()
+    harness.feed(WS_GET)
+
+    closed = await harness.run()
+
+    assert closed.reason == "shutdown"
+    assert finished == [True]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_connection_ends_session_with_shutdown() -> None:
+    harness, sessions = _ws_harness()
+    harness.feed(WS_GET)
+    task = asyncio.create_task(harness.connection.run())
+    session = await sessions.next()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert harness.closed.reason == "shutdown"
+    assert session.recorded.closed is harness.closed
+
+
+@pytest.mark.asyncio
+async def test_switched_writer_stops_retaining_response_bytes() -> None:
+    harness, sessions = _ws_harness()
+    harness.feed(WS_GET)
+    task = asyncio.create_task(harness.run())
+    session = await sessions.next()
+
+    await session.send_bytes(bytes(10_000))
+    exchange = harness.recorder.exchanges[0]
+
+    assert exchange.response is not None
+    assert exchange.response.wire_raw_bytes == WS_ACCEPT_HEAD
+    assert harness.state.bytes_written == len(WS_ACCEPT_HEAD) + 10_004
+    await session.drop()
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_handshake_overrides_shape_session_record() -> None:
+    harness, sessions = _ws_harness(
+        AcceptWebSocket(
+            subprotocol="rpc.v1",
+            headers={"Sec-WebSocket-Extensions": "permessage-deflate"},
+        )
+    )
+    harness.feed(WS_GET + _client_frame(WebSocketFrame.close(1000)))
+
+    await harness.run()
+
+    recorded = sessions.sessions[0].recorded
+    assert recorded.subprotocol == "rpc.v1"
+    assert recorded.compression is not None
+    assert b"Sec-WebSocket-Protocol: rpc.v1\r\n" in harness.written
+
+
+@pytest.mark.asyncio
+async def test_accept_without_publisher_still_records_websocket() -> None:
+    harness = _harness(response=AcceptWebSocket())
+    harness.feed(WS_GET + _client_frame(WebSocketFrame.ping(b"x")), eof=True)
+
+    closed = await harness.run()
+
+    [record] = harness.recorder.websockets
+    assert [f.frame.opcode for f in record.server_frames] == [Opcode.PONG]
+    assert closed.reason == "client"
+
+
+@pytest.mark.asyncio
+async def test_accept_negotiates_offered_compression() -> None:
+    harness, sessions = _ws_harness(
+        AcceptWebSocket(
+            compression=PerMessageDeflate(server_no_context_takeover=True)
+        )
+    )
+    offer = WS_GET.replace(
+        b"\r\n\r\n",
+        b"\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+    )
+    harness.feed(offer + _client_frame(WebSocketFrame.close(1000)))
+
+    await harness.run()
+
+    assert (
+        b"Sec-WebSocket-Extensions: permessage-deflate; "
+        b"server_no_context_takeover\r\n"
+    ) in harness.written
+    recorded = sessions.sessions[0].recorded
+    assert recorded.compression == PerMessageDeflate(
+        server_no_context_takeover=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_accept_declines_compression_the_client_did_not_offer() -> None:
+    harness, sessions = _ws_harness(
+        AcceptWebSocket(compression=PerMessageDeflate())
+    )
+    harness.feed(WS_GET + _client_frame(WebSocketFrame.close(1000)))
+
+    await harness.run()
+
+    assert b"Sec-WebSocket-Extensions" not in harness.written
+    assert sessions.sessions[0].recorded.compression is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_accept_closes_before_session() -> None:
+    async def shut_down(
+        ctx: SenderContext, response: ResponseSpec, call_next: SenderNext
+    ) -> SendResult:
+        result = await call_next(response, ctx=ctx)
+        harness.connection.shutdown()
+        return result
+
+    harness, sessions = _ws_harness(sender_middlewares=[shut_down])
+    harness.feed(WS_GET)
+
+    closed = await harness.run()
+
+    assert closed.reason == "shutdown"
+    assert sessions.sessions == []
+    assert harness.recorder.exchanges[0].closed is closed

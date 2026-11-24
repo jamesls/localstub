@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
@@ -14,6 +14,7 @@ from localstub.http.proxy import (
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.responsespec import HTTPResponse
 from localstub.middleware.core import (
+    AcceptWebSocket,
     CloseConnection,
     CloseDuringRequest,
     ForwardProxyResponse,
@@ -74,7 +75,7 @@ class ThrottleMiddleware:
 
 @dataclass
 class ResponseSequenceMiddleware:
-    responses: list[HTTPResponse | CloseConnection]
+    responses: Sequence[HTTPResponse | CloseConnection | AcceptWebSocket]
     index: int = 0
 
     def reset(self) -> None:

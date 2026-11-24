@@ -15,6 +15,7 @@ from localstub.http.exchange import ConnectionClosed
 from localstub.http.headers import Headers
 from localstub.http.request import HTTPRequestHeaders, HTTPRequestReader
 from localstub.middleware import (
+    AcceptWebSocket,
     CloseConnection,
     ForwardProxyResponse,
     HeaderContext,
@@ -98,6 +99,33 @@ def test_server_url_raises_when_not_started() -> None:
     server = AsyncHTTPTestServer()
     with pytest.raises(RuntimeError, match="Server not started yet"):
         _ = server.url
+
+
+def test_server_ws_url_raises_when_not_started() -> None:
+    server = AsyncHTTPTestServer()
+    with pytest.raises(RuntimeError, match="Server not started yet"):
+        _ = server.ws_url
+
+
+@pytest.mark.asyncio
+async def test_server_ws_url_and_next_websocket_without_timeout() -> None:
+    async with AsyncHTTPTestServer() as server:
+        server.set_default_response(AcceptWebSocket())
+        host, port = _listening(server)
+        assert server.ws_url == f"ws://{host}:{port}/"
+        reader, writer = await asyncio.open_connection(host, port)
+        writer.write(
+            b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+            b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        )
+        session = await asyncio.wait_for(server.next_websocket(), 1.0)
+        await reader.readuntil(b"\r\n\r\n")
+        writer.close()
+        await writer.wait_closed()
+
+        assert server.default_response == AcceptWebSocket()
+        assert (await session.wait_closed(1.0)).reason == "client"
 
 
 def test_forward_proxy_with_injected_client_raises_value_error() -> None:

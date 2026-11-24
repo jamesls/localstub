@@ -23,6 +23,7 @@ from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.http.tcp import pack_linger_option
 from localstub.middleware import (
+    AcceptWebSocket,
     CloseConnection,
     CloseDuringRequest,
     HeaderDecision,
@@ -58,9 +59,25 @@ from localstub.server.transmission import (
     TruncateBody,
     Writer,
 )
+from localstub.websocket.deflate import PerMessageDeflate
+from localstub.websocket.frames import Opcode, WebSocketFrame
+from localstub.websocket.records import (
+    RecordedWebSocket,
+    RecordedWebSocketFrame,
+    RecordedWebSocketMessage,
+    WebSocketClose,
+    WebSocketMessage,
+    WebSocketViolation,
+)
+from localstub.websocket.session import (
+    WebSocketEnded,
+    WebSocketHandler,
+    WebSocketSession,
+)
 
 __all__ = [
     "AbortTransmission",
+    "AcceptWebSocket",
     "ApplyResult",
     "AsyncHTTPTestServer",
     "ByteFlip",
@@ -83,9 +100,14 @@ __all__ = [
     "ImmediateTransmission",
     "KeepAlivePolicy",
     "OnHeadersReceived",
+    "Opcode",
+    "PerMessageDeflate",
     "RecordedExchange",
     "RecordedHTTPRequest",
     "RecordedHTTPResponse",
+    "RecordedWebSocket",
+    "RecordedWebSocketFrame",
+    "RecordedWebSocketMessage",
     "RecordingStreamWriter",
     "RequestPipeline",
     "ResponderHandler",
@@ -96,6 +118,13 @@ __all__ = [
     "ThrottledTransmission",
     "TransmissionStrategy",
     "TruncateBody",
+    "WebSocketClose",
+    "WebSocketEnded",
+    "WebSocketFrame",
+    "WebSocketHandler",
+    "WebSocketMessage",
+    "WebSocketSession",
+    "WebSocketViolation",
     "Writer",
     "pack_linger_option",
 ]

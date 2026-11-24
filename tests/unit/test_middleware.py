@@ -16,6 +16,7 @@ from localstub.http.request import (
 from localstub.http.response import RecordedHTTPResponse
 from localstub.http.responsespec import HTTPResponse
 from localstub.middleware import (
+    AcceptWebSocket,
     CloseConnection,
     CloseDuringRequest,
     ConnectionMeta,
@@ -642,6 +643,26 @@ def test_close_connection_defaults_to_graceful_close_without_delay() -> None:
 def test_close_connection_negative_delay_raises_value_error() -> None:
     with pytest.raises(ValueError, match="delay must be non-negative"):
         CloseConnection(delay=-0.1)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"close_timeout": -1.0}, "close_timeout"),
+        ({"max_message_bytes": -1}, "max_message_bytes"),
+    ],
+)
+def test_accept_websocket_rejects_negative_limits(
+    kwargs: dict[str, float], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        AcceptWebSocket(**kwargs)
+
+
+def test_ensure_response_spec_accepts_accept_websocket() -> None:
+    accept = AcceptWebSocket(subprotocol="chat")
+
+    assert ensure_response_spec(accept) is accept
 
 
 def test_close_connection_compares_by_value_and_is_hashable() -> None:

@@ -10,7 +10,7 @@ so memory stays bounded no matter how long the server or proxy runs.
 shared by the test server and the TLS intercept proxy: bounded history
 lists, ``last_*`` convenience attributes, and the queues behind the
 ``next_request()`` / ``next_response()`` / ``next_exchange()`` /
-``next_closed_connection()`` consumer API.
+``next_closed_connection()`` / ``next_websocket()`` consumer API.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from localstub.http.exchange import ConnectionClosed, RecordedExchange
 from localstub.http.request import RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
 from localstub.middleware import SystemTimestampProvider, TimestampProvider
+from localstub.websocket.records import RecordedWebSocket
 
 LOG = logging.getLogger(__name__)
 
@@ -241,10 +242,11 @@ def trim_history[T](items: list[T], maxsize: int | None) -> list[T]:
 class TrafficRecorder:
     """Records HTTP traffic and hands it to recording consumers.
 
-    Owns the bounded request/response/exchange/closed-connection
-    history lists, the ``last_*`` convenience attributes, and the
-    queues that back the ``next_request()`` / ``next_response()`` /
-    ``next_exchange()`` / ``next_closed_connection()`` consumer API.
+    Owns the bounded request/response/exchange/closed-connection/
+    WebSocket history lists, the ``last_*`` convenience attributes, and
+    the queues that back the ``next_request()`` / ``next_response()`` /
+    ``next_exchange()`` / ``next_closed_connection()`` /
+    ``next_websocket()`` consumer API.
     All buffers share one ``buffer_size``; ``None`` means unbounded.
     """
 
@@ -256,12 +258,15 @@ class TrafficRecorder:
     exchanges: list[RecordedExchange]
     last_closed_connection: ConnectionClosed | None
     closed_connections: list[ConnectionClosed]
+    last_websocket: RecordedWebSocket | None
+    websockets: list[RecordedWebSocket]
 
     _request_timestamps: dict[int, float]
     _request_queue: BoundedRecordQueue[RecordedHTTPRequest]
     _response_queue: BoundedRecordQueue[RecordedHTTPResponse]
     _exchange_queue: BoundedRecordQueue[RecordedExchange]
     _closed_connection_queue: BoundedRecordQueue[ConnectionClosed]
+    _websocket_queue: BoundedRecordQueue[RecordedWebSocket]
 
     def __init__(
         self,
@@ -277,6 +282,19 @@ class TrafficRecorder:
         )
         self.reset()
 
+    @property
+    def clock(self) -> Clock:
+        return self._clock
+
+    @property
+    def timestamp_provider(self) -> TimestampProvider:
+        return self._timestamp_provider
+
+    @property
+    def buffer_size(self) -> int | None:
+        """The bound every history and queue shares; ``None`` is none."""
+        return self._buffer_size
+
     def reset(self) -> None:
         """Drop all recorded traffic and start over with empty buffers."""
         self.last_request = None
@@ -287,6 +305,8 @@ class TrafficRecorder:
         self.exchanges = []
         self.last_closed_connection = None
         self.closed_connections = []
+        self.last_websocket = None
+        self.websockets = []
         self._request_timestamps = {}
         self._request_queue = BoundedRecordQueue(
             self._buffer_size, name="requests"
@@ -299,6 +319,9 @@ class TrafficRecorder:
         )
         self._closed_connection_queue = BoundedRecordQueue(
             self._buffer_size, name="closed connections"
+        )
+        self._websocket_queue = BoundedRecordQueue(
+            self._buffer_size, name="websockets"
         )
 
     def record_request(
@@ -329,14 +352,15 @@ class TrafficRecorder:
         request_timestamp: datetime,
         interim_responses: tuple[RecordedHTTPResponse, ...] = (),
         closed: ConnectionClosed | None = None,
-    ) -> None:
+    ) -> RecordedExchange:
         """Record a completed exchange and, when present, its response.
 
         ``response`` is ``None`` when the exchange failed before a
         response could be sent; the exchange is still recorded so
         consumers observe the request's outcome, but nothing is added
         to the response history or queue.  ``interim_responses`` and
-        ``closed`` are stored on the exchange only.
+        ``closed`` are stored on the exchange only.  Returns the
+        recorded exchange.
         """
         response_timestamp = (
             self._timestamp_provider.now() if response is not None else None
@@ -358,6 +382,7 @@ class TrafficRecorder:
             trim_history(self.responses, self._buffer_size)
             self.last_response = response
             self._response_queue.put(response)
+        return exchange
 
     def record_connection_closed(self, event: ConnectionClosed) -> None:
         """Record the terminal event of a connection."""
@@ -365,6 +390,13 @@ class TrafficRecorder:
         trim_history(self.closed_connections, self._buffer_size)
         self.last_closed_connection = event
         self._closed_connection_queue.put(event)
+
+    def record_websocket(self, websocket: RecordedWebSocket) -> None:
+        """Record a WebSocket session once its 101 is on the wire."""
+        self.websockets.append(websocket)
+        trim_history(self.websockets, self._buffer_size)
+        self.last_websocket = websocket
+        self._websocket_queue.put(websocket)
 
     def get_request_timestamp(self, request: RecordedHTTPRequest) -> float:
         """Return the monotonic reception timestamp for *request*.
@@ -417,6 +449,12 @@ class TrafficRecorder:
         """
         return await self._next(self._closed_connection_queue, timeout)
 
+    async def next_websocket(
+        self, timeout: float | None = None
+    ) -> RecordedWebSocket:
+        """Await and return the record of the next WebSocket session."""
+        return await self._next(self._websocket_queue, timeout)
+
     @property
     def dropped_requests(self) -> int:
         """Requests evicted unread from the next_request() buffer."""
@@ -437,6 +475,12 @@ class TrafficRecorder:
         """Close events evicted unread from the next_closed_connection()
         buffer."""
         return self._closed_connection_queue.dropped
+
+    @property
+    def dropped_websockets(self) -> int:
+        """WebSocket records evicted unread from the next_websocket()
+        buffer."""
+        return self._websocket_queue.dropped
 
     async def _next[T](
         self, queue: BoundedRecordQueue[T], timeout: float | None

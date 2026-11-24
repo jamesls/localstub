@@ -18,6 +18,8 @@ type CloseReason = Literal[
     "protocol_error",  # the request could not be parsed
     "error",  # handler or middleware raised
     "shutdown",  # server or proxy shutdown closed it
+    "websocket_close",  # WebSocket closing handshake by either side
+    "websocket_drop",  # WebSocketSession.drop() closed with no Close
 ]
 
 type ClosePhase = Literal[
@@ -27,6 +29,7 @@ type ClosePhase = Literal[
     "response",  # request complete, no responder output written
     "response_body",  # response head written, body unfinished
     "after_response",  # response fully written
+    "websocket",  # 101 written, WebSocket session not yet ended
 ]
 
 

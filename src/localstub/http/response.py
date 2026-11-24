@@ -257,6 +257,15 @@ class AsyncMultiResponseParser:
         """Whether bytes remain past the last parsed response."""
         return bool(self._buffer)
 
+    def take_buffered_data(self) -> bytes:
+        """Remove and return the bytes read past the last response.
+
+        After a 101 these belong to the switched protocol.
+        """
+        data = bytes(self._buffer)
+        self._buffer.clear()
+        return data
+
     async def next_response(
         self,
         reader: asyncio.StreamReader,

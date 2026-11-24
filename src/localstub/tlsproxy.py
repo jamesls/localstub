@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from localstub.ca import TLSProxyCA
 from localstub.forward import (
     ForwardError,
+    ForwardResult,
     RawForwarder,
     ResponseTransformer,
     StreamClientWriter,
@@ -24,6 +25,7 @@ from localstub.forward import (
     TransformResult,
     response_allows_keep_alive,
 )
+from localstub.http import stream
 from localstub.http.exchange import ConnectionClosed, RecordedExchange
 from localstub.http.request import (
     AsyncRequestParser,
@@ -32,15 +34,21 @@ from localstub.http.request import (
     RecordedHTTPRequest,
 )
 from localstub.http.response import (
+    AsyncMultiResponseParser,
     RecordedHTTPResponse,
 )
 from localstub.http.uri import format_host
 from localstub.recording import (
+    DEFAULT_MAX_CONNECTION_BYTES,
     DEFAULT_RECORDING_BUFFER_SIZE,
     TrafficRecorder,
 )
 from localstub.server import AsyncHTTPTestServer
 from localstub.server.transmission import apply_fault_steps
+from localstub.websocket.deflate import agreed_extensions
+from localstub.websocket.handshake import header_tokens
+from localstub.websocket.records import RecordedWebSocket, WebSocketLog
+from localstub.websocket.relay import WebSocketRelay
 
 LOG = logging.getLogger(__name__)
 _SHUTDOWN_DRAIN_TURNS = 8
@@ -133,6 +141,24 @@ def _wire_log(direction: str, data: bytes) -> None:
         escaped_dir,
         hexdump,
         extra={"markup": True, "highlighter": None},
+    )
+
+
+def _is_websocket_switch(
+    request: RecordedHTTPRequest,
+    response: ForwardResult,
+) -> bool:
+    """Whether an upstream 101 switched the connection to WebSocket."""
+    if response.status != 101:
+        return False
+    if "websocket" not in {
+        token.lower() for token in header_tokens(request.headers, "Upgrade")
+    }:
+        return False
+    return any(
+        token.strip().lower() == "websocket"
+        for value in response.headers.get_all("Upgrade", [])
+        for token in value.split(",")
     )
 
 
@@ -309,6 +335,33 @@ class AsyncTLSInterceptProxy:
         """Close events evicted unread from the next_closed_connection()
         buffer."""
         return self._recorder.dropped_closed_connections
+
+    @property
+    def websockets(self) -> list[RecordedWebSocket]:
+        """WebSocket records through this proxy's recorder, oldest first.
+
+        In forward mode these are relayed sessions; in intercept mode
+        the shared recorder also holds the server's stub sessions,
+        which a test drives through ``server.next_websocket()``.
+        """
+        return self._recorder.websockets
+
+    @property
+    def last_websocket(self) -> RecordedWebSocket | None:
+        """The most recently recorded WebSocket session."""
+        return self._recorder.last_websocket
+
+    async def next_websocket(
+        self, timeout: float | None = None
+    ) -> RecordedWebSocket:
+        """Await and return the record of the next WebSocket session."""
+        return await self._recorder.next_websocket(timeout)
+
+    @property
+    def dropped_websockets(self) -> int:
+        """WebSocket records evicted unread from the next_websocket()
+        buffer."""
+        return self._recorder.dropped_websockets
 
     async def start(self) -> None:
         if self._listener is not None:
@@ -747,12 +800,14 @@ class AsyncTLSInterceptProxy:
             upstream_writer.write(full_wire)
             await upstream_writer.drain()
 
+            response_parser = AsyncMultiResponseParser(max_read=self._max_read)
             final_response = await self._forwarder.read_and_relay_responses(
                 upstream_reader=upstream_reader,
                 client_writer=StreamClientWriter(client_writer),
                 request_method=final_parsed.method,
                 upstream_id=upstream_id,
                 client_id=client_id,
+                multi_parser=response_parser,
             )
             if final_response is None:
                 await self._record_failure_and_close(
@@ -769,16 +824,77 @@ class AsyncTLSInterceptProxy:
                 return False
 
             response = final_response.to_recorded_response()
-            self._recorder.record_exchange(
+            exchange = self._recorder.record_exchange(
                 request=request,
                 response=response,
                 request_timestamp=request_timestamp,
             )
             _close_log(f"{upstream_id} --> lstub", "response received")
             _close_log(f"lstub --> {client_id}", "response relayed")
+            if _is_websocket_switch(request, final_response):
+                await self._relay_websocket(
+                    exchange=exchange,
+                    response=final_response,
+                    response_parser=response_parser,
+                    client_reader=client_reader,
+                    client_writer=client_writer,
+                    upstream_reader=upstream_reader,
+                    upstream_writer=upstream_writer,
+                    client_id=client_id,
+                    upstream_id=upstream_id,
+                )
+                return False
             return response_allows_keep_alive(request, final_response)
         finally:
             self._forwarder.release_upstream(upstream_writer)
+
+    async def _relay_websocket(
+        self,
+        *,
+        exchange: RecordedExchange,
+        response: ForwardResult,
+        response_parser: AsyncMultiResponseParser,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        upstream_reader: asyncio.StreamReader,
+        upstream_writer: asyncio.StreamWriter,
+        client_id: str,
+        upstream_id: str,
+    ) -> None:
+        """Tunnel a switched WebSocket unchanged and record its frames.
+
+        The record holds what the upstream's 101 agreed, so a tap can
+        inflate permessage-deflate messages in both directions.
+        """
+        agreed = agreed_extensions(
+            response.headers.get_all("Sec-WebSocket-Extensions", [])
+        )
+        log = WebSocketLog(
+            handshake=exchange,
+            subprotocol=response.headers.get("Sec-WebSocket-Protocol"),
+            compression=agreed.compression,
+            history_size=self._recorder.buffer_size,
+            history_bytes=DEFAULT_MAX_CONNECTION_BYTES,
+        )
+        self._recorder.record_websocket(RecordedWebSocket(log))
+        relay = WebSocketRelay(
+            client_reader=client_reader,
+            client_writer=client_writer,
+            upstream_reader=upstream_reader,
+            upstream_writer=upstream_writer,
+            log=log,
+            clock=self._recorder.clock,
+            timestamp=self._recorder.timestamp_provider.now,
+            max_read=self._max_read,
+            unknown_extensions=agreed.other,
+            upstream_prefix=stream.take_unread_data(client_reader),
+            client_prefix=response_parser.take_buffered_data(),
+            wire_log=_wire_log,
+            client_id=client_id,
+            upstream_id=upstream_id,
+        )
+        await relay.run()
+        _close_log(f"lstub --> {client_id}", "WebSocket relay ended")
 
     async def _forward_100_continue_request(
         self,

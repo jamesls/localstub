@@ -12,6 +12,7 @@ nav = [
   { "Home" = "index.md" },
   { "Getting started" = "getting-started.md" },
   { "Large bodies and benchmarking" = "large-bodies.md" },
+  { "WebSockets" = "websockets.md" },
 ]
 
 # extra_css = ["stylesheets/extra.css"]

@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+* WebSocket support (RFC 6455). A responder returns `AcceptWebSocket`
+  wherever it would return an `HTTPResponse`; the server completes the
+  handshake and `server.next_websocket()` returns a `WebSocketSession`
+  to drive, or a handler coroutine runs it. Routes, response sequences,
+  throttling and middleware apply to the handshake unchanged, and an
+  invalid handshake gets a 400 or 426. Every client frame is recorded
+  with its exact wire bytes in `session.recorded`. Sessions can send
+  invalid frames, raw bytes, chosen close codes, or drop the
+  connection. `server.ws_url` gives the `ws://` URL.
+* A session's frame and message histories and its receive queues are
+  bounded by `recording_buffer_size` entries and `max_connection_bytes`
+  bytes, so a long or large session holds bounded memory.
+* permessage-deflate (RFC 7692), off unless
+  `AcceptWebSocket(compression=PerMessageDeflate())` asks for it.
+* The TLS proxy's forward mode relays a WebSocket upstream unchanged
+  and records both directions; `proxy.next_websocket()` returns the
+  record. A non-WebSocket 101 still closes the tunnel.
+* `CloseReason` gains `websocket_close` and `websocket_drop`, and
+  `ClosePhase` gains `websocket`. Code that matches them exhaustively
+  needs new cases.
+* A plain `HTTPResponse(status=101)` keeps its behaviour: it is written
+  and the connection closes.
+
 ## v0.1.2
 
 * The `lstub` CLI no longer keeps a raw byte log for each client

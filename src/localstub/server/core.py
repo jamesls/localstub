@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from types import TracebackType
 from typing import Any, Self
 
@@ -21,6 +21,7 @@ from localstub.http.responsespec import HeadersLike, HTTPResponse
 from localstub.http.uri import format_host
 from localstub.http.utils import maybe_await
 from localstub.middleware import (
+    AcceptWebSocket,
     CloseConnection,
     HeaderContext,
     HeaderDecision,
@@ -50,7 +51,9 @@ from localstub.recording import (
     DEFAULT_MAX_CONNECTION_BYTES,
     DEFAULT_RECORDING_BUFFER_SIZE,
     BoundedByteBuffer,
+    BoundedRecordQueue,
     TrafficRecorder,
+    trim_history,
 )
 from localstub.router import (
     HandlerMiddleware,
@@ -80,9 +83,11 @@ from localstub.throttle import (
     ThrottleKeyFunc,
     TokenBucketThrottler,
 )
+from localstub.websocket.session import WebSocketSession
 
 LOG = logging.getLogger(__name__)
 ThrottleResponse = HTTPResponse | ThrottleResponseFunc
+StaticResponse = HTTPResponse | CloseConnection | AcceptWebSocket
 
 # Event-loop turns aclose() yields after pausing accepts, so already-accepted
 # connections reach _client_connected and get torn down. Turning an accepted
@@ -164,12 +169,15 @@ class AsyncHTTPTestServer:
         in one write.
     """
 
+    host: str | None
+    port: int | None
+
     def __init__(
         self,
         host: str = "127.0.0.1",
         port: int = 0,
         handler: ResponderHandler | None = None,
-        default_response: HTTPResponse | CloseConnection | None = None,
+        default_response: StaticResponse | None = None,
         on_headers_received: OnHeadersReceived | None = None,
         upstream_client: HTTPClient | None = None,
         raw_forwarder: RawForwarder | None = None,
@@ -218,7 +226,7 @@ class AsyncHTTPTestServer:
         self._client_tasks: dict[HTTPConnection, asyncio.Task[None]] = {}
 
         self._handler: ResponderHandler | None = handler
-        self._default_response: HTTPResponse | CloseConnection = (
+        self._default_response: StaticResponse = (
             default_response or HTTPResponse.json({})
         )
         self.router = Router()
@@ -274,6 +282,7 @@ class AsyncHTTPTestServer:
             clock=self._clock,
             timestamp_provider=self._timestamp_provider,
         )
+        self._reset_websockets()
         self._max_connection_bytes = max_connection_bytes
         self._max_recorded_body_bytes = max_recorded_body_bytes
         self._write_chunk_size = _checked_write_chunk_size(write_chunk_size)
@@ -295,8 +304,7 @@ class AsyncHTTPTestServer:
             keep_alive=self._get_keep_alive,
         )
 
-        self.host: str | None = None
-        self.port: int | None = None
+        self.host = self.port = None
 
     @property
     def url(self) -> str:
@@ -313,13 +321,18 @@ class AsyncHTTPTestServer:
         self._handler = value
 
     @property
-    def default_response(self) -> HTTPResponse | CloseConnection:
+    def ws_url(self) -> str:
+        """The server's address as a ``ws://`` URL."""
+        if self.host is None or self.port is None:
+            raise RuntimeError("Server not started yet")
+        return f"ws://{format_host(self.host)}:{self.port}/"
+
+    @property
+    def default_response(self) -> StaticResponse:
         return self._default_response
 
     @default_response.setter
-    def default_response(
-        self, response: HTTPResponse | CloseConnection
-    ) -> None:
+    def default_response(self, response: StaticResponse) -> None:
         self.set_default_response(response)
 
     def add_route(
@@ -388,23 +401,23 @@ class AsyncHTTPTestServer:
             HTTPResponse.raw(data, status=status, headers=headers)
         )
 
-    def set_default_response(
-        self, response: HTTPResponse | CloseConnection
-    ) -> None:
+    def set_default_response(self, response: StaticResponse) -> None:
         """Configure a static response returned for every request.
 
         Unlike set_json_response/set_text_response/set_raw_response, this
-        accepts an already-constructed HTTPResponse object, or a
-        ``CloseConnection`` to close on every request without a handler.
+        accepts an already-constructed HTTPResponse object, a
+        ``CloseConnection`` to close on every request without a handler,
+        or an ``AcceptWebSocket`` to accept every WebSocket handshake.
 
         Args:
-            response: HTTPResponse or CloseConnection used for all requests
+            response: HTTPResponse, CloseConnection or AcceptWebSocket
+                used for all requests
         """
         self._default_response = response
         self._builtins.clear("sequence")
 
     def set_response_sequence(
-        self, responses: list[HTTPResponse | CloseConnection]
+        self, responses: Sequence[StaticResponse]
     ) -> None:
         """Configure a sequence of responses to return in order.
 
@@ -413,7 +426,8 @@ class AsyncHTTPTestServer:
 
         This is useful for testing retry logic where you want the first N
         requests to fail and subsequent requests to succeed.  An item may
-        be a ``CloseConnection`` to close instead of responding.
+        be a ``CloseConnection`` to close instead of responding, or an
+        ``AcceptWebSocket`` to accept a WebSocket handshake.
 
         Example:
             server.set_response_sequence([
@@ -423,8 +437,8 @@ class AsyncHTTPTestServer:
             ])
 
         Args:
-            responses: List of HTTPResponse or CloseConnection objects to
-                return in sequence
+            responses: List of HTTPResponse, CloseConnection or
+                AcceptWebSocket objects to return in sequence
         """
         self._builtins.set("sequence", ResponseSequenceMiddleware(responses))
         # Clear default response (last one wins)
@@ -547,10 +561,11 @@ class AsyncHTTPTestServer:
         """Clear all recorded request state.
 
         Resets last_request, requests list, the request queue, the
-        closed-connection history and queue, and connection-level raw
-        bytes while preserving server configuration (handler,
-        default_response, etc.).  Per-connection byte counters are not
-        touched.
+        closed-connection history and queue, the WebSocket histories and
+        queues, and connection-level raw bytes while preserving server
+        configuration (handler, default_response, etc.).  Per-connection
+        byte counters are not touched, and a WebSocket session that is
+        still open stays open and keeps recording into its own record.
 
         Useful for reusing a session-scoped test server across multiple
         tests without needing to shut down and restart the server.
@@ -569,6 +584,7 @@ class AsyncHTTPTestServer:
                 assert len(server.requests) == 1
         """
         self._recorder.reset()
+        self._reset_websockets()
         for buf in self._connection_raw_bytes_received.values():
             buf.clear()
         for buf in self._connection_raw_bytes_sent.values():
@@ -917,6 +933,48 @@ class AsyncHTTPTestServer:
         buffer."""
         return self._recorder.dropped_closed_connections
 
+    @property
+    def websockets(self) -> list[WebSocketSession]:
+        """Sessions accepted so far, open or ended, oldest first
+        (bounded history)."""
+        return self._websockets
+
+    @property
+    def last_websocket(self) -> WebSocketSession | None:
+        """The most recently accepted session."""
+        return self._last_websocket
+
+    async def next_websocket(
+        self, timeout: float | None = None
+    ) -> WebSocketSession:
+        """Await and return the next accepted session.
+
+        A session is queued once its 101 is on the wire, whether or not
+        its accept named a handler.
+        """
+        queue = self._websocket_queue
+        if timeout is None:
+            return await queue.get()
+        return await asyncio.wait_for(queue.get(), timeout=timeout)
+
+    @property
+    def dropped_websockets(self) -> int:
+        """Sessions evicted unread from the next_websocket() buffer."""
+        return self._websocket_queue.dropped
+
+    def _reset_websockets(self) -> None:
+        self._websockets: list[WebSocketSession] = []
+        self._last_websocket: WebSocketSession | None = None
+        self._websocket_queue: BoundedRecordQueue[WebSocketSession] = (
+            BoundedRecordQueue(self._recorder.buffer_size, name="websockets")
+        )
+
+    def _publish_websocket(self, session: WebSocketSession) -> None:
+        self._websockets.append(session)
+        trim_history(self._websockets, self._recorder.buffer_size)
+        self._last_websocket = session
+        self._websocket_queue.put(session)
+
     async def handle_http_connection(
         self,
         reader: asyncio.StreamReader,
@@ -985,6 +1043,10 @@ class AsyncHTTPTestServer:
             track_forwarder=self._track_forwarder,
             max_body_kept=self._max_recorded_body_bytes,
             write_chunk_size=self._write_chunk_size,
+            publish_websocket=self._publish_websocket,
+            # 0 turns the byte log off; it must not make WebSocket
+            # histories and queues keep only their newest entry.
+            websocket_history_bytes=self._max_connection_bytes or None,
         )
         self._connections[writer] = connection
         return connection

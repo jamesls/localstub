@@ -52,6 +52,7 @@ dev = [
   "zensical",
   "pytest-codspeed>=5.0.3",
   "pyrefly>=1.4.1",
+  "websockets>=17.4",
 ]
 
 
@@ -159,7 +160,7 @@ layers = [
   "server",
   "recording | router",
   "middleware",
-  "forward | throttle",
+  "forward | throttle | websocket",
   "http",
   "clock | ca | console",
 ]
@@ -178,6 +179,19 @@ layers = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "localstub.websocket layers: frames up to session and relay"
+type = "layers"
+containers = ["localstub.websocket"]
+exhaustive = true
+layers = [
+  "session | relay",
+  "assembly",
+  "records | handshake",
+  "deflate",
+  "frames",
+]
+
+[[tool.importlinter.contracts]]
 name = "Only the CLI may import console"
 type = "forbidden"
 source_modules = [
@@ -191,6 +205,7 @@ source_modules = [
   "localstub.middleware",
   "localstub.forward",
   "localstub.throttle",
+  "localstub.websocket",
   "localstub.http",
   "localstub.clock",
   "localstub.ca",

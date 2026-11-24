@@ -77,6 +77,16 @@ before handoff. The sequence is: change → `poe auto-check` → `poe test`.
 - Factory methods: `.json()`, `.text()`, `.raw()` for common response types
 - Automatically sets appropriate Content-Type and Content-Length headers
 
+**WebSockets** (`src/localstub/websocket/`, `src/localstub/server/websocket.py`)
+- `AcceptWebSocket` (`middleware/core.py`) is a `ResponseSpec`; the
+  sender terminal writes the 101 and `_serve()` runs a
+  `WebSocketSession` once the handshake exchange is recorded
+- The package does no server imports: `frames` (codec), `deflate`
+  (RFC 7692), `handshake`, `records`, `assembly` (violation checks,
+  shared by sessions and the forward relay), `session`, `relay`
+- Sessions decide closes through a callback, so `ConnectionState` stays
+  the only place a close is decided; phase is `websocket`
+
 ### Key Features
 
 1. **Raw Wire Bytes**: The server preserves exact bytes received, including Transfer-Encoding chunked framing and AWS chunked signatures

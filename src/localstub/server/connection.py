@@ -29,7 +29,12 @@ from localstub.http.connection import (
     parse_connection_tokens,
     should_close_connection,
 )
-from localstub.http.exchange import ClosePhase, CloseReason, ConnectionClosed
+from localstub.http.exchange import (
+    ClosePhase,
+    CloseReason,
+    ConnectionClosed,
+    RecordedExchange,
+)
 from localstub.http.headers import HeaderItem, Headers
 from localstub.http.request import (
     AsyncRequestParser,
@@ -50,6 +55,7 @@ from localstub.http.utils import (
     status_phrase,
 )
 from localstub.middleware import (
+    AcceptWebSocket,
     CloseConnection,
     CloseDuringRequest,
     ConnectionMeta,
@@ -73,6 +79,12 @@ from localstub.server.transmission import (
     ImmediateTransmission,
     TransmissionStrategy,
 )
+from localstub.server.websocket import (
+    PreparedAccept,
+    build_session,
+    prepare_accept,
+)
+from localstub.websocket.session import WebSocketSession
 
 LOG = logging.getLogger(__name__)
 
@@ -87,6 +99,7 @@ HeaderApp = Callable[[HeaderContext], Awaitable[HeaderDecision]]
 ResponderApp = Callable[[ResponderContext], Awaitable[ResponseSpec]]
 SenderApp = Callable[[SenderContext, ResponseSpec], Awaitable[SendResult]]
 CaptureContext = Callable[[ResponderContext], None]
+PublishWebSocket = Callable[[WebSocketSession], None]
 
 
 class ConnectionLost(Exception):
@@ -385,6 +398,7 @@ class RecordingStreamWriter:
         self._state = state
         self._chunks: list[bytes | memoryview] = []
         self._pending = bytearray()
+        self._retain = True
 
     @property
     def bytes_sent(self) -> bytes:
@@ -411,8 +425,21 @@ class RecordingStreamWriter:
         self._chunks.clear()
         self._pending.clear()
 
+    def stop_retaining(self) -> None:
+        """Stop retaining the current response; keep counting bytes.
+
+        Called once a connection switches to WebSocket, where "the
+        current response" would otherwise hold every frame of a long
+        session.  The connection byte buffer and counters still see
+        every write.
+        """
+        self._retain = False
+        self.start_response()
+
     def write(self, data: bytes | memoryview) -> None:
-        if len(data) >= self._coalesce_size:
+        if not self._retain:
+            pass
+        elif len(data) >= self._coalesce_size:
             if self._pending:
                 self._chunks.append(bytes(self._pending))
                 self._pending.clear()
@@ -519,6 +546,8 @@ class HTTPConnection:
         track_forwarder: TrackForwarder,
         max_body_kept: int | None = None,
         write_chunk_size: int | None = None,
+        publish_websocket: PublishWebSocket | None = None,
+        websocket_history_bytes: int | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -537,6 +566,13 @@ class HTTPConnection:
         self._finalized = False
         self._sending: HTTPResponse | None = None
         self._final_send_close = False
+        self._publish_websocket = publish_websocket
+        self._websocket_history_bytes = websocket_history_bytes
+        # An accept whose 101 is on the wire, waiting for its exchange
+        # to be recorded before its session starts.
+        self._pending_accept: PreparedAccept | None = None
+        self._handshake: RecordedExchange | None = None
+        self._session: WebSocketSession | None = None
 
     @property
     def state(self) -> ConnectionState:
@@ -576,11 +612,18 @@ class HTTPConnection:
         An earlier decision is preserved.  The loop's task is never
         cancelled from inside itself: a handler that shuts the server
         down only records the decision, and the loop exits after the
-        current request.  Once the loop has finished, only the transport
+        current request.  A WebSocket session ends at once.  Once the
+        loop has finished, only the transport
         close remains, and that is aborted rather than left waiting on
         the peer.
         """
-        self._decide("shutdown", self._state.phase)
+        event = self._decide("shutdown", self._state.phase)
+        session = self._session
+        if session is not None and not session.ended:
+            # A WebSocket ends at once, without a Close frame, even when
+            # its own handler shut the server down.
+            self._start_close(event)
+            session.terminate(event)
         child = self._child
         if child is None or self.owns_current_task():
             return
@@ -601,11 +644,19 @@ class HTTPConnection:
             await asyncio.wait({child})
 
     def owns_current_task(self) -> bool:
-        """Whether the calling code runs inside this connection's loop."""
+        """Whether the calling code runs inside this connection's loop.
+
+        A WebSocket session's handler task counts as the loop, so a
+        handler that shuts the server down is not cancelled from
+        inside itself.
+        """
         try:
             current = asyncio.current_task()
         except RuntimeError:
             return False
+        session = self._session
+        if session is not None and session.owns_current_task():
+            return True
         return self._child is not None and self._child is current
 
     def finalize(self) -> None:
@@ -674,6 +725,11 @@ class HTTPConnection:
                 if reading is None:
                     break
                 if await self._handle_request(reading):
+                    break
+                session = self._take_pending_session()
+                if session is not None:
+                    state.phase = "websocket"
+                    await self._run_session(session)
                     break
             if state.closed is not None and not self._writer.is_closing():
                 self._start_close(state.closed)
@@ -1039,9 +1095,9 @@ class HTTPConnection:
         request_timestamp: datetime,
         *,
         response: RecordedHTTPResponse | None,
-    ) -> None:
+    ) -> RecordedExchange:
         state = self._state
-        self._recorder.record_exchange(
+        exchange = self._recorder.record_exchange(
             request=request,
             response=response,
             request_timestamp=request_timestamp,
@@ -1049,6 +1105,7 @@ class HTTPConnection:
             closed=state.closed,
         )
         self._sending = None
+        return exchange
 
     async def _handle_request(self, reading: _Reading) -> bool:
         """Respond to a complete request; return whether to close.
@@ -1078,12 +1135,20 @@ class HTTPConnection:
             should_close = True
         else:
             state.phase = "after_response"
-            should_close = self._apply_close_policy(result.should_close)
-        self._record_exchange(
+            if self._pending_accept is not None and state.closed is None:
+                # Keep-alive policy stops applying once the connection
+                # switches: max_requests or a zero timeout must not
+                # close it between the 101 and the session.
+                should_close = False
+            else:
+                should_close = self._apply_close_policy(result.should_close)
+        exchange = self._record_exchange(
             reading.request,
             reading.request_timestamp,
             response=result.recorded,
         )
+        if self._pending_accept is not None:
+            self._handshake = exchange
         return should_close
 
     def _record_failed_exchange(
@@ -1180,6 +1245,11 @@ class HTTPConnection:
         response = ensure_response_spec(response)
         if isinstance(response, CloseConnection):
             return await self._close_response(response)
+        if isinstance(response, AcceptWebSocket):
+            prepared = prepare_accept(request, response)
+            if isinstance(prepared, HTTPResponse):
+                return await self._send_request_response(request, prepared)
+            return await self._send_accept(prepared)
 
         writer = self._writer
         writer.start_response()
@@ -1197,6 +1267,71 @@ class HTTPConnection:
         )
         self._start_close(event)
         return SendResult(recorded=recorded, should_close=True, closed=event)
+
+    async def _send_accept(self, prepared: PreparedAccept) -> SendResult:
+        """Write the 101 and leave the session pending on the connection.
+
+        The session starts only after the exchange is recorded, so
+        ``next_exchange()`` resolves when the handshake completes and
+        sender middleware is not held open for the whole session.
+        """
+        writer = self._writer
+        writer.start_response()
+        response = prepared.response
+        self._sending = response
+        head, _ = self._encode_response("GET", response, close=False)
+        self._state.phase = "response_body"
+        self._write(head)
+        await self._drain()
+        recorded = self._build_recorded_response(response, writer.sent_wire())
+        self._state.phase = "after_response"
+        self._pending_accept = prepared
+        return SendResult(recorded=recorded, should_close=False)
+
+    def _take_pending_session(self) -> WebSocketSession | None:
+        """Build the session for a recorded 101, and publish it."""
+        prepared = self._pending_accept
+        handshake = self._handshake
+        self._pending_accept = None
+        self._handshake = None
+        if prepared is None or handshake is None:
+            return None
+        self._writer.stop_retaining()
+        session = build_session(
+            prepared=prepared,
+            handshake=handshake,
+            reader=self._reader,
+            writer=self._writer,
+            consumed=self._sink,
+            close=self._close_session,
+            sleep=self._sleep,
+            clock=self._services.clock,
+            timestamp=self._services.timestamp_provider.now,
+            history_size=self._recorder.buffer_size,
+            history_bytes=self._websocket_history_bytes,
+            write_chunk_size=self._write_chunk_size,
+        )
+        self._session = session
+        self._recorder.record_websocket(session.recorded)
+        if self._publish_websocket is not None:
+            self._publish_websocket(session)
+        return session
+
+    async def _run_session(self, session: WebSocketSession) -> None:
+        try:
+            await session.run()
+        finally:
+            # Whatever stopped the session, its record ends with the
+            # connection's one close event.
+            session.terminate(self._decide("error", "websocket"))
+
+    def _close_session(
+        self, reason: CloseReason, reset: bool
+    ) -> ConnectionClosed:
+        """Decide a close the session asked for and start closing."""
+        event = self._decide(reason, "websocket", reset=reset)
+        self._start_close(event)
+        return event
 
     async def _close_response(self, spec: CloseConnection) -> SendResult:
         if spec.delay > 0:

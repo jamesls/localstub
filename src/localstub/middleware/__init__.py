@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .core import (
+    AcceptWebSocket,
     CloseConnection,
     CloseDuringRequest,
     ConnectionMeta,
@@ -28,6 +29,7 @@ from .core import (
 )
 
 __all__ = [
+    'AcceptWebSocket',
     'CloseConnection',
     'CloseDuringRequest',
     'ConnectionMeta',

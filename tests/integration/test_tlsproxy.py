@@ -1540,14 +1540,14 @@ async def test_forward_closes_tunnel_after_early_final_expect_response():
 
 
 @pytest.mark.asyncio
-async def test_forward_closes_tunnel_after_101_switching_protocols():
+async def test_forward_closes_tunnel_after_non_websocket_101():
     async def handle(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         await reader.readuntil(b"\r\n\r\n")
         writer.write(
             b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\n"
+            b"Upgrade: custom\r\n"
             b"Connection: Upgrade\r\n\r\n"
         )
         await writer.drain()
@@ -1571,7 +1571,7 @@ async def test_forward_closes_tunnel_after_101_switching_protocols():
                 writer.write(
                     b"GET /ws HTTP/1.1\r\n"
                     + f"Host: {upstream_host}:{upstream_port}\r\n".encode()
-                    + b"Upgrade: websocket\r\n"
+                    + b"Upgrade: custom\r\n"
                     + b"Connection: Upgrade\r\n\r\n"
                 )
                 await writer.drain()
@@ -1581,9 +1581,10 @@ async def test_forward_closes_tunnel_after_101_switching_protocols():
                 )
                 assert response.startswith(b"HTTP/1.1 101")
 
-                # After a protocol switch the tunnel no longer carries
-                # HTTP.  Without a bidirectional relay the proxy must
-                # close rather than parse frames as another request.
+                # After a switch to a protocol other than WebSocket the
+                # tunnel no longer carries HTTP and nothing relays it,
+                # so the proxy must close rather than parse the bytes
+                # as another request.
                 try:
                     writer.write(b"\x81\x05hello")
                     await writer.drain()

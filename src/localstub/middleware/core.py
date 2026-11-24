@@ -11,8 +11,10 @@ from localstub.forward import RawForwarder
 from localstub.http.exchange import ConnectionClosed
 from localstub.http.request import HTTPRequestHeaders, RecordedHTTPRequest
 from localstub.http.response import RecordedHTTPResponse
-from localstub.http.responsespec import HTTPResponse
+from localstub.http.responsespec import HeadersLike, HTTPResponse
 from localstub.http.utils import maybe_await, replace_keeping_lazy
+from localstub.websocket.deflate import PerMessageDeflate
+from localstub.websocket.session import WebSocketHandler
 
 
 class _Unset(Enum):
@@ -182,7 +184,55 @@ class CloseDuringRequest:
         )
 
 
-type ResponseSpec = HTTPResponse | ForwardProxyResponse | CloseConnection
+@dataclass(frozen=True)
+class AcceptWebSocket:
+    """Complete the opening handshake and switch to WebSocket.
+
+    Returned anywhere a responder can return an ``HTTPResponse``.  The
+    server validates the handshake, writes the 101 and records the
+    exchange, then runs a ``WebSocketSession`` on the connection.  A
+    request that is not a valid handshake gets a 400 or 426 instead.
+    """
+
+    handler: WebSocketHandler | None = None
+    """Coroutine that runs the session.  ``None`` leaves the session
+    open for the test to drive."""
+
+    subprotocol: str | None = None
+    """Value for ``Sec-WebSocket-Protocol``, sent as given."""
+
+    headers: HeadersLike | None = None
+    """Extra headers for the 101.  A name given here replaces the
+    computed header of that name."""
+
+    compression: PerMessageDeflate | None = None
+    """permessage-deflate preferences.  ``None`` declines it."""
+
+    strict: bool = True
+    """Fail the connection when the client violates RFC 6455."""
+
+    auto_pong: bool = True
+    """Answer each client Ping with a Pong."""
+
+    auto_close: bool = True
+    """Answer a client Close frame and close the connection."""
+
+    close_timeout: float = 5.0
+    """Seconds ``close()`` waits for the client's Close frame."""
+
+    max_message_bytes: int | None = None
+    """Largest message accepted, after decompression."""
+
+    def __post_init__(self) -> None:
+        if self.close_timeout < 0:
+            raise ValueError("close_timeout must be non-negative")
+        if self.max_message_bytes is not None and self.max_message_bytes < 0:
+            raise ValueError("max_message_bytes must be non-negative or None")
+
+
+type ResponseSpec = (
+    HTTPResponse | ForwardProxyResponse | CloseConnection | AcceptWebSocket
+)
 
 
 def ensure_response_spec(value: object) -> ResponseSpec:
@@ -193,7 +243,11 @@ def ensure_response_spec(value: object) -> ResponseSpec:
     ``object`` rather than trusting the annotation.
     """
     if isinstance(
-        value, HTTPResponse | ForwardProxyResponse | CloseConnection
+        value,
+        HTTPResponse
+        | ForwardProxyResponse
+        | CloseConnection
+        | AcceptWebSocket,
     ):
         return value
     raise TypeError(f"Unhandled response spec: {type(value).__name__}")
