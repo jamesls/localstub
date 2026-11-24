@@ -1011,3 +1011,45 @@ async def test_stalled_handler_delays_violation_close_by_close_timeout() -> (
     assert harness.server_frames == [WebSocketFrame.close(1002)]
     # The catch-up wait, then the wait for the handler to finish.
     assert sleep.calls == [2.5, 2.5]
+
+
+async def _close_in_background(ws: WebSocketSession) -> None:
+    asyncio.create_task(ws.close(1000))
+    await settle()
+
+
+async def _send_close_frame(ws: WebSocketSession) -> None:
+    await ws.send_frame(WebSocketFrame.close(1000))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "send_close",
+    [_close_in_background, _send_close_frame],
+    ids=["close", "send_frame"],
+)
+async def test_violation_after_server_close_sends_no_second_close(
+    send_close: Callable[[WebSocketSession], Awaitable[None]],
+) -> None:
+    harness = _harness(sleep=_never)
+    harness.start()
+    await send_close(harness.session)
+
+    harness.reader.feed_data(WebSocketFrame.text("unmasked").encode())
+    closed = await harness.finish()
+
+    assert closed.reason == "protocol_error"
+    assert harness.server_frames == [WebSocketFrame.close(1000)]
+
+
+@pytest.mark.asyncio
+async def test_client_close_after_sent_close_frame_is_not_echoed() -> None:
+    harness = _harness()
+    harness.start()
+    await harness.session.send_frame(WebSocketFrame.close(4000))
+
+    harness.send(WebSocketFrame.close(1000))
+    closed = await harness.finish()
+
+    assert closed.reason == "websocket_close"
+    assert harness.server_frames == [WebSocketFrame.close(4000)]

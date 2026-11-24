@@ -381,7 +381,9 @@ class WebSocketSession:
         """Write ``frame`` exactly as given, valid or not, and record it.
 
         A Close frame is recorded as ``server_close`` but does not start
-        the closing handshake.
+        the closing handshake: the session stays open and does not wait
+        for the client.  The session sends no Close of its own after
+        it, so a client Close ends the session without an echo.
         """
         await self._send_frame(frame)
 
@@ -500,14 +502,23 @@ class WebSocketSession:
         finally:
             await _cancel(*waiters)
 
+    def _sent_close(self) -> bool:
+        """Whether the server has sent, or is sending, a Close frame.
+
+        RFC 6455 allows one Close frame per endpoint, so the session
+        sends no other once one is on its way.
+        """
+        return self._closing.is_set() or self._log.server_close is not None
+
     async def _fail(self, code: int, reason: CloseReason) -> None:
         """Send a Close frame with ``code`` and end with ``reason``."""
         if reason == "protocol_error":
             await self._let_handler_catch_up()
-        try:
-            await self._send_frame(WebSocketFrame.close(code))
-        except WebSocketEnded:
-            return
+        if not self._sent_close():
+            try:
+                await self._send_frame(WebSocketFrame.close(code))
+            except WebSocketEnded:
+                return
         self._end(reason)
 
     async def _wait_for_client_close(self) -> None:
@@ -650,6 +661,10 @@ class WebSocketSession:
         self._client_closed.set()
         if self._closing.is_set() or not self.auto_close:
             # A close() in progress ends the session once it sees this.
+            return
+        if self._log.server_close is not None:
+            # A Close sent with send_frame() is answered by this one.
+            self._end("websocket_close")
             return
         await self._let_handler_catch_up()
         echo = b"" if close.code is None else close.code.to_bytes(2, "big")
