@@ -6,6 +6,7 @@ import json
 from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import create_autospec
 
+import httpx
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -20,6 +21,7 @@ from localstub.traffic_jsonl import (
     JSONLTrafficWriter,
     dump_server_traffic_jsonl,
     exchange_to_json_obj,
+    record_traffic_jsonl,
 )
 
 
@@ -658,3 +660,42 @@ def test_exchange_to_json_obj_timestamp_roundtrips_to_same_instant(
         assert parsed == timestamp.replace(tzinfo=UTC)
     else:
         assert parsed == timestamp
+
+
+def _jsonl_paths(path) -> list[str]:
+    return [
+        json.loads(line)["request"]["path"]
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_record_traffic_jsonl_writes_every_exchange_live(
+    tmp_path,
+) -> None:
+    output = tmp_path / "traffic.jsonl"
+    output.write_text(
+        json.dumps({"request": {"path": "/earlier"}}) + "\n",
+        encoding="utf-8",
+    )
+    async with (
+        AsyncHTTPTestServer(recording_buffer_size=2) as server,
+        httpx.AsyncClient() as client,
+    ):
+        with record_traffic_jsonl(
+            server,
+            output,
+            exclude=lambda request: request.target == "/_stub/healthz",
+        ):
+            await client.get(server.url + "a")
+            await client.get(server.url + "_stub/healthz")
+            await client.get(server.url + "b")
+            # Readable while the server runs, before the block exits.
+            assert _jsonl_paths(output) == ["/earlier", "/a", "/b"]
+            server.clear_requests()
+            for path in ("/c", "/d", "/e"):
+                await client.get(server.url + path.lstrip("/"))
+        await client.get(server.url + "after")
+
+    assert len(server.exchanges) == 2
+    assert _jsonl_paths(output) == ["/earlier", "/a", "/b", "/c", "/d", "/e"]

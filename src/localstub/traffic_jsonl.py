@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TextIO
@@ -168,3 +170,33 @@ def dump_server_traffic_jsonl(
     for exchange in exchanges:
         writer.write_exchange(exchange)
     return len(exchanges)
+
+
+@contextmanager
+def record_traffic_jsonl(
+    server: AsyncHTTPTestServer,
+    output: Path,
+    *,
+    exclude: Callable[[RecordedHTTPRequest], bool] | None = None,
+) -> Iterator[None]:
+    """Append each exchange to *output* as a JSONL line as it completes.
+
+    Lines are written in completion order and flushed one at a time, so
+    the file can be read while the server keeps running.  Every
+    exchange recorded while the block is active is written, whatever
+    the server's ``recording_buffer_size``.  Requests for which
+    *exclude* returns true are not written.  *output* is opened in
+    append mode.
+    """
+    with output.open("a", encoding="utf-8") as fp:
+        writer = JSONLTrafficWriter(fp)
+
+        def on_exchange(exchange: RecordedExchange) -> None:
+            if exclude is None or not exclude(exchange.request):
+                writer.write_exchange(exchange)
+
+        remove = server.recorder.add_exchange_listener(on_exchange)
+        try:
+            yield
+        finally:
+            remove()

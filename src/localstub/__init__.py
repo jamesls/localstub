@@ -54,7 +54,12 @@ from localstub.server import (
     TruncateBody,
 )
 from localstub.tlsproxy import AsyncTLSInterceptProxy
-from localstub.traffic_jsonl import dump_server_traffic_jsonl
+from localstub.traffic_jsonl import (
+    JSONLTrafficWriter,
+    dump_server_traffic_jsonl,
+    exchange_to_json_obj,
+    record_traffic_jsonl,
+)
 
 __all__ = [
     "AbortTransmission",
@@ -79,6 +84,7 @@ __all__ = [
     "HeaderNext",
     "Headers",
     "ImmediateTransmission",
+    "JSONLTrafficWriter",
     "OnHeadersReceived",
     "ParsedURI",
     "RecordedExchange",
@@ -97,4 +103,6 @@ __all__ = [
     "TruncateBody",
     "close_during_request",
     "dump_server_traffic_jsonl",
+    "exchange_to_json_obj",
+    "record_traffic_jsonl",
 ]
