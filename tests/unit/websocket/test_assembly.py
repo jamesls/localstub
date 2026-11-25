@@ -523,6 +523,36 @@ def test_check_header_refuses_frame_before_payload(
 
 
 @pytest.mark.parametrize(
+    ("earlier", "wire", "kind"),
+    [
+        pytest.param(
+            WebSocketFrame.binary(bytes(60)),
+            b"\x82\xbc" + MASK,
+            None,
+            id="new_message",
+        ),
+        pytest.param(
+            WebSocketFrame(Opcode.BINARY, bytes(60), fin=False),
+            b"\x80\xbc" + MASK,
+            "message_too_big",
+            id="continuation",
+        ),
+    ],
+)
+def test_check_header_counts_only_the_message_in_progress(
+    earlier: WebSocketFrame, wire: bytes, kind: str | None
+) -> None:
+    assembler = _assembler(max_message_bytes=100)
+    _feed(assembler, [_masked(earlier).encode()])
+    header = _header(wire)
+    assert header is not None
+
+    violation = assembler.check_header(header)
+
+    assert (None if violation is None else violation.kind) == kind
+
+
+@pytest.mark.parametrize(
     ("wire", "options"),
     [
         (b"\x82\xfe\x01\x00" + MASK, {"max_message_bytes": 256}),

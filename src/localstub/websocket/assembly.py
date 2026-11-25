@@ -214,10 +214,12 @@ class MessageAssembler:
                 return self._header_violation("oversized_control_frame")
             return None
         compressed = header.rsv1 and self._inflater is not None
+        # Only a continuation adds to the message in progress.
+        size = self._size if header.opcode == Opcode.CONTINUATION else 0
         if (
             not compressed
             and self._limit is not None
-            and self._size + header.length > self._limit
+            and size + header.length > self._limit
         ):
             return self._header_violation("message_too_big")
         return None
