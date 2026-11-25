@@ -332,7 +332,11 @@ class MessageInflater:
     ) -> None:
         self._no_context_takeover = no_context_takeover
         self._window_bits = max_window_bits or DEFAULT_WINDOW_BITS
+        self._window_size = 1 << self._window_bits
         self._decompressor = zlib.decompressobj(-self._window_bits)
+        # The latest output, which seeds a decompressor restarted after
+        # a block with BFINAL set.
+        self._window = b""
         self._used = False
         self._size = 0
 
@@ -341,23 +345,37 @@ class MessageInflater:
         self._size = 0
         if self._used and self._no_context_takeover:
             self._decompressor = zlib.decompressobj(-self._window_bits)
+            self._window = b""
         self._used = True
 
     def feed(self, data: bytes, limit: int | None) -> bytes:
         """Inflate ``data``; raise once the message passes ``limit``."""
-        decompressor = self._decompressor
+        pieces: list[bytes] = []
+        window = self._window_size
         try:
-            if limit is None:
-                out = decompressor.decompress(data)
-            else:
-                room = limit - self._size
-                out = decompressor.decompress(data, room + 1)
-                if len(out) > room:
-                    raise MessageTooBig
+            while True:
+                decompressor = self._decompressor
+                if limit is None:
+                    piece = decompressor.decompress(data)
+                else:
+                    room = limit - self._size
+                    piece = decompressor.decompress(data, room + 1)
+                    if len(piece) > room:
+                        raise MessageTooBig
+                self._size += len(piece)
+                pieces.append(piece)
+                self._window = (self._window + piece[-window:])[-window:]
+                if not decompressor.eof:
+                    return b"".join(pieces)
+                # A block with BFINAL set ends zlib's stream, but RFC
+                # 7692 §7.2.1 lets more blocks follow, in this message
+                # and the next, that refer back to the same window.
+                data = decompressor.unused_data
+                self._decompressor = zlib.decompressobj(
+                    -self._window_bits, zdict=self._window
+                )
         except zlib.error as exc:
             raise InflateError(str(exc)) from exc
-        self._size += len(out)
-        return out
 
     def finish(self, limit: int | None) -> bytes:
         """Inflate the sync tail that ends the message."""

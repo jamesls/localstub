@@ -20,6 +20,10 @@ from localstub.websocket.deflate import (
 HELLO = bytes.fromhex("f248cdc9c90700")
 HELLO_SHARED_CONTEXT = bytes.fromhex("f200110000")
 HELLO_STORED = bytes.fromhex("000500faff48656c6c6f")
+# RFC 7692 section 7.2.3.4: "Hello" in a block with BFINAL set, then
+# the byte that starts the empty stored block the receiver completes.
+HELLO_FINAL_BLOCK = bytes.fromhex("f348cdc9c90700")
+HELLO_FINAL = HELLO_FINAL_BLOCK + b"\x00"
 DEFAULTS = PerMessageDeflate()
 
 
@@ -48,7 +52,7 @@ def test_deflater_without_context_takeover_starts_each_message_fresh() -> None:
     assert deflater.compress(b"Hello") == HELLO
 
 
-@pytest.mark.parametrize("payload", [HELLO, HELLO_STORED])
+@pytest.mark.parametrize("payload", [HELLO, HELLO_STORED, HELLO_FINAL])
 def test_inflater_reads_rfc_7692_vectors(payload: bytes) -> None:
     assert _inflate(_inflater(), payload) == b"Hello"
 
@@ -58,6 +62,48 @@ def test_inflater_keeps_context_across_messages() -> None:
 
     assert _inflate(inflater, HELLO) == b"Hello"
     assert _inflate(inflater, HELLO_SHARED_CONTEXT) == b"Hello"
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected"),
+    [
+        pytest.param(
+            [[HELLO_FINAL], [HELLO_SHARED_CONTEXT]],
+            [b"Hello", b"Hello"],
+            id="next_message",
+        ),
+        pytest.param(
+            [[HELLO_FINAL_BLOCK, HELLO_SHARED_CONTEXT]],
+            [b"HelloHello"],
+            id="same_message",
+        ),
+    ],
+)
+def test_inflater_keeps_window_after_block_with_bfinal(
+    messages: list[list[bytes]], expected: list[bytes]
+) -> None:
+    # Each HELLO_SHARED_CONTEXT refers back to the "Hello" before it.
+    inflater = _inflater()
+    inflated: list[bytes] = []
+
+    for fragments in messages:
+        inflater.start()
+        out = b"".join(inflater.feed(f, None) for f in fragments)
+        inflated.append(out + inflater.finish(None))
+
+    assert inflated == expected
+
+
+def test_inflater_limit_counts_blocks_after_bfinal() -> None:
+    payload = HELLO_FINAL_BLOCK + HELLO_SHARED_CONTEXT
+    over = _inflater()
+    over.start()
+    at = _inflater()
+    at.start()
+
+    with pytest.raises(MessageTooBig):
+        over.feed(payload, 9)
+    assert at.feed(payload, 10) + at.finish(10) == b"HelloHello"
 
 
 def test_inflater_without_context_takeover_cannot_read_shared_message() -> (
