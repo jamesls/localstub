@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+)
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
@@ -30,6 +36,7 @@ from localstub.http.connection import (
     should_close_connection,
 )
 from localstub.http.exchange import ClosePhase, CloseReason, ConnectionClosed
+from localstub.http.framing import content_length, is_chunked_transfer
 from localstub.http.headers import HeaderItem, Headers
 from localstub.http.request import (
     AsyncRequestParser,
@@ -40,7 +47,13 @@ from localstub.http.request import (
     RecordedHTTPRequest,
 )
 from localstub.http.response import RecordedHTTPResponse
-from localstub.http.responsespec import HTTPResponse
+from localstub.http.responsespec import (
+    AbortTransmission,
+    HTTPResponse,
+    Pause,
+    StreamBody,
+    StreamItem,
+)
 from localstub.http.tcp import reset_stream
 from localstub.http.utils import (
     LazyBytes,
@@ -69,7 +82,6 @@ from localstub.recording import (
     TrafficRecorder,
 )
 from localstub.server.transmission import (
-    AbortTransmission,
     ImmediateTransmission,
     TransmissionStrategy,
 )
@@ -102,7 +114,7 @@ class ConnectionLost(Exception):
 def _serialize_response_head(
     status: int,
     headers: tuple[HeaderItem, ...],
-    body_length: int,
+    body_length: int | None,
     should_close: bool,
     keep_alive_hint: str | None,
 ) -> bytes:
@@ -118,7 +130,10 @@ def _serialize_response_head(
             for name, value in items
             if name.lower() != "content-length"
         ]
-    elif not header_names & {"content-length", "transfer-encoding"}:
+    elif body_length is not None and not header_names & {
+        "content-length",
+        "transfer-encoding",
+    }:
         # A Transfer-Encoding header already frames the body, and RFC
         # 9112 §6.2 forbids sending Content-Length alongside it.
         items.append(("Content-Length", str(body_length)))
@@ -140,6 +155,15 @@ def _normalize_body(body_obj: bytes | str) -> bytes:
     if isinstance(body_obj, bytes):
         return body_obj
     return body_obj.encode("utf-8")
+
+
+async def _stream_items(items: StreamBody) -> AsyncIterator[StreamItem]:
+    if isinstance(items, AsyncIterable):
+        async for item in items:
+            yield item
+    else:
+        for item in items:
+            yield item
 
 
 def _is_interim(status: int) -> bool:
@@ -536,6 +560,8 @@ class HTTPConnection:
         self._child: asyncio.Task[None] | None = None
         self._finalized = False
         self._sending: HTTPResponse | None = None
+        # Payload chunks of the streamed body being written, if any.
+        self._streamed: list[bytes] = []
         self._final_send_close = False
 
     @property
@@ -913,6 +939,8 @@ class HTTPConnection:
         recording.  A 101 closes the connection once the request is
         read, since the server does not speak the switched protocol.
         """
+        if response.body_stream is not None:
+            raise ValueError("Header middleware cannot send a streamed body")
         state = self._state
         is_interim = _is_interim(response.status)
         close = False
@@ -957,7 +985,7 @@ class HTTPConnection:
         head = _serialize_response_head(
             response.status,
             tuple(response.headers.items()),
-            len(body),
+            None if response.body_stream is not None else len(body),
             close,
             self._policy.keep_alive_hint(),
         )
@@ -1273,9 +1301,27 @@ class HTTPConnection:
         should_close = self._should_close_after(
             request, response, self._state.requests_completed
         )
+        body_stream = response.body_stream
+        chunked = False
+        if body_stream is not None:
+            raw_headers = list(response.headers.raw)
+            chunked = is_chunked_transfer(raw_headers)
+            if not chunked and content_length(raw_headers) is None:
+                # Close-delimited: closing is what ends the body.
+                should_close = True
         head, wire_body = self._encode_response(
             request.method, response, close=should_close
         )
+
+        if body_stream is not None:
+            self._streamed = []
+            self._state.phase = "response_body"
+            self._write(head)
+            abort = None
+            if _body_allowed(request.method, response.status):
+                abort = await self._write_stream(body_stream, chunked=chunked)
+            await self._drain()
+            return should_close, abort
 
         strategy = self._pipeline.transmission()
         self._state.phase = "response_body"
@@ -1295,6 +1341,38 @@ class HTTPConnection:
         )
         abort = await strategy.write_body(client_writer, wire_body)
         return should_close, abort
+
+    async def _write_stream(
+        self, items: StreamBody, *, chunked: bool
+    ) -> AbortTransmission | None:
+        """Write each item of a streamed body as it is produced.
+
+        Every chunk is drained before the next item is read, so the
+        client has it before a later ``Pause`` or ``asyncio.Event``.
+        An ``AbortTransmission`` stops before the terminal chunk.
+        """
+        async for item in _stream_items(items):
+            if isinstance(item, AbortTransmission):
+                return item
+            if isinstance(item, Pause):
+                await self._sleep(item.seconds)
+                continue
+            if isinstance(item, asyncio.Event):
+                await item.wait()
+                continue
+            data = _normalize_body(item)
+            if not data:
+                # An empty chunk would be read as the terminal chunk.
+                continue
+            if chunked:
+                self._write(b"%x\r\n%s\r\n" % (len(data), data))
+            else:
+                self._write(data)
+            self._streamed.append(data)
+            await self._drain()
+        if chunked:
+            self._write(b"0\r\n\r\n")
+        return None
 
     async def _write_body(self, body: bytes) -> None:
         """Write a response body right after its head.
@@ -1363,7 +1441,11 @@ class HTTPConnection:
             response=HTTPResponse(
                 status=response.status,
                 headers=response.headers,
-                body=_normalize_body(response.body),
+                body=(
+                    _normalize_body(response.body)
+                    if response.body_stream is None
+                    else b"".join(self._streamed)
+                ),
             ),
             reason=status_phrase(response.status),
             wire_raw_bytes=b"",

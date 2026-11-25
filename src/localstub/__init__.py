@@ -21,7 +21,7 @@ from localstub.http.request import (
     RecordedHTTPRequest,
 )
 from localstub.http.response import RecordedHTTPResponse
-from localstub.http.responsespec import HTTPResponse
+from localstub.http.responsespec import HTTPResponse, Pause
 from localstub.http.uri import ParsedURI
 from localstub.middleware import (
     CloseConnection,
@@ -87,6 +87,7 @@ __all__ = [
     "JSONLTrafficWriter",
     "OnHeadersReceived",
     "ParsedURI",
+    "Pause",
     "RecordedExchange",
     "RecordedHTTPRequest",
     "RecordedHTTPResponse",

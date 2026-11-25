@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol, override
 
+from localstub.http.responsespec import AbortTransmission
+
 
 class Writer(Protocol):
     """What a transmission strategy may do with the connection.
@@ -19,15 +21,6 @@ class Writer(Protocol):
     def write(self, data: bytes) -> None: ...
 
     async def drain(self) -> None: ...
-
-
-@dataclass(frozen=True)
-class AbortTransmission:
-    """Returned by a strategy that stopped writing and wants the
-    connection closed."""
-
-    reset: bool = False
-    """Request an abortive TCP close instead of ordinary closure."""
 
 
 class TransmissionStrategy:
