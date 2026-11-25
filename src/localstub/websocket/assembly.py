@@ -153,6 +153,7 @@ class MessageAssembler:
         self._inflater = None
         self._utf8 = None
         self._partial_utf8 = None
+        self._forget_message()
 
     def check_partial(
         self, header: FrameHeader, decoder: FrameDecoder
@@ -363,10 +364,7 @@ class MessageAssembler:
         self._kind = kind
         self._compressed = recorded.frame.rsv1 and self._inflater is not None
         self._inflate_ok = True
-        self._frames = []
-        self._chunks = []
-        self._raw = []
-        self._size = 0
+        self._forget_message()
         self._size_reported = False
         self._utf8 = (
             _UTF8()
@@ -473,13 +471,23 @@ class MessageAssembler:
             data = b"".join(self._chunks)
         if not self._compressed and self._check_text(last, b"", final=True):
             return None
-        return RecordedWebSocketMessage(
+        message = RecordedWebSocketMessage(
             message=WebSocketMessage(kind, data),
             sender=self._sender,
             frames=tuple(self._frames),
             compressed=inflated,
             timestamp=last.timestamp,
         )
+        self._forget_message()
+        return message
+
+    def _forget_message(self) -> None:
+        # Once a message is recorded its record holds what it needs; an
+        # inflated message's pieces would otherwise be a second copy.
+        self._frames = []
+        self._chunks = []
+        self._raw = []
+        self._size = 0
 
     def _violate(
         self,
