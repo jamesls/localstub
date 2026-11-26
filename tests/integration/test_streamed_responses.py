@@ -315,8 +315,10 @@ async def test_stream_accepts_async_iterator_that_is_not_a_generator() -> None:
     class Countdown:
         def __init__(self) -> None:
             self.left = 3
+            self.subscriptions = 0
 
         def __aiter__(self) -> Countdown:
+            self.subscriptions += 1
             return self
 
         async def __anext__(self) -> bytes:
@@ -325,11 +327,13 @@ async def test_stream_accepts_async_iterator_that_is_not_a_generator() -> None:
             self.left -= 1
             return str(self.left).encode()
 
+    countdown = Countdown()
     async with AsyncHTTPTestServer() as server, httpx.AsyncClient() as client:
-        server.handler = lambda _: HTTPResponse.stream(Countdown())
+        server.handler = lambda _: HTTPResponse.stream(countdown)
         response = await client.get(server.url)
 
     assert response.content == b"210"
+    assert countdown.subscriptions == 1
 
 
 @pytest.mark.asyncio
@@ -347,10 +351,55 @@ async def test_max_recorded_body_bytes_bounds_streamed_recording() -> None:
         writer.close()
 
     # The client gets everything; the recording keeps a 5-byte prefix,
-    # and its wire bytes end after the chunk that reached the limit.
+    # and its wire bytes end at the same payload byte.
     assert body == sent + b"0\r\n\r\n"
     assert exchange.response is not None
     assert exchange.response.body == b"abcde"
     assert exchange.response.wire_raw_bytes == (
-        head + _chunk(b"abc") + _chunk(b"defg")
+        head + _chunk(b"abc") + b"4\r\nde"
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_producer_cleanup() -> None:
+    cleaned_up = asyncio.Event()
+
+    async def events() -> AsyncIterator[StreamItem]:
+        try:
+            yield EVENT_1
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.05)
+            cleaned_up.set()
+
+    async with AsyncHTTPTestServer() as server:
+        server.handler = lambda _: HTTPResponse.stream(events())
+        reader, writer, _ = await _open(server)
+        await asyncio.wait_for(
+            reader.readexactly(len(_chunk(EVENT_1))), timeout=TIMEOUT
+        )
+    writer.close()
+
+    assert cleaned_up.is_set()
+
+
+@pytest.mark.asyncio
+async def test_producer_can_shut_down_its_own_server() -> None:
+    async with AsyncHTTPTestServer() as server:
+
+        async def events() -> AsyncIterator[StreamItem]:
+            yield EVENT_1
+            await server.aclose()
+            yield EVENT_2
+
+        server.handler = lambda _: HTTPResponse.stream(events())
+        reader, writer, _ = await _open(server)
+        rest = _chunk(EVENT_1) + _chunk(EVENT_2) + b"0\r\n\r\n"
+        body = await asyncio.wait_for(
+            reader.readexactly(len(rest)), timeout=TIMEOUT
+        )
+        writer.close()
+
+    assert body == rest
+    assert server.exchanges[-1].closed is not None
+    assert server.exchanges[-1].closed.reason == "shutdown"

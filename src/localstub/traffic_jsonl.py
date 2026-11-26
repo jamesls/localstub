@@ -175,12 +175,16 @@ def dump_server_traffic_jsonl(
 
 def _lacks_final_newline(path: Path) -> bool:
     """Whether *path* is a non-empty file whose last byte is not LF."""
+    if not path.is_file():
+        # Opening a named pipe to read would block until a writer
+        # appears, and this function's caller is that writer.
+        return False
     try:
         with path.open("rb") as fp:
             fp.seek(-1, os.SEEK_END)
             return fp.read(1) != b"\n"
     except OSError:
-        # Missing, or empty: seeking before the start fails.
+        # Empty: seeking before the start fails.
         return False
 
 

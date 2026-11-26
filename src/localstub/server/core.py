@@ -157,8 +157,8 @@ class AsyncHTTPTestServer:
         Handlers see the kept prefix.  It cannot be combined with
         forwarding, which needs the whole request.  It also keeps only
         the first N payload bytes of each streamed response body
-        (``HTTPResponse.stream()``); its ``wire_raw_bytes`` end after
-        the chunk that reached the limit.
+        (``HTTPResponse.stream()``); its ``wire_raw_bytes`` end at the
+        same payload byte.
       * ``write_chunk_size`` sends each response body as writes of at
         most N bytes, waiting for each to drain.  Over TLS this keeps
         the encryption buffers small, which cuts server CPU for large

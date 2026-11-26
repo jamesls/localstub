@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import sys
+import threading
 from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import create_autospec
 
@@ -738,3 +741,45 @@ async def test_record_traffic_jsonl_error_reaches_neither_client_nor_others(
     assert statuses == [200, 200]
     assert failing.read_text(encoding="utf-8") == ""
     assert _jsonl_paths(healthy) == ["/a", "/b"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs os.mkfifo")
+@pytest.mark.asyncio
+async def test_record_traffic_jsonl_writes_to_named_pipe(tmp_path) -> None:
+    fifo = tmp_path / "traffic.fifo"
+    os.mkfifo(fifo)
+    received: list[str] = []
+    reader = threading.Thread(
+        target=lambda: received.append(fifo.read_text(encoding="utf-8")),
+        daemon=True,
+    )
+    reader.start()
+
+    async with (
+        AsyncHTTPTestServer() as server,
+        httpx.AsyncClient() as client,
+    ):
+        with record_traffic_jsonl(server, fifo):
+            await client.get(server.url + "a")
+    reader.join(timeout=2)
+
+    assert [
+        json.loads(line)["request"]["path"]
+        for line in received[0].splitlines()
+    ] == ["/a"]
+
+
+@pytest.mark.asyncio
+async def test_record_traffic_jsonl_appends_to_empty_file(tmp_path) -> None:
+    output = tmp_path / "traffic.jsonl"
+    output.touch()
+    async with (
+        AsyncHTTPTestServer() as server,
+        httpx.AsyncClient() as client,
+    ):
+        with record_traffic_jsonl(server, output):
+            await client.get(server.url + "a")
+
+    # No separator line before the first record.
+    assert output.read_text(encoding="utf-8").startswith("{")
+    assert _jsonl_paths(output) == ["/a"]

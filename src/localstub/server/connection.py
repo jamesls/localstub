@@ -167,7 +167,13 @@ async def _stream_items(
         return
     iterator = aiter(items)
     try:
-        async for item in iterator:
+        while True:
+            # anext(), not ``async for``, which would call
+            # ``__aiter__`` a second time.
+            try:
+                item = await anext(iterator)
+            except StopAsyncIteration:
+                return
             yield item
     finally:
         # Finalize a producer the stream stopped early, such as when
@@ -584,6 +590,9 @@ class HTTPConnection:
         # up to ``max_body_kept`` bytes.
         self._streamed: list[bytes] = []
         self._streamed_size = 0
+        # The task producing a streamed body, which runs the producer
+        # on behalf of the loop.
+        self._stream_task: asyncio.Task[AbortTransmission | None] | None = None
         self._final_send_close = False
 
     @property
@@ -654,7 +663,10 @@ class HTTPConnection:
             current = asyncio.current_task()
         except RuntimeError:
             return False
-        return self._child is not None and self._child is current
+        return current is not None and current in (
+            self._child,
+            self._stream_task,
+        )
 
     def finalize(self) -> None:
         """Decide a close if none exists, close the writer, and publish.
@@ -1383,6 +1395,7 @@ class HTTPConnection:
         read, and the watch stops.
         """
         send = asyncio.ensure_future(self._send_stream(items, chunked=chunked))
+        self._stream_task = send
         watch = asyncio.ensure_future(self._watch_client())
         try:
             done, _ = await asyncio.wait(
@@ -1392,13 +1405,30 @@ class HTTPConnection:
                 raise ConnectionLost("client went away during a stream")
             return await send
         finally:
-            tasks = (send, watch)
-            for task in tasks:
-                task.cancel()
-            await asyncio.wait(tasks)
-            for task in tasks:
-                if not task.cancelled():
-                    task.exception()
+            await self._finish_tasks((send, watch))
+            self._stream_task = None
+
+    @staticmethod
+    async def _finish_tasks(tasks: tuple[asyncio.Task[Any], ...]) -> None:
+        """Cancel *tasks* and wait until all of them have finished.
+
+        Shutdown can cancel the loop more than once.  The wait outlasts
+        every cancellation, so a producer's own cleanup completes
+        before shutdown returns; the cancellation is re-raised after.
+        """
+        for task in tasks:
+            task.cancel()
+        cancelled = False
+        while not all(task.done() for task in tasks):
+            try:
+                await asyncio.wait(tasks)
+            except asyncio.CancelledError:
+                cancelled = True
+        for task in tasks:
+            if not task.cancelled():
+                task.exception()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _watch_client(self) -> bool:
         """Return ``True`` once the client is gone, ``False`` on data."""
@@ -1441,33 +1471,36 @@ class HTTPConnection:
                 # silently, so check first that this chunk can still be
                 # sent rather than record bytes the client never got.
                 await self._drain()
-                if chunked:
-                    self._write(b"%x\r\n%s\r\n" % (len(data), data))
-                else:
-                    self._write(data)
-                self._keep_streamed(data)
+                self._send_chunk(data, chunked=chunked)
                 await self._drain()
         if chunked:
             self._write(b"0\r\n\r\n")
         return None
 
-    def _keep_streamed(self, data: bytes) -> None:
-        """Record a sent chunk, keeping at most ``max_body_kept`` bytes.
+    def _send_chunk(self, data: bytes, *, chunked: bool) -> None:
+        """Write one chunk, recording at most ``max_body_kept`` bytes.
 
-        Once the limit is reached, the writer stops keeping the wire
-        bytes too, so they end after the chunk that reached it.
+        The client always gets the whole chunk.  The part past the
+        limit is written after the writer stops keeping bytes, so the
+        recorded wire bytes end at the same payload byte as the
+        recorded body, however large the chunk.
         """
+        head = b"%x\r\n" % len(data) if chunked else b""
+        tail = b"\r\n" if chunked else b""
         limit = self._max_body_kept
-        if limit is None:
+        room = None if limit is None else limit - self._streamed_size
+        if room is None or len(data) < room:
+            self._write(head + data + tail)
             self._streamed.append(data)
+            self._streamed_size += len(data)
             return
-        room = limit - self._streamed_size
         if room > 0:
-            kept = data[:room]
-            self._streamed.append(kept)
-            self._streamed_size += len(kept)
-        if self._streamed_size >= limit:
-            self._writer.stop_retaining()
+            self._write(head + data[:room])
+            self._streamed.append(data[:room])
+            self._streamed_size += room
+            head = b""
+        self._writer.stop_retaining()
+        self._write(head + memoryview(data)[max(room, 0) :] + tail)
 
     async def _write_body(self, body: bytes) -> None:
         """Write a response body right after its head.
