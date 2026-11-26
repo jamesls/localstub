@@ -21,7 +21,7 @@ from localstub.http.request import (
     RecordedHTTPRequest,
 )
 from localstub.http.response import RecordedHTTPResponse
-from localstub.http.responsespec import HTTPResponse
+from localstub.http.responsespec import HTTPResponse, Pause
 from localstub.http.uri import ParsedURI
 from localstub.middleware import (
     CloseConnection,
@@ -54,7 +54,12 @@ from localstub.server import (
     TruncateBody,
 )
 from localstub.tlsproxy import AsyncTLSInterceptProxy
-from localstub.traffic_jsonl import dump_server_traffic_jsonl
+from localstub.traffic_jsonl import (
+    JSONLTrafficWriter,
+    dump_server_traffic_jsonl,
+    exchange_to_json_obj,
+    record_traffic_jsonl,
+)
 
 __all__ = [
     "AbortTransmission",
@@ -79,8 +84,10 @@ __all__ = [
     "HeaderNext",
     "Headers",
     "ImmediateTransmission",
+    "JSONLTrafficWriter",
     "OnHeadersReceived",
     "ParsedURI",
+    "Pause",
     "RecordedExchange",
     "RecordedHTTPRequest",
     "RecordedHTTPResponse",
@@ -97,4 +104,6 @@ __all__ = [
     "TruncateBody",
     "close_during_request",
     "dump_server_traffic_jsonl",
+    "exchange_to_json_obj",
+    "record_traffic_jsonl",
 ]

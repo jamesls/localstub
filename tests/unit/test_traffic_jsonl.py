@@ -3,9 +3,13 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import sys
+import threading
 from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import create_autospec
 
+import httpx
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -20,6 +24,7 @@ from localstub.traffic_jsonl import (
     JSONLTrafficWriter,
     dump_server_traffic_jsonl,
     exchange_to_json_obj,
+    record_traffic_jsonl,
 )
 
 
@@ -658,3 +663,123 @@ def test_exchange_to_json_obj_timestamp_roundtrips_to_same_instant(
         assert parsed == timestamp.replace(tzinfo=UTC)
     else:
         assert parsed == timestamp
+
+
+def _jsonl_paths(path) -> list[str]:
+    return [
+        json.loads(line)["request"]["path"]
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_newline", ["\n", ""])
+async def test_record_traffic_jsonl_writes_every_exchange_live(
+    tmp_path, final_newline: str
+) -> None:
+    output = tmp_path / "traffic.jsonl"
+    # JSON Lines allows the last line to end without a newline.
+    output.write_text(
+        json.dumps({"request": {"path": "/earlier"}}) + final_newline,
+        encoding="utf-8",
+    )
+    async with (
+        AsyncHTTPTestServer(recording_buffer_size=2) as server,
+        httpx.AsyncClient() as client,
+    ):
+        with record_traffic_jsonl(
+            server,
+            output,
+            exclude=lambda request: request.target == "/_stub/healthz",
+        ):
+            await client.get(server.url + "a")
+            await client.get(server.url + "_stub/healthz")
+            await client.get(server.url + "b")
+            # Readable while the server runs, before the block exits.
+            assert _jsonl_paths(output) == ["/earlier", "/a", "/b"]
+            server.clear_requests()
+            for path in ("/c", "/d", "/e"):
+                await client.get(server.url + path.lstrip("/"))
+        await client.get(server.url + "after")
+
+    assert len(server.exchanges) == 2
+    assert _jsonl_paths(output) == ["/earlier", "/a", "/b", "/c", "/d", "/e"]
+
+
+@pytest.mark.asyncio
+async def test_record_traffic_jsonl_error_reaches_neither_client_nor_others(
+    tmp_path,
+) -> None:
+    failing = tmp_path / "failing.jsonl"
+    healthy = tmp_path / "healthy.jsonl"
+
+    def exclude(request: RecordedHTTPRequest) -> bool:
+        raise KeyError(request.target)
+
+    statuses: list[int] = []
+
+    async def send_while_recording(
+        server: AsyncHTTPTestServer, client: httpx.AsyncClient
+    ) -> None:
+        with (
+            record_traffic_jsonl(server, failing, exclude=exclude),
+            record_traffic_jsonl(server, healthy),
+        ):
+            for path in ("a", "b"):
+                response = await client.get(server.url + path)
+                statuses.append(response.status_code)
+
+    async with (
+        AsyncHTTPTestServer() as server,
+        httpx.AsyncClient() as client,
+    ):
+        with pytest.raises(KeyError, match="/a"):
+            await send_while_recording(server, client)
+        # Both requests shared one keep-alive connection, still open.
+        assert server.closed_connections == []
+
+    assert statuses == [200, 200]
+    assert failing.read_text(encoding="utf-8") == ""
+    assert _jsonl_paths(healthy) == ["/a", "/b"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs os.mkfifo")
+@pytest.mark.asyncio
+async def test_record_traffic_jsonl_writes_to_named_pipe(tmp_path) -> None:
+    fifo = tmp_path / "traffic.fifo"
+    os.mkfifo(fifo)
+    received: list[str] = []
+    reader = threading.Thread(
+        target=lambda: received.append(fifo.read_text(encoding="utf-8")),
+        daemon=True,
+    )
+    reader.start()
+
+    async with (
+        AsyncHTTPTestServer() as server,
+        httpx.AsyncClient() as client,
+    ):
+        with record_traffic_jsonl(server, fifo):
+            await client.get(server.url + "a")
+    reader.join(timeout=2)
+
+    assert [
+        json.loads(line)["request"]["path"]
+        for line in received[0].splitlines()
+    ] == ["/a"]
+
+
+@pytest.mark.asyncio
+async def test_record_traffic_jsonl_appends_to_empty_file(tmp_path) -> None:
+    output = tmp_path / "traffic.jsonl"
+    output.touch()
+    async with (
+        AsyncHTTPTestServer() as server,
+        httpx.AsyncClient() as client,
+    ):
+        with record_traffic_jsonl(server, output):
+            await client.get(server.url + "a")
+
+    # No separator line before the first record.
+    assert output.read_text(encoding="utf-8").startswith("{")
+    assert _jsonl_paths(output) == ["/a"]

@@ -16,6 +16,7 @@ from localstub.forward import (
     TransformResult,
 )
 from localstub.http.request import AsyncRequestParser, RecordedHTTPRequest
+from localstub.http.responsespec import HTTPResponse
 from localstub.http.tcp import pack_linger_option
 from localstub.server import DropConnection
 from localstub.tlsproxy import fault_step_transformer
@@ -264,3 +265,8 @@ async def test_release_upstream_logs_shutdown_failure_at_debug(
     await forwarder.abort_pending_closes()
 
     assert "Failed to close upstream writer" in caplog.text
+
+
+def test_transform_result_rejects_streamed_override() -> None:
+    with pytest.raises(ValueError, match="streamed body"):
+        TransformResult(override_response=HTTPResponse.stream([b"x"]))

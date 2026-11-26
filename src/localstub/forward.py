@@ -111,6 +111,13 @@ class TransformResult:
     drop_after: int | None = None
     drop_reset: bool = False
 
+    def __post_init__(self) -> None:
+        if (
+            self.override_response is not None
+            and self.override_response.body_stream is not None
+        ):
+            raise ValueError("override_response cannot have a streamed body")
+
 
 ResponseTransformer = Callable[
     [TransformContext],

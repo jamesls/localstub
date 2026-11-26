@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TextIO
@@ -168,3 +171,66 @@ def dump_server_traffic_jsonl(
     for exchange in exchanges:
         writer.write_exchange(exchange)
     return len(exchanges)
+
+
+def _lacks_final_newline(path: Path) -> bool:
+    """Whether *path* is a non-empty file whose last byte is not LF."""
+    if not path.is_file():
+        # Opening a named pipe to read would block until a writer
+        # appears, and this function's caller is that writer.
+        return False
+    try:
+        with path.open("rb") as fp:
+            fp.seek(-1, os.SEEK_END)
+            return fp.read(1) != b"\n"
+    except OSError:
+        # Empty: seeking before the start fails.
+        return False
+
+
+@contextmanager
+def record_traffic_jsonl(
+    server: AsyncHTTPTestServer,
+    output: Path,
+    *,
+    exclude: Callable[[RecordedHTTPRequest], bool] | None = None,
+) -> Iterator[None]:
+    """Append each exchange to *output* as a JSONL line as it completes.
+
+    Lines are written in completion order and flushed one at a time, so
+    the file can be read while the server keeps running.  Every
+    exchange recorded while the block is active is written, whatever
+    the server's ``recording_buffer_size``.  Requests for which
+    *exclude* returns true are not written.  *output* is opened in
+    append mode.
+
+    If writing a line or calling *exclude* raises, the server keeps
+    serving, no further lines are written, and the first error is
+    raised when the block exits.
+    """
+    missing_newline = _lacks_final_newline(output)
+    with output.open("a", encoding="utf-8") as fp:
+        if missing_newline:
+            # Otherwise the first record joins the file's last line.
+            fp.write("\n")
+            fp.flush()
+        writer = JSONLTrafficWriter(fp)
+        errors: list[Exception] = []
+
+        def on_exchange(exchange: RecordedExchange) -> None:
+            if errors:
+                return
+            try:
+                if exclude is None or not exclude(exchange.request):
+                    writer.write_exchange(exchange)
+            except Exception as exc:
+                errors.append(exc)
+                raise  # The recorder logs it.
+
+        remove = server.recorder.add_exchange_listener(on_exchange)
+        try:
+            yield
+        finally:
+            remove()
+        if errors:
+            raise errors[0]

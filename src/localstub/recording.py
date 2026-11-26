@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime
 from typing import Final
 
@@ -275,7 +276,25 @@ class TrafficRecorder:
         self._timestamp_provider: TimestampProvider = (
             timestamp_provider or SystemTimestampProvider()
         )
+        self._exchange_listeners: list[Callable[[RecordedExchange], None]] = []
         self.reset()
+
+    def add_exchange_listener(
+        self, listener: Callable[[RecordedExchange], None]
+    ) -> Callable[[], None]:
+        """Call *listener* with every exchange as it is recorded.
+
+        Listeners see each exchange exactly once, in completion order,
+        independent of the bounded history and of ``next_exchange()``
+        consumers, and survive ``reset()``.  They run synchronously on
+        the connection's task, so they must not block.  An exception a
+        listener raises is logged and does not reach the connection or
+        the other listeners.
+
+        Returns a function that removes the listener.
+        """
+        self._exchange_listeners.append(listener)
+        return lambda: self._exchange_listeners.remove(listener)
 
     def reset(self) -> None:
         """Drop all recorded traffic and start over with empty buffers."""
@@ -358,6 +377,11 @@ class TrafficRecorder:
             trim_history(self.responses, self._buffer_size)
             self.last_response = response
             self._response_queue.put(response)
+        for listener in tuple(self._exchange_listeners):
+            try:
+                listener(exchange)
+            except Exception:
+                LOG.exception("Exchange listener %r failed", listener)
 
     def record_connection_closed(self, event: ConnectionClosed) -> None:
         """Record the terminal event of a connection."""

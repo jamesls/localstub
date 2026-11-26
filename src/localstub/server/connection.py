@@ -15,8 +15,15 @@ the callables in ``RequestPipeline``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    Awaitable,
+    Callable,
+    Iterable,
+)
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
@@ -30,6 +37,7 @@ from localstub.http.connection import (
     should_close_connection,
 )
 from localstub.http.exchange import ClosePhase, CloseReason, ConnectionClosed
+from localstub.http.framing import content_length, is_chunked_transfer
 from localstub.http.headers import HeaderItem, Headers
 from localstub.http.request import (
     AsyncRequestParser,
@@ -40,7 +48,13 @@ from localstub.http.request import (
     RecordedHTTPRequest,
 )
 from localstub.http.response import RecordedHTTPResponse
-from localstub.http.responsespec import HTTPResponse
+from localstub.http.responsespec import (
+    AbortTransmission,
+    HTTPResponse,
+    Pause,
+    StreamBody,
+    StreamItem,
+)
 from localstub.http.tcp import reset_stream
 from localstub.http.utils import (
     LazyBytes,
@@ -69,7 +83,6 @@ from localstub.recording import (
     TrafficRecorder,
 )
 from localstub.server.transmission import (
-    AbortTransmission,
     ImmediateTransmission,
     TransmissionStrategy,
 )
@@ -102,7 +115,7 @@ class ConnectionLost(Exception):
 def _serialize_response_head(
     status: int,
     headers: tuple[HeaderItem, ...],
-    body_length: int,
+    body_length: int | None,
     should_close: bool,
     keep_alive_hint: str | None,
 ) -> bytes:
@@ -118,7 +131,10 @@ def _serialize_response_head(
             for name, value in items
             if name.lower() != "content-length"
         ]
-    elif not header_names & {"content-length", "transfer-encoding"}:
+    elif body_length is not None and not header_names & {
+        "content-length",
+        "transfer-encoding",
+    }:
         # A Transfer-Encoding header already frames the body, and RFC
         # 9112 §6.2 forbids sending Content-Length alongside it.
         items.append(("Content-Length", str(body_length)))
@@ -140,6 +156,30 @@ def _normalize_body(body_obj: bytes | str) -> bytes:
     if isinstance(body_obj, bytes):
         return body_obj
     return body_obj.encode("utf-8")
+
+
+async def _stream_items(
+    items: StreamBody,
+) -> AsyncGenerator[StreamItem]:
+    if not isinstance(items, AsyncIterable):
+        for item in items:
+            yield item
+        return
+    iterator = aiter(items)
+    try:
+        while True:
+            # anext(), not ``async for``, which would call
+            # ``__aiter__`` a second time.
+            try:
+                item = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            yield item
+    finally:
+        # Finalize a producer the stream stopped early, such as when
+        # the client went away while it waited.
+        if isinstance(iterator, AsyncGenerator):
+            await iterator.aclose()
 
 
 def _is_interim(status: int) -> bool:
@@ -385,6 +425,7 @@ class RecordingStreamWriter:
         self._state = state
         self._chunks: list[bytes | memoryview] = []
         self._pending = bytearray()
+        self._retain = True
 
     @property
     def bytes_sent(self) -> bytes:
@@ -410,18 +451,27 @@ class RecordingStreamWriter:
         """Start recording a new response."""
         self._chunks.clear()
         self._pending.clear()
+        self._retain = True
+
+    def stop_retaining(self) -> None:
+        """Keep no more bytes of the current response.
+
+        Later writes are still sent and counted.
+        """
+        self._retain = False
 
     def write(self, data: bytes | memoryview) -> None:
-        if len(data) >= self._coalesce_size:
-            if self._pending:
-                self._chunks.append(bytes(self._pending))
-                self._pending.clear()
-            self._chunks.append(data)
-        elif data:
-            self._pending += data
-            if len(self._pending) >= self._coalesce_size:
-                self._chunks.append(bytes(self._pending))
-                self._pending.clear()
+        if self._retain:
+            if len(data) >= self._coalesce_size:
+                if self._pending:
+                    self._chunks.append(bytes(self._pending))
+                    self._pending.clear()
+                self._chunks.append(data)
+            elif data:
+                self._pending += data
+                if len(self._pending) >= self._coalesce_size:
+                    self._chunks.append(bytes(self._pending))
+                    self._pending.clear()
         if self._sent_buffer is not None:
             self._sent_buffer.extend(data)
         if self._state is not None:
@@ -536,6 +586,13 @@ class HTTPConnection:
         self._child: asyncio.Task[None] | None = None
         self._finalized = False
         self._sending: HTTPResponse | None = None
+        # Payload chunks of the streamed body being written, if any,
+        # up to ``max_body_kept`` bytes.
+        self._streamed: list[bytes] = []
+        self._streamed_size = 0
+        # The task producing a streamed body, which runs the producer
+        # on behalf of the loop.
+        self._stream_task: asyncio.Task[AbortTransmission | None] | None = None
         self._final_send_close = False
 
     @property
@@ -606,7 +663,10 @@ class HTTPConnection:
             current = asyncio.current_task()
         except RuntimeError:
             return False
-        return self._child is not None and self._child is current
+        return current is not None and current in (
+            self._child,
+            self._stream_task,
+        )
 
     def finalize(self) -> None:
         """Decide a close if none exists, close the writer, and publish.
@@ -913,6 +973,8 @@ class HTTPConnection:
         recording.  A 101 closes the connection once the request is
         read, since the server does not speak the switched protocol.
         """
+        if response.body_stream is not None:
+            raise ValueError("Header middleware cannot send a streamed body")
         state = self._state
         is_interim = _is_interim(response.status)
         close = False
@@ -957,7 +1019,7 @@ class HTTPConnection:
         head = _serialize_response_head(
             response.status,
             tuple(response.headers.items()),
-            len(body),
+            None if response.body_stream is not None else len(body),
             close,
             self._policy.keep_alive_hint(),
         )
@@ -1049,6 +1111,7 @@ class HTTPConnection:
             closed=state.closed,
         )
         self._sending = None
+        self._streamed = []
 
     async def _handle_request(self, reading: _Reading) -> bool:
         """Respond to a complete request; return whether to close.
@@ -1273,9 +1336,32 @@ class HTTPConnection:
         should_close = self._should_close_after(
             request, response, self._state.requests_completed
         )
+        body_stream = response.body_stream
+        chunked = False
+        if body_stream is not None:
+            raw_headers = list(response.headers.raw)
+            chunked = is_chunked_transfer(raw_headers)
+            if (
+                not chunked
+                and content_length(raw_headers) is None
+                and _body_allowed(request.method, response.status)
+            ):
+                # Close-delimited: closing is what ends the body.
+                should_close = True
         head, wire_body = self._encode_response(
             request.method, response, close=should_close
         )
+
+        if body_stream is not None:
+            self._streamed = []
+            self._streamed_size = 0
+            self._state.phase = "response_body"
+            self._write(head)
+            abort = None
+            if _body_allowed(request.method, response.status):
+                abort = await self._write_stream(body_stream, chunked=chunked)
+            await self._drain()
+            return should_close, abort
 
         strategy = self._pipeline.transmission()
         self._state.phase = "response_body"
@@ -1295,6 +1381,126 @@ class HTTPConnection:
         )
         abort = await strategy.write_body(client_writer, wire_body)
         return should_close, abort
+
+    async def _write_stream(
+        self, items: StreamBody, *, chunked: bool
+    ) -> AbortTransmission | None:
+        """Write a streamed body while watching for the client to leave.
+
+        A stream can wait a long time for its next item, and nothing
+        is written meanwhile to show that the client is gone.  So the
+        connection is read at the same time: EOF or a reset closes it
+        as ``client`` and cancels the producer.  Bytes the client sends
+        instead, such as a pipelined request, are kept for the next
+        read, and the watch stops.
+        """
+        send = asyncio.ensure_future(self._send_stream(items, chunked=chunked))
+        self._stream_task = send
+        watch = asyncio.ensure_future(self._watch_client())
+        try:
+            done, _ = await asyncio.wait(
+                {send, watch}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if send not in done and watch.result():
+                raise ConnectionLost("client went away during a stream")
+            return await send
+        finally:
+            await self._finish_tasks((send, watch))
+            self._stream_task = None
+
+    @staticmethod
+    async def _finish_tasks(tasks: tuple[asyncio.Task[Any], ...]) -> None:
+        """Cancel *tasks* and wait until all of them have finished.
+
+        Shutdown can cancel the loop more than once.  The wait outlasts
+        every cancellation, so a producer's own cleanup completes
+        before shutdown returns; the cancellation is re-raised after.
+        """
+        for task in tasks:
+            task.cancel()
+        cancelled = False
+        while not all(task.done() for task in tasks):
+            try:
+                await asyncio.wait(tasks)
+            except asyncio.CancelledError:
+                cancelled = True
+        for task in tasks:
+            if not task.cancelled():
+                task.exception()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _watch_client(self) -> bool:
+        """Return ``True`` once the client is gone, ``False`` on data."""
+        try:
+            data = await stream.read(self._reader, 8192)
+        except OSError as exc:
+            reset = isinstance(exc, ConnectionResetError)
+            self._decide("client", self._state.phase, reset=reset)
+            return True
+        if not data:
+            self._decide("client", self._state.phase)
+            return True
+        stream.unread_data(self._reader, data)
+        return False
+
+    async def _send_stream(
+        self, items: StreamBody, *, chunked: bool
+    ) -> AbortTransmission | None:
+        """Write each item of a streamed body as it is produced.
+
+        Every chunk is drained before the next item is read, so the
+        client has it before a later ``Pause`` or ``asyncio.Event``.
+        An ``AbortTransmission`` stops before the terminal chunk.
+        """
+        async with contextlib.aclosing(_stream_items(items)) as produced:
+            async for item in produced:
+                if isinstance(item, AbortTransmission):
+                    return item
+                if isinstance(item, Pause):
+                    await self._sleep(item.seconds)
+                    continue
+                if isinstance(item, asyncio.Event):
+                    await item.wait()
+                    continue
+                data = _normalize_body(item)
+                if not data:
+                    # An empty chunk would be read as the terminal chunk.
+                    continue
+                # A transport whose peer went away drops writes
+                # silently, so check first that this chunk can still be
+                # sent rather than record bytes the client never got.
+                await self._drain()
+                self._send_chunk(data, chunked=chunked)
+                await self._drain()
+        if chunked:
+            self._write(b"0\r\n\r\n")
+        return None
+
+    def _send_chunk(self, data: bytes, *, chunked: bool) -> None:
+        """Write one chunk, recording at most ``max_body_kept`` bytes.
+
+        The client always gets the whole chunk.  The part past the
+        limit is written after the writer stops keeping bytes, so the
+        recorded wire bytes end at the same payload byte as the
+        recorded body, however large the chunk.
+        """
+        head = b"%x\r\n" % len(data) if chunked else b""
+        tail = b"\r\n" if chunked else b""
+        limit = self._max_body_kept
+        room = None if limit is None else limit - self._streamed_size
+        if room is None or len(data) < room:
+            self._write(head + data + tail)
+            self._streamed.append(data)
+            self._streamed_size += len(data)
+            return
+        if room > 0:
+            self._write(head + data[:room])
+            self._streamed.append(data[:room])
+            self._streamed_size += room
+            head = b""
+        self._writer.stop_retaining()
+        self._write(head + memoryview(data)[max(room, 0) :] + tail)
 
     async def _write_body(self, body: bytes) -> None:
         """Write a response body right after its head.
@@ -1363,7 +1569,11 @@ class HTTPConnection:
             response=HTTPResponse(
                 status=response.status,
                 headers=response.headers,
-                body=_normalize_body(response.body),
+                body=(
+                    _normalize_body(response.body)
+                    if response.body_stream is None
+                    else b"".join(self._streamed)
+                ),
             ),
             reason=status_phrase(response.status),
             wire_raw_bytes=b"",
