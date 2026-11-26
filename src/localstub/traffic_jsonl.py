@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -172,6 +173,17 @@ def dump_server_traffic_jsonl(
     return len(exchanges)
 
 
+def _lacks_final_newline(path: Path) -> bool:
+    """Whether *path* is a non-empty file whose last byte is not LF."""
+    try:
+        with path.open("rb") as fp:
+            fp.seek(-1, os.SEEK_END)
+            return fp.read(1) != b"\n"
+    except OSError:
+        # Missing, or empty: seeking before the start fails.
+        return False
+
+
 @contextmanager
 def record_traffic_jsonl(
     server: AsyncHTTPTestServer,
@@ -192,7 +204,12 @@ def record_traffic_jsonl(
     serving, no further lines are written, and the first error is
     raised when the block exits.
     """
+    missing_newline = _lacks_final_newline(output)
     with output.open("a", encoding="utf-8") as fp:
+        if missing_newline:
+            # Otherwise the first record joins the file's last line.
+            fp.write("\n")
+            fp.flush()
         writer = JSONLTrafficWriter(fp)
         errors: list[Exception] = []
 

@@ -155,7 +155,10 @@ class AsyncHTTPTestServer:
         reads every request body to its end but keeps only its first
         N payload bytes (see ``RecordedHTTPRequest.full_body_size``).
         Handlers see the kept prefix.  It cannot be combined with
-        forwarding, which needs the whole request.
+        forwarding, which needs the whole request.  It also keeps only
+        the first N payload bytes of each streamed response body
+        (``HTTPResponse.stream()``); its ``wire_raw_bytes`` end after
+        the chunk that reached the limit.
       * ``write_chunk_size`` sends each response body as writes of at
         most N bytes, waiting for each to drain.  Over TLS this keeps
         the encryption buffers small, which cuts server CPU for large

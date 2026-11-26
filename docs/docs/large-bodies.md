@@ -41,7 +41,9 @@ server = AsyncHTTPTestServer(
 - `max_connection_bytes=0` turns off the byte log.
 - `max_recorded_body_bytes=1024` keeps only the first 1024 bytes of
   each request body. The server still reads every body to its end, so
-  framing and keep-alive work as usual.
+  framing and keep-alive work as usual. It also keeps only the first
+  1024 bytes of each streamed response body (`HTTPResponse.stream()`),
+  which the server would otherwise hold in full until the stream ends.
 
 With all three settings, memory use stays constant regardless of body
 size or request count. The repository's

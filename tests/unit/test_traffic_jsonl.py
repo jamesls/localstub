@@ -670,12 +670,14 @@ def _jsonl_paths(path) -> list[str]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("final_newline", ["\n", ""])
 async def test_record_traffic_jsonl_writes_every_exchange_live(
-    tmp_path,
+    tmp_path, final_newline: str
 ) -> None:
     output = tmp_path / "traffic.jsonl"
+    # JSON Lines allows the last line to end without a newline.
     output.write_text(
-        json.dumps({"request": {"path": "/earlier"}}) + "\n",
+        json.dumps({"request": {"path": "/earlier"}}) + final_newline,
         encoding="utf-8",
     )
     async with (

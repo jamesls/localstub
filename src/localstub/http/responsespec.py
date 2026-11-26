@@ -99,6 +99,11 @@ class HTTPResponse:
     ``write_chunk_size`` do not apply.  An async generator can be
     iterated only once, so return a fresh response from a handler for
     each request; a list can be reused.
+
+    The recorded body holds every chunk sent, unless the server's
+    ``max_recorded_body_bytes`` limits it.  While the stream waits,
+    EOF or a reset from the client ends it as a client close and
+    cancels the producer.
     """
 
     @classmethod
