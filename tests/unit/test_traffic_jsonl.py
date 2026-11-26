@@ -699,3 +699,40 @@ async def test_record_traffic_jsonl_writes_every_exchange_live(
 
     assert len(server.exchanges) == 2
     assert _jsonl_paths(output) == ["/earlier", "/a", "/b", "/c", "/d", "/e"]
+
+
+@pytest.mark.asyncio
+async def test_record_traffic_jsonl_error_reaches_neither_client_nor_others(
+    tmp_path,
+) -> None:
+    failing = tmp_path / "failing.jsonl"
+    healthy = tmp_path / "healthy.jsonl"
+
+    def exclude(request: RecordedHTTPRequest) -> bool:
+        raise KeyError(request.target)
+
+    statuses: list[int] = []
+
+    async def send_while_recording(
+        server: AsyncHTTPTestServer, client: httpx.AsyncClient
+    ) -> None:
+        with (
+            record_traffic_jsonl(server, failing, exclude=exclude),
+            record_traffic_jsonl(server, healthy),
+        ):
+            for path in ("a", "b"):
+                response = await client.get(server.url + path)
+                statuses.append(response.status_code)
+
+    async with (
+        AsyncHTTPTestServer() as server,
+        httpx.AsyncClient() as client,
+    ):
+        with pytest.raises(KeyError, match="/a"):
+            await send_while_recording(server, client)
+        # Both requests shared one keep-alive connection, still open.
+        assert server.closed_connections == []
+
+    assert statuses == [200, 200]
+    assert failing.read_text(encoding="utf-8") == ""
+    assert _jsonl_paths(healthy) == ["/a", "/b"]

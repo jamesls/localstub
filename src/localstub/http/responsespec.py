@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterable, Iterable, Mapping
+import re
+from collections.abc import AsyncIterable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -70,10 +71,16 @@ def _with_defaults(
     return Headers.from_items(items)
 
 
+# The line endings an event stream parser recognizes.
+_SSE_LINE_END = re.compile(r"\r\n|\r|\n")
+
+
 def _encode_sse_event(name: str | None, data: Any) -> bytes:
+    if name is not None and _SSE_LINE_END.search(name):
+        raise ValueError(f"SSE event name contains a line break: {name!r}")
     text = data if isinstance(data, str) else json.dumps(data)
     lines = [] if name is None else [f"event: {name}"]
-    lines.extend(f"data: {line}" for line in text.split("\n"))
+    lines.extend(f"data: {line}" for line in _SSE_LINE_END.split(text))
     return ("\n".join(lines) + "\n\n").encode("utf-8")
 
 
@@ -168,11 +175,13 @@ class HTTPResponse:
         *items* is an iterable or async iterable of ``StreamItem``.
         With ``chunked`` (and no ``Content-Length`` in *headers*) the
         body uses chunked transfer encoding; with ``chunked=False`` it
-        is close-delimited.
+        is close-delimited.  A 1xx or 204 status, which has no body,
+        gets no ``Transfer-Encoding`` (RFC 9112 §6.1).
         """
         supplied = normalize_headers(headers)
         defaults: tuple[HeaderItem, ...] = ()
-        if chunked and "Content-Length" not in supplied:
+        bodiless = 100 <= status < 200 or status == 204
+        if chunked and not bodiless and "Content-Length" not in supplied:
             defaults = (("Transfer-Encoding", "chunked"),)
         return cls(
             status=status,
@@ -183,7 +192,7 @@ class HTTPResponse:
     @classmethod
     def sse(
         cls,
-        events: Iterable[SSEEvent | Pause | asyncio.Event | AbortTransmission],
+        events: Sequence[SSEEvent | Pause | asyncio.Event | AbortTransmission],
         *,
         status: int = 200,
         headers: HeadersLike | None = None,
@@ -193,9 +202,10 @@ class HTTPResponse:
 
         Each ``(event_name, data)`` pair becomes ``event:`` and
         ``data:`` lines; a ``str`` *data* is sent as is and anything
-        else as JSON.  ``Pause``, ``asyncio.Event`` and
-        ``AbortTransmission`` items work as in ``stream()``.  The
-        events are encoded up front, so the response can be reused.
+        else as JSON, one ``data:`` line per line of it.  ``Pause``,
+        ``asyncio.Event`` and ``AbortTransmission`` items work as in
+        ``stream()``.  The events are encoded up front, so the response
+        can be reused.
         """
         items: list[StreamItem] = [
             _encode_sse_event(*event) if isinstance(event, tuple) else event

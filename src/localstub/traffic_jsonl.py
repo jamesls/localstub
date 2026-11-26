@@ -187,16 +187,29 @@ def record_traffic_jsonl(
     the server's ``recording_buffer_size``.  Requests for which
     *exclude* returns true are not written.  *output* is opened in
     append mode.
+
+    If writing a line or calling *exclude* raises, the server keeps
+    serving, no further lines are written, and the first error is
+    raised when the block exits.
     """
     with output.open("a", encoding="utf-8") as fp:
         writer = JSONLTrafficWriter(fp)
+        errors: list[Exception] = []
 
         def on_exchange(exchange: RecordedExchange) -> None:
-            if exclude is None or not exclude(exchange.request):
-                writer.write_exchange(exchange)
+            if errors:
+                return
+            try:
+                if exclude is None or not exclude(exchange.request):
+                    writer.write_exchange(exchange)
+            except Exception as exc:
+                errors.append(exc)
+                raise  # The recorder logs it.
 
         remove = server.recorder.add_exchange_listener(on_exchange)
         try:
             yield
         finally:
             remove()
+        if errors:
+            raise errors[0]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from localstub.http.responsespec import HTTPResponse
 
 
@@ -71,3 +73,17 @@ def test_http_response_supplied_headers_override_defaults() -> None:
         ("content-type", "text/html"),
         ("CONTENT-LENGTH", "123"),
     ]
+
+
+def test_sse_splits_data_on_every_line_ending() -> None:
+    response = HTTPResponse.sse([("e", "a\rb\r\nc\nd")])
+
+    assert response.body_stream == [
+        b"event: e\ndata: a\ndata: b\ndata: c\ndata: d\n\n"
+    ]
+
+
+@pytest.mark.parametrize("name", ["a\nevent: injected", "a\rb"])
+def test_sse_rejects_event_name_with_line_break(name: str) -> None:
+    with pytest.raises(ValueError, match="line break"):
+        HTTPResponse.sse([(name, "x")])

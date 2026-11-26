@@ -1306,7 +1306,11 @@ class HTTPConnection:
         if body_stream is not None:
             raw_headers = list(response.headers.raw)
             chunked = is_chunked_transfer(raw_headers)
-            if not chunked and content_length(raw_headers) is None:
+            if (
+                not chunked
+                and content_length(raw_headers) is None
+                and _body_allowed(request.method, response.status)
+            ):
                 # Close-delimited: closing is what ends the body.
                 should_close = True
         head, wire_body = self._encode_response(
@@ -1364,6 +1368,10 @@ class HTTPConnection:
             if not data:
                 # An empty chunk would be read as the terminal chunk.
                 continue
+            # A transport whose peer went away drops writes silently,
+            # so check first that this chunk can still be sent rather
+            # than record bytes the client never got.
+            await self._drain()
             if chunked:
                 self._write(b"%x\r\n%s\r\n" % (len(data), data))
             else:

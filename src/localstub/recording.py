@@ -287,7 +287,9 @@ class TrafficRecorder:
         Listeners see each exchange exactly once, in completion order,
         independent of the bounded history and of ``next_exchange()``
         consumers, and survive ``reset()``.  They run synchronously on
-        the connection's task, so they must not raise or block.
+        the connection's task, so they must not block.  An exception a
+        listener raises is logged and does not reach the connection or
+        the other listeners.
 
         Returns a function that removes the listener.
         """
@@ -376,7 +378,10 @@ class TrafficRecorder:
             self.last_response = response
             self._response_queue.put(response)
         for listener in tuple(self._exchange_listeners):
-            listener(exchange)
+            try:
+                listener(exchange)
+            except Exception:
+                LOG.exception("Exchange listener %r failed", listener)
 
     def record_connection_closed(self, event: ConnectionClosed) -> None:
         """Record the terminal event of a connection."""
